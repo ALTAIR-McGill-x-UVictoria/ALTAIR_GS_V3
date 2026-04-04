@@ -1,0 +1,15 @@
+# JS dependencies — reinstall with: npm install
+node_modules/
+
+# Vite build output
+dist/
+dist-ssr/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Editor
+.vscode/
+.idea/

@@ -29,6 +29,9 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from backend.packets import REGISTRY, HEADER_SIZE, CRC_SIZE, MIN_FRAME, SYNC_BYTE, decode_frame
 from backend.packets import _HEADER, _CRC
+from backend.tracking import calculate_tracking_params
+from backend.mount import BaseMountController, create_mount
+from backend.camera import CameraController
 
 logger = logging.getLogger("gs.backend")
 logging.basicConfig(
@@ -174,6 +177,12 @@ class SerialReader:
             await self._broadcast({"type": "packet", **result})
 
     async def _broadcast(self, msg: dict[str, Any]) -> None:
+        # Intercept GPS packets to keep _latest_gps up-to-date for telescope tracking
+        if msg.get("type") == "packet" and msg.get("label") == "GPS":
+            global _latest_gps
+            fields = {f["name"]: f["value"] for f in msg.get("fields", [])}
+            _latest_gps = fields  # keys: lat, lon, alt, relative_alt, hdg
+
         if not self._clients:
             return
         data = json.dumps(msg)
@@ -188,6 +197,70 @@ class SerialReader:
 
 serial_reader = SerialReader()
 
+# ---------------------------------------------------------------------------
+# Telescope hardware controllers
+# ---------------------------------------------------------------------------
+
+mount_controller: BaseMountController | None = None
+camera_controller = CameraController()
+
+# Latest GPS data from telemetry — updated by _gps_forwarder, read by tracking poll
+_latest_gps: dict | None = None
+
+# Telescope WebSocket clients (separate from telemetry WS)
+_telescope_clients: set[WebSocket] = set()
+
+_tracking_task: asyncio.Task | None = None
+_tracking_enabled = False
+
+
+async def _broadcast_telescope(msg: dict) -> None:
+    if not _telescope_clients:
+        return
+    data = json.dumps(msg)
+    dead: set[WebSocket] = set()
+    for ws in _telescope_clients:
+        try:
+            await ws.send_text(data)
+        except Exception:
+            dead.add(ws)
+    _telescope_clients -= dead
+
+
+async def _tracking_poll_loop(interval_s: float = 1.0) -> None:
+    """
+    Periodically compute tracking params from latest GPS and broadcast to
+    telescope clients. Also commands the mount if tracking is enabled.
+    """
+    global _latest_gps, _tracking_enabled
+    while True:
+        await asyncio.sleep(interval_s)
+        gps = _latest_gps
+        if gps is None:
+            continue
+        try:
+            params = calculate_tracking_params(
+                payload_lat=gps["lat"],
+                payload_lon=gps["lon"],
+                payload_alt_m=gps["alt"],
+            )
+            msg = {"type": "tracking", **params}
+            await _broadcast_telescope(msg)
+
+            if _tracking_enabled and mount_controller is not None and mount_controller.connected:
+                if mount_controller.mount_type == "am5":
+                    await mount_controller.goto(
+                        ra_hours=params["ra_hours"],
+                        dec_deg=params["dec_deg"],
+                    )
+                else:
+                    await mount_controller.goto(
+                        azimuth=params["azimuth"],
+                        elevation=params["elevation"],
+                    )
+        except Exception as e:
+            logger.warning("Tracking poll error: %s", e)
+
 
 # ---------------------------------------------------------------------------
 # FastAPI app
@@ -195,6 +268,7 @@ serial_reader = SerialReader()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global _tracking_task
     # Auto-connect on startup if LR-900p is present
     port = find_lr900p()
     if port:
@@ -202,8 +276,20 @@ async def lifespan(app: FastAPI):
             await serial_reader.connect(port)
         except Exception:
             pass
+    # Start telescope tracking poll loop
+    _tracking_task = asyncio.create_task(_tracking_poll_loop())
     yield
+    if _tracking_task:
+        _tracking_task.cancel()
+        try:
+            await _tracking_task
+        except asyncio.CancelledError:
+            pass
     await serial_reader.disconnect()
+    if mount_controller is not None and mount_controller.connected:
+        await mount_controller.disconnect()
+    if camera_controller.connected:
+        await camera_controller.disconnect()
 
 
 app = FastAPI(title="ALTAIR GS", lifespan=lifespan)
@@ -275,6 +361,155 @@ async def websocket_endpoint(ws: WebSocket):
     finally:
         serial_reader.remove_client(ws)
         logger.info("WebSocket client disconnected (%d remaining)", len(serial_reader._clients))
+
+
+# ---------------------------------------------------------------------------
+# Telescope WebSocket endpoint
+# ---------------------------------------------------------------------------
+
+@app.websocket("/ws/telescope")
+async def telescope_ws_endpoint(ws: WebSocket):
+    await ws.accept()
+    _telescope_clients.add(ws)
+    logger.info("Telescope WS client connected (%d total)", len(_telescope_clients))
+    # Send current status immediately
+    await ws.send_text(json.dumps({
+        "type":   "telescope_status",
+        "mount":  mount_controller.status_dict() if mount_controller else None,
+        "camera": camera_controller.status_dict(),
+        "tracking_enabled": _tracking_enabled,
+    }))
+    try:
+        while True:
+            await ws.receive_text()
+    except WebSocketDisconnect:
+        pass
+    finally:
+        _telescope_clients.discard(ws)
+        logger.info("Telescope WS client disconnected (%d remaining)", len(_telescope_clients))
+
+
+# ---------------------------------------------------------------------------
+# Telescope REST endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/api/telescope/status")
+def get_telescope_status():
+    return {
+        "mount":            mount_controller.status_dict() if mount_controller else None,
+        "camera":           camera_controller.status_dict(),
+        "tracking_enabled": _tracking_enabled,
+        "latest_gps":       _latest_gps,
+    }
+
+
+@app.post("/api/telescope/mount/connect")
+async def post_mount_connect(body: dict):
+    """
+    Body: { "mount_type": "nexstar"|"am5", "port": "COM10" }
+    For AM5, port is optional (ASCOM driver owns the COM port).
+    For AM5, an optional "progid" key overrides the default ASCOM ProgID.
+    """
+    global mount_controller
+    mount_type = body.get("mount_type", "nexstar")
+    port       = body.get("port", "")
+    progid     = body.get("progid", "")
+
+    if not port and mount_type == "nexstar":
+        return {"ok": False, "error": "port required for NexStar"}
+
+    # Disconnect any existing mount first
+    if mount_controller is not None and mount_controller.connected:
+        await mount_controller.disconnect()
+
+    try:
+        mount_controller = create_mount(mount_type)
+        if mount_type == "am5":
+            await mount_controller.connect(port=port, progid=progid)
+        else:
+            await mount_controller.connect(port=port)
+        await _broadcast_telescope({"type": "telescope_status",
+                                    "mount": mount_controller.status_dict()})
+        return {"ok": True, "mount_type": mount_type}
+    except Exception as e:
+        mount_controller = None
+        return {"ok": False, "error": str(e)}
+
+
+@app.post("/api/telescope/mount/disconnect")
+async def post_mount_disconnect():
+    global mount_controller
+    if mount_controller is not None:
+        await mount_controller.disconnect()
+    await _broadcast_telescope({"type": "telescope_status",
+                                 "mount": mount_controller.status_dict() if mount_controller else None})
+    return {"ok": True}
+
+
+@app.post("/api/telescope/mount/goto")
+async def post_mount_goto(body: dict):
+    if mount_controller is None or not mount_controller.connected:
+        return {"ok": False, "error": "Mount not connected"}
+    if mount_controller.mount_type == "am5":
+        ra  = float(body.get("ra_hours", 0))
+        dec = float(body.get("dec_deg",  0))
+        asyncio.create_task(mount_controller.goto(ra_hours=ra, dec_deg=dec))
+        return {"ok": True, "ra_hours": ra, "dec_deg": dec}
+    else:
+        az = float(body.get("azimuth",   0))
+        el = float(body.get("elevation", 0))
+        asyncio.create_task(mount_controller.goto(azimuth=az, elevation=el))
+        return {"ok": True, "azimuth": az, "elevation": el}
+
+
+@app.post("/api/telescope/tracking")
+async def post_tracking(body: dict):
+    global _tracking_enabled
+    if mount_controller is None or not mount_controller.connected:
+        return {"ok": False, "error": "Mount not connected"}
+    _tracking_enabled = bool(body.get("enabled", False))
+    logger.info("Telescope tracking %s", "enabled" if _tracking_enabled else "disabled")
+    await _broadcast_telescope({"type": "telescope_status",
+                                 "tracking_enabled": _tracking_enabled})
+    return {"ok": True, "tracking_enabled": _tracking_enabled}
+
+
+@app.post("/api/telescope/camera/connect")
+async def post_camera_connect():
+    try:
+        await camera_controller.connect()
+        await _broadcast_telescope({"type": "telescope_status",
+                                    "camera": camera_controller.status_dict()})
+        return {"ok": True}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.post("/api/telescope/camera/disconnect")
+async def post_camera_disconnect():
+    await camera_controller.disconnect()
+    await _broadcast_telescope({"type": "telescope_status",
+                                 "camera": camera_controller.status_dict()})
+    return {"ok": True}
+
+
+@app.post("/api/telescope/camera/settings")
+async def post_camera_settings(body: dict):
+    if "gain" in body:
+        await camera_controller.set_gain(int(body["gain"]))
+    if "exposure_ms" in body:
+        await camera_controller.set_exposure_ms(int(body["exposure_ms"]))
+    return {"ok": True, "camera": camera_controller.status_dict()}
+
+
+@app.post("/api/telescope/camera/capture")
+async def post_camera_capture(body: dict):
+    output_path = body.get("output_path", "captures/frame.tif")
+    try:
+        saved = await camera_controller.capture(output_path)
+        return {"ok": True, "path": saved}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 
 # ---------------------------------------------------------------------------

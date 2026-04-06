@@ -2,3 +2,6 @@ fastapi>=0.111.0
 uvicorn[standard]>=0.30.0
 pyserial>=3.5
 websockets>=12.0
+nexstar>=0.1.0
+zwoasi>=0.0.22
+pywin32>=306       # ASCOM COM dispatch for ZWO AM5

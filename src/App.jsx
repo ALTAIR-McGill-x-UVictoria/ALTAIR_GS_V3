@@ -3,9 +3,10 @@ import { useTelemetry } from './hooks/useTelemetry'
 import ConnectionBar from './components/ConnectionBar'
 import PacketPanel from './components/PacketPanel'
 import MapView from './components/MapView'
+import TelescopeView from './components/TelescopeView'
 
 const PANEL_ORDER = ['Attitude', 'Power', 'VESC', 'Photodiode', 'GPS']
-const TABS = ['Telemetry', 'Map']
+const TABS = ['Telemetry', 'Map', 'Telescope']
 
 export default function App() {
   const { status, packets, history, freshness, wsReady } = useTelemetry()
@@ -46,6 +47,12 @@ export default function App() {
             gpsPacket={packets['GPS']}
             history={history['GPS']}
           />
+        </div>
+      )}
+
+      {activeTab === 'Telescope' && (
+        <div style={styles.telescopeWrapper}>
+          <TelescopeView />
         </div>
       )}
 
@@ -101,6 +108,12 @@ const styles = {
   mapWrapper: {
     flex: 1,
     overflow: 'hidden',
+    display: 'flex',
+    flexDirection: 'column',
+  },
+  telescopeWrapper: {
+    flex: 1,
+    overflowY: 'auto',
     display: 'flex',
     flexDirection: 'column',
   },

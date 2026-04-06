@@ -5,3 +5,5 @@ websockets>=12.0
 nexstar>=0.1.0
 zwoasi>=0.0.22
 pywin32>=306       # ASCOM COM dispatch for ZWO AM5
+Pillow>=10.0       # TIFF→JPEG conversion for image gallery
+piexif>=1.1.3      # EXIF metadata injection into TIFF/JPEG

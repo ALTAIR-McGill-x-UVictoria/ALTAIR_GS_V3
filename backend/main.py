@@ -16,16 +16,21 @@ Or via the helper script:
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import logging
+import os
 import sys
+import time
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
 import serial
 import serial.tools.list_ports
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse, Response
 
 from backend.packets import REGISTRY, HEADER_SIZE, CRC_SIZE, MIN_FRAME, SYNC_BYTE, decode_frame
 from backend.packets import _HEADER, _CRC
@@ -204,14 +209,91 @@ serial_reader = SerialReader()
 mount_controller: BaseMountController | None = None
 camera_controller = CameraController()
 
-# Latest GPS data from telemetry — updated by _gps_forwarder, read by tracking poll
+# Latest GPS data from telemetry — updated by _broadcast, read by tracking poll
 _latest_gps: dict | None = None
+
+# Latest computed tracking params — updated by _tracking_poll_loop, read at capture time
+_latest_tracking: dict | None = None
 
 # Telescope WebSocket clients (separate from telemetry WS)
 _telescope_clients: set[WebSocket] = set()
 
 _tracking_task: asyncio.Task | None = None
 _tracking_enabled = False
+
+# ---------------------------------------------------------------------------
+# Image gallery — capture directory + JPEG cache
+# ---------------------------------------------------------------------------
+
+_REPO_ROOT    = Path(__file__).parent.parent
+_capture_dir  = _REPO_ROOT / "captures"   # default; overridable at runtime
+
+# In-memory JPEG cache: filename -> (mtime, jpeg_thumb_bytes, jpeg_full_bytes)
+_jpeg_cache: dict[str, tuple[float, bytes, bytes]] = {}
+
+_THUMB_SIZE = (400, 400)   # max thumbnail dimensions
+_TIFF_EXTS  = {".tif", ".tiff"}
+
+
+def _list_images() -> list[dict]:
+    """Return image metadata sorted newest-first."""
+    results = []
+    try:
+        for entry in _capture_dir.iterdir():
+            if entry.suffix.lower() in _TIFF_EXTS and entry.is_file():
+                st = entry.stat()
+                results.append({
+                    "filename":  entry.name,
+                    "url":       f"/api/gallery/thumb/{entry.name}",
+                    "full_url":  f"/api/gallery/full/{entry.name}",
+                    "mtime":     st.st_mtime,
+                    "size_kb":   round(st.st_size / 1024),
+                })
+    except FileNotFoundError:
+        pass
+    results.sort(key=lambda x: x["mtime"], reverse=True)
+    return results
+
+
+def _get_jpegs(filename: str) -> tuple[bytes, bytes] | None:
+    """Return (thumb_jpeg, full_jpeg) for filename, using cache when mtime unchanged."""
+    path = _capture_dir / filename
+    if not path.exists():
+        return None
+    mtime = path.stat().st_mtime
+    cached = _jpeg_cache.get(filename)
+    if cached and cached[0] == mtime:
+        return cached[1], cached[2]
+
+    try:
+        from PIL import Image
+        img = Image.open(path)
+        # Normalise 16-bit to 8-bit for JPEG encoding
+        if img.mode == "I;16" or img.mode == "I":
+            import numpy as np
+            arr = np.array(img, dtype=np.float32)
+            arr = ((arr - arr.min()) / (arr.max() - arr.min() + 1e-9) * 255).astype(np.uint8)
+            img = Image.fromarray(arr)
+        elif img.mode not in ("RGB", "L"):
+            img = img.convert("RGB")
+
+        # Full-size JPEG
+        buf_full = io.BytesIO()
+        img.save(buf_full, format="JPEG", quality=90)
+
+        # Thumbnail JPEG
+        thumb = img.copy()
+        thumb.thumbnail(_THUMB_SIZE)
+        buf_thumb = io.BytesIO()
+        thumb.save(buf_thumb, format="JPEG", quality=85)
+
+        thumb_bytes = buf_thumb.getvalue()
+        full_bytes  = buf_full.getvalue()
+        _jpeg_cache[filename] = (mtime, thumb_bytes, full_bytes)
+        return thumb_bytes, full_bytes
+    except Exception as e:
+        logger.warning("Gallery: failed to convert %s: %s", filename, e)
+        return None
 
 
 async def _broadcast_telescope(msg: dict) -> None:
@@ -232,7 +314,7 @@ async def _tracking_poll_loop(interval_s: float = 1.0) -> None:
     Periodically compute tracking params from latest GPS and broadcast to
     telescope clients. Also commands the mount if tracking is enabled.
     """
-    global _latest_gps, _tracking_enabled
+    global _latest_gps, _latest_tracking, _tracking_enabled
     while True:
         await asyncio.sleep(interval_s)
         gps = _latest_gps
@@ -244,6 +326,7 @@ async def _tracking_poll_loop(interval_s: float = 1.0) -> None:
                 payload_lon=gps["lon"],
                 payload_alt_m=gps["alt"],
             )
+            _latest_tracking = params
             msg = {"type": "tracking", **params}
             await _broadcast_telescope(msg)
 
@@ -341,7 +424,7 @@ async def post_disconnect():
 # WebSocket endpoint
 # ---------------------------------------------------------------------------
 
-@app.websocket("/ws")
+@app.websocket("/api/ws")
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
     serial_reader.add_client(ws)
@@ -367,7 +450,7 @@ async def websocket_endpoint(ws: WebSocket):
 # Telescope WebSocket endpoint
 # ---------------------------------------------------------------------------
 
-@app.websocket("/ws/telescope")
+@app.websocket("/api/ws/telescope")
 async def telescope_ws_endpoint(ws: WebSocket):
     await ws.accept()
     _telescope_clients.add(ws)
@@ -504,12 +587,373 @@ async def post_camera_settings(body: dict):
 
 @app.post("/api/telescope/camera/capture")
 async def post_camera_capture(body: dict):
-    output_path = body.get("output_path", "captures/frame.tif")
+    # Build output path inside _capture_dir; caller may override filename only
+    filename = body.get("filename") or f"frame_{int(time.time())}.tif"
+    output_path = _capture_dir / filename
+    _capture_dir.mkdir(parents=True, exist_ok=True)
+
+    # Assemble capture metadata from all available live sources
+    capture_meta: dict = {"capture_utc": time.time()}
+
+    gps = _latest_gps
+    if gps:
+        capture_meta["payload_lat"]       = gps.get("lat")
+        capture_meta["payload_lon"]       = gps.get("lon")
+        capture_meta["payload_alt_m"]     = gps.get("alt")
+        capture_meta["payload_alt_rel_m"] = gps.get("relative_alt")
+        capture_meta["payload_hdg_deg"]   = gps.get("hdg")
+
+    tracking = _latest_tracking
+    if tracking:
+        capture_meta["azimuth"]    = tracking.get("azimuth")
+        capture_meta["elevation"]  = tracking.get("elevation")
+        capture_meta["ra_hours"]   = tracking.get("ra_hours")
+        capture_meta["dec_deg"]    = tracking.get("dec_deg")
+        capture_meta["distance_m"] = tracking.get("distance_m")
+        capture_meta["slant_m"]    = tracking.get("slant_m")
+        capture_meta["gs_lat"]     = tracking.get("gs_lat")
+        capture_meta["gs_lon"]     = tracking.get("gs_lon")
+        capture_meta["gs_alt"]     = tracking.get("gs_alt")
+
+    if mount_controller is not None:
+        capture_meta["mount_type"] = mount_controller.mount_type
+        capture_meta["mount_port"] = mount_controller.port_name
+
+    # Remove None values — EXIF injection skips missing keys anyway,
+    # but this keeps the description block clean
+    capture_meta = {k: v for k, v in capture_meta.items() if v is not None}
+
     try:
-        saved = await camera_controller.capture(output_path)
+        saved = await camera_controller.capture(output_path, metadata=capture_meta)
         return {"ok": True, "path": saved}
     except Exception as e:
         return {"ok": False, "error": str(e)}
+
+
+# ---------------------------------------------------------------------------
+# Gallery REST endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/api/gallery/images")
+def get_gallery_images():
+    return _list_images()
+
+
+@app.get("/api/gallery/config")
+def get_gallery_config():
+    return {"capture_dir": str(_capture_dir)}
+
+
+@app.post("/api/gallery/config")
+def post_gallery_config(body: dict):
+    global _capture_dir
+    raw = body.get("capture_dir", "")
+    if not raw:
+        return {"ok": False, "error": "capture_dir required"}
+    path = Path(raw)
+    if not path.is_absolute():
+        path = _REPO_ROOT / path
+    path.mkdir(parents=True, exist_ok=True)
+    _capture_dir = path
+    _jpeg_cache.clear()
+    logger.info("Gallery capture dir set to %s", _capture_dir)
+    return {"ok": True, "capture_dir": str(_capture_dir)}
+
+
+@app.get("/api/gallery/thumb/{filename}")
+def get_gallery_thumb(filename: str):
+    result = _get_jpegs(filename)
+    if result is None:
+        return Response(status_code=404)
+    return Response(content=result[0], media_type="image/jpeg")
+
+
+@app.get("/api/gallery/full/{filename}")
+def get_gallery_full(filename: str):
+    result = _get_jpegs(filename)
+    if result is None:
+        return Response(status_code=404)
+    return Response(content=result[1], media_type="image/jpeg")
+
+
+# ---------------------------------------------------------------------------
+# Gallery HTML page
+# ---------------------------------------------------------------------------
+
+_GALLERY_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ALTAIR V2 — Image Gallery</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  :root {
+    --bg:      #0d1117;
+    --surface: #161b22;
+    --border:  #1e2d3d;
+    --accent:  #00e5ff;
+    --green:   #00ff88;
+    --muted:   #607080;
+    --text:    #c9d1d9;
+    --font:    'Courier New', Courier, monospace;
+    --header-h: 40px;
+  }
+  body {
+    background: var(--bg); color: var(--text);
+    font-family: var(--font); font-size: 13px;
+    height: 100vh; display: flex; flex-direction: column; overflow: hidden;
+  }
+
+  /* ── Header ── */
+  header {
+    flex-shrink: 0; height: var(--header-h);
+    display: flex; align-items: center; gap: 12px;
+    padding: 0 16px; background: var(--surface);
+    border-bottom: 1px solid var(--border);
+  }
+  header h1 { font-size: 12px; letter-spacing: 2px; color: var(--accent); text-transform: uppercase; white-space: nowrap; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--green); flex-shrink: 0; }
+  .dot.off { background: var(--muted); }
+  input[type=text] {
+    background: var(--bg); border: 1px solid var(--border); border-radius: 4px;
+    color: var(--text); font-family: var(--font); font-size: 11px;
+    padding: 3px 8px; width: 260px;
+  }
+  button {
+    background: transparent; border: 1px solid var(--accent); border-radius: 4px;
+    color: var(--accent); font-family: var(--font); font-size: 11px;
+    padding: 3px 10px; cursor: pointer; white-space: nowrap;
+  }
+  button:hover { background: rgba(0,229,255,0.08); }
+  .spacer { flex: 1; }
+  #count-label { color: var(--muted); font-size: 11px; white-space: nowrap; }
+
+  /* ── Main split layout ── */
+  #main {
+    flex: 1; display: flex; flex-direction: column; overflow: hidden;
+  }
+
+  /* ── Top: image viewer (60% height) ── */
+  #viewer {
+    flex: 0 0 60%; display: flex; align-items: center; justify-content: center;
+    background: #000; border-bottom: 2px solid var(--border); position: relative;
+    overflow: hidden;
+  }
+  #viewer img {
+    max-width: 100%; max-height: 100%; object-fit: contain; display: block;
+  }
+  #viewer-placeholder {
+    color: var(--muted); font-size: 12px; text-align: center; line-height: 1.8;
+  }
+  #viewer-caption {
+    position: absolute; bottom: 0; left: 0; right: 0;
+    background: rgba(0,0,0,0.65); padding: 5px 12px;
+    display: flex; justify-content: space-between; align-items: center;
+    font-size: 11px;
+  }
+  #viewer-caption span:first-child { color: var(--accent); }
+  #viewer-caption span:last-child  { color: var(--muted); }
+
+  /* ── Bottom: image list (40% height, scrollable) ── */
+  #list-pane {
+    flex: 1; overflow-y: auto; background: var(--bg);
+  }
+  #list-pane table {
+    width: 100%; border-collapse: collapse;
+  }
+  #list-pane thead th {
+    position: sticky; top: 0; background: var(--surface);
+    color: var(--muted); font-size: 10px; letter-spacing: 1px; text-transform: uppercase;
+    padding: 6px 10px; border-bottom: 1px solid var(--border); text-align: left;
+    font-weight: normal;
+  }
+  #list-pane tbody tr {
+    border-bottom: 1px solid var(--border); cursor: pointer;
+    transition: background 0.1s;
+  }
+  #list-pane tbody tr:hover   { background: var(--surface); }
+  #list-pane tbody tr.active  { background: #0e2030; border-left: 2px solid var(--accent); }
+  #list-pane tbody tr.new-row { border-left: 2px solid var(--green); }
+  #list-pane td { padding: 5px 10px; vertical-align: middle; }
+  .td-thumb { width: 56px; }
+  .td-thumb img { width: 48px; height: 36px; object-fit: contain; background: #000; display: block; border-radius: 2px; }
+  .td-name  { color: var(--accent); font-size: 11px; }
+  .td-time  { color: var(--muted);  font-size: 11px; white-space: nowrap; }
+  .td-size  { color: var(--muted);  font-size: 11px; white-space: nowrap; text-align: right; }
+
+  #empty-row td { color: var(--muted); padding: 30px; text-align: center; cursor: default; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>ALTAIR V2 &mdash; Gallery</h1>
+  <div class="dot off" id="refresh-dot"></div>
+  <div class="spacer"></div>
+  <span id="count-label">0 images</span>
+  <label style="color:var(--muted);font-size:11px">Dir:</label>
+  <input type="text" id="dir-input" placeholder="captures/">
+  <button onclick="setDir()">Set</button>
+</header>
+
+<div id="main">
+  <!-- Top: viewer -->
+  <div id="viewer">
+    <div id="viewer-placeholder">Select an image from the list below.</div>
+    <img id="viewer-img" src="" alt="" style="display:none">
+    <div id="viewer-caption" style="display:none">
+      <span id="cap-name"></span>
+      <span id="cap-info"></span>
+    </div>
+  </div>
+
+  <!-- Bottom: list -->
+  <div id="list-pane">
+    <table>
+      <thead>
+        <tr>
+          <th class="td-thumb"></th>
+          <th>Filename</th>
+          <th>Time</th>
+          <th style="text-align:right">Size</th>
+        </tr>
+      </thead>
+      <tbody id="list-body">
+        <tr id="empty-row"><td colspan="4">No images captured yet.</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+const REFRESH_MS = 5000
+let knownFiles = new Set()
+let newCount = 0
+let activeFile = null
+const baseTitle = 'ALTAIR V2 \u2014 Image Gallery'
+
+function fmt(mtime) {
+  return new Date(mtime * 1000).toLocaleTimeString()
+}
+
+function selectImage(img) {
+  activeFile = img.filename
+  const viewImg = document.getElementById('viewer-img')
+  const placeholder = document.getElementById('viewer-placeholder')
+  const caption = document.getElementById('viewer-caption')
+  viewImg.src = img.full_url
+  viewImg.style.display = 'block'
+  placeholder.style.display = 'none'
+  caption.style.display = 'flex'
+  document.getElementById('cap-name').textContent = img.filename
+  document.getElementById('cap-info').textContent = fmt(img.mtime) + '  \u2022  ' + img.size_kb + ' KB'
+  // Update active row highlight
+  document.querySelectorAll('#list-body tr').forEach(r => r.classList.remove('active'))
+  const row = document.getElementById('row-' + CSS.escape(img.filename))
+  if (row) {
+    row.classList.add('active')
+    row.scrollIntoView({block: 'nearest'})
+  }
+}
+
+async function loadImages() {
+  const dot = document.getElementById('refresh-dot')
+  dot.classList.remove('off')
+  try {
+    const res = await fetch('/api/gallery/images')
+    const images = await res.json()
+    const tbody = document.getElementById('list-body')
+    const countLabel = document.getElementById('count-label')
+
+    countLabel.textContent = images.length + ' image' + (images.length !== 1 ? 's' : '')
+
+    if (images.length === 0) {
+      tbody.innerHTML = '<tr id="empty-row"><td colspan="4">No images captured yet.</td></tr>'
+      dot.classList.add('off')
+      return
+    }
+
+    // Detect new arrivals
+    const incoming = new Set(images.map(i => i.filename))
+    const fresh = new Set([...incoming].filter(f => !knownFiles.has(f)))
+    if (knownFiles.size > 0 && fresh.size > 0) {
+      newCount += fresh.size
+      if (document.hidden) updateTitle()
+    }
+    knownFiles = incoming
+
+    tbody.innerHTML = images.map(img => `
+      <tr id="row-${img.filename}"
+          class="${fresh.has(img.filename) ? 'new-row' : ''}${activeFile === img.filename ? ' active' : ''}"
+          onclick="selectImage(${JSON.stringify(img)})">
+        <td class="td-thumb"><img src="${img.url}" loading="lazy" alt=""></td>
+        <td class="td-name">${img.filename}</td>
+        <td class="td-time">${fmt(img.mtime)}</td>
+        <td class="td-size">${img.size_kb} KB</td>
+      </tr>`).join('')
+
+    // Auto-select newest if nothing selected yet
+    if (!activeFile && images.length > 0) selectImage(images[0])
+
+    // If the active image was just updated (re-captured), refresh the viewer
+    if (activeFile) {
+      const current = images.find(i => i.filename === activeFile)
+      if (current) {
+        const viewImg = document.getElementById('viewer-img')
+        if (viewImg.src !== location.origin + current.full_url) {
+          viewImg.src = current.full_url
+        }
+      }
+    }
+  } catch(e) {
+    console.warn('Gallery fetch error:', e)
+  }
+  setTimeout(() => dot.classList.add('off'), 400)
+}
+
+function updateTitle() {
+  document.title = newCount > 0 ? '(' + newCount + ' new) ' + baseTitle : baseTitle
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) { newCount = 0; updateTitle() }
+})
+
+async function loadConfig() {
+  const res = await fetch('/api/gallery/config')
+  const cfg = await res.json()
+  document.getElementById('dir-input').value = cfg.capture_dir
+}
+
+async function setDir() {
+  const val = document.getElementById('dir-input').value.trim()
+  if (!val) return
+  const res = await fetch('/api/gallery/config', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({capture_dir: val})
+  })
+  const data = await res.json()
+  if (data.ok) {
+    document.getElementById('dir-input').value = data.capture_dir
+    knownFiles.clear()
+    activeFile = null
+    loadImages()
+  }
+}
+
+loadConfig()
+loadImages()
+setInterval(loadImages, REFRESH_MS)
+</script>
+</body>
+</html>"""
+
+
+@app.get("/gallery", response_class=HTMLResponse)
+def get_gallery():
+    return HTMLResponse(content=_GALLERY_HTML)
 
 
 # ---------------------------------------------------------------------------

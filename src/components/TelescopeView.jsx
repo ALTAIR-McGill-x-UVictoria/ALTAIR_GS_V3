@@ -121,7 +121,7 @@ export default function TelescopeView() {
   const [manualEl,    setManualEl]    = useState('')
   const [manualRa,    setManualRa]    = useState('')
   const [manualDec,   setManualDec]   = useState('')
-  const [capturePath, setCapturePath] = useState('captures/frame.tif')
+  const [capturePath, setCapturePath] = useState('')
   const [lastCapture, setLastCapture] = useState(null)
   const [busy,        setBusy]        = useState(false)
 
@@ -328,7 +328,7 @@ export default function TelescopeView() {
                   style={styles.input}
                   value={capturePath}
                   onChange={e => setCapturePath(e.target.value)}
-                  placeholder="output path"
+                  placeholder="filename (auto if blank)"
                 />
                 <button
                   style={styles.btnGreen}

@@ -1,6 +1,6 @@
-import { useEffect, useRef, useState, useCallback } from 'react'
+import { useEffect, useRef, useState } from 'react'
 
-const WS_URL = 'ws://localhost:5173/ws'
+const WS_URL = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/api/ws`
 const HISTORY_LEN = 200   // data points kept per field for sparklines
 
 // Staleness thresholds in milliseconds
@@ -18,23 +18,35 @@ const STALE_LOST_MS = 5000   // red     — no packet for 5 s
  *   wsReady    — bool
  */
 export function useTelemetry() {
-  const ws = useRef(null)
-  const [wsReady,    setWsReady]    = useState(false)
-  const [status,     setStatus]     = useState({ connected: false, port: '' })
-  const [packets,    setPackets]    = useState({})
-  const [history,    setHistory]    = useState({})
-  // lastSeen: { [label]: Date.now() } — updated on every packet received
-  const lastSeen = useRef({})
-  const [freshness,  setFreshness]  = useState({})
+  const ws             = useRef(null)
+  const reconnectTimer = useRef(null)
 
-  const connect = useCallback(() => {
-    if (ws.current) ws.current.close()
+  const [wsReady,   setWsReady]   = useState(false)
+  const [status,    setStatus]    = useState({ connected: false, port: '' })
+  const [packets,   setPackets]   = useState({})
+  const [history,   setHistory]   = useState({})
+  const lastSeen = useRef({})
+  const [freshness, setFreshness] = useState({})
+
+  // Stable ref so connect() can schedule itself without being a dependency
+  const connectRef = useRef(null)
+  connectRef.current = function connect() {
+    if (ws.current) {
+      ws.current.onclose = null  // prevent reconnect loop from old socket
+      ws.current.close()
+    }
 
     const socket = new WebSocket(WS_URL)
     ws.current = socket
 
-    socket.onopen  = () => setWsReady(true)
-    socket.onclose = () => { setWsReady(false); scheduleReconnect() }
+    socket.onopen = () => setWsReady(true)
+
+    socket.onclose = () => {
+      setWsReady(false)
+      clearTimeout(reconnectTimer.current)
+      reconnectTimer.current = setTimeout(() => connectRef.current(), 2000)
+    }
+
     socket.onerror = () => socket.close()
 
     socket.onmessage = (evt) => {
@@ -48,8 +60,7 @@ export function useTelemetry() {
       if (msg.type === 'packet') {
         const { label, seq, timestamp, fields } = msg
 
-        // Record wall-clock time of receipt for freshness tracking
-        lastSeen.current = { ...lastSeen.current, [label]: Date.now() }
+        lastSeen.current[label] = Date.now()
 
         setPackets(prev => ({
           ...prev,
@@ -70,21 +81,19 @@ export function useTelemetry() {
         })
       }
     }
-  }, [])
+  }
 
-  const reconnectTimer = useRef(null)
-  const scheduleReconnect = useCallback(() => {
-    clearTimeout(reconnectTimer.current)
-    reconnectTimer.current = setTimeout(connect, 2000)
-  }, [connect])
-
+  // Mount once — no dependency array churn
   useEffect(() => {
-    connect()
+    connectRef.current()
     return () => {
       clearTimeout(reconnectTimer.current)
-      ws.current?.close()
+      if (ws.current) {
+        ws.current.onclose = null
+        ws.current.close()
+      }
     }
-  }, [connect])
+  }, [])  // eslint-disable-line react-hooks/exhaustive-deps
 
   // Poll freshness every 500 ms
   useEffect(() => {

@@ -10,6 +10,9 @@ __pycache__/
 *.pyc
 .venv/
 
+# Runtime binaries (obtain separately — see lib/README.md)
+lib/*.dll
+
 # Editor
 .vscode/
 .idea/

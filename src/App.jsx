@@ -113,7 +113,7 @@ const styles = {
   },
   telescopeWrapper: {
     flex: 1,
-    overflowY: 'auto',
+    overflow: 'hidden',
     display: 'flex',
     flexDirection: 'column',
   },

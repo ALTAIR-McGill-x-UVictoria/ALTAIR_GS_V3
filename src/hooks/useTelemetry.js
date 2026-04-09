@@ -18,17 +18,31 @@ const STALE_LOST_MS = 5000   // red     — no packet for 5 s
  *   wsReady    — bool
  */
 export function useTelemetry() {
-  const ws = useRef(null)
-  const [wsReady,    setWsReady]    = useState(false)
-  const [status,     setStatus]     = useState({ connected: false, port: '' })
-  const [packets,    setPackets]    = useState({})
-  const [history,    setHistory]    = useState({})
-  // lastSeen: { [label]: Date.now() } — updated on every packet received
-  const lastSeen = useRef({})
-  const [freshness,  setFreshness]  = useState({})
+  const ws             = useRef(null)
+  const reconnectTimer = useRef(null)
 
-  const connect = useCallback(() => {
-    if (ws.current) ws.current.close()
+  const [wsReady,     setWsReady]     = useState(false)
+  const [status,      setStatus]      = useState({ connected: false, port: '' })
+  const [packets,     setPackets]     = useState({})
+  const [history,     setHistory]     = useState({})
+  const [alarms,      setAlarms]      = useState([])
+  const [alarmRules,  setAlarmRules]  = useState([])
+  const [events,      setEvents]      = useState([])   // [{wall_ms, field, message, new_val, stage}, ...]
+  const [stageNames,  setStageNames]  = useState({})   // {0: "Pre-flight", ...}
+  const [lastAck,     setLastAck]     = useState(null) // {cmd_id, cmd_seq, status, wall_ms}
+  const lastSeen     = useRef({})
+  const arrivalTimes = useRef({})
+  const [freshness, setFreshness] = useState({})
+
+  const RATE_WINDOW = 10   // use last N arrivals to compute Hz
+
+  // Stable ref so connect() can schedule itself without being a dependency
+  const connectRef = useRef(null)
+  connectRef.current = function connect() {
+    if (ws.current) {
+      ws.current.onclose = null  // prevent reconnect loop from old socket
+      ws.current.close()
+    }
 
     const socket = new WebSocket(WS_URL)
     ws.current = socket
@@ -40,20 +54,95 @@ export function useTelemetry() {
     socket.onmessage = (evt) => {
       const msg = JSON.parse(evt.data)
 
+      if (msg.type === 'registry') {
+        // Pre-populate panels with null so placeholders appear before first packet
+        setPackets(prev => {
+          const next = { ...prev }
+          for (const label of msg.labels) {
+            if (!(label in next)) next[label] = null
+          }
+          return next
+        })
+        return
+      }
+
+      if (msg.type === 'alarm_rules') {
+        setAlarmRules(msg.rules)
+        return
+      }
+
+      if (msg.type === 'alarm') {
+        setAlarms(prev => {
+          // Keep newest 50 alarms; replace existing entry for same label+field if severity changed
+          const entry = {
+            severity:  msg.severity,
+            label:     msg.label,
+            field:     msg.field,
+            value:     msg.value,
+            message:   msg.message,
+            rule_type: msg.rule_type,
+            timestamp: msg.timestamp,
+            wall_ms:   Date.now(),
+          }
+          const filtered = prev.filter(a => !(a.label === msg.label && a.field === msg.field))
+          const next = [entry, ...filtered]
+          return next.length > 50 ? next.slice(0, 50) : next
+        })
+        return
+      }
+
       if (msg.type === 'status') {
-        setStatus({ connected: msg.connected, port: msg.port })
+        setStatus({ connected: msg.connected, port: msg.port, emulating: msg.emulating ?? false })
+        return
+      }
+
+      if (msg.type === 'event_meta') {
+        setStageNames(msg.stage_names ?? {})
+        return
+      }
+
+      if (msg.type === 'event') {
+        setEvents(prev => {
+          const entry = {
+            wall_ms: msg.wall_time * 1000,
+            field:   msg.field,
+            new_val: msg.new_val,
+            old_val: msg.old_val,
+            message: msg.message,
+            stage:   msg.stage,
+          }
+          const next = [entry, ...prev]
+          return next.length > 200 ? next.slice(0, 200) : next
+        })
+        return
+      }
+
+      if (msg.type === 'ack') {
+        setLastAck({ cmd_id: msg.cmd_id, cmd_seq: msg.cmd_seq, status: msg.status, wall_ms: Date.now() })
         return
       }
 
       if (msg.type === 'packet') {
         const { label, seq, timestamp, fields } = msg
 
-        // Record wall-clock time of receipt for freshness tracking
-        lastSeen.current = { ...lastSeen.current, [label]: Date.now() }
+        const now = Date.now()
+        lastSeen.current[label] = now
+
+        // Rolling arrival window → update Hz
+        const buf = arrivalTimes.current[label] ?? []
+        buf.push(now)
+        if (buf.length > RATE_WINDOW) buf.shift()
+        arrivalTimes.current[label] = buf
+
+        let hz = null
+        if (buf.length >= 2) {
+          const span = buf[buf.length - 1] - buf[0]   // ms across (N-1) intervals
+          hz = Math.round(((buf.length - 1) / span) * 1000 * 10) / 10  // 1 decimal
+        }
 
         setPackets(prev => ({
           ...prev,
-          [label]: { fields, seq, timestamp, dropped: msg.dropped ?? 0 },
+          [label]: { fields, seq, timestamp, wall_ms: msg.wall_ms ?? null, dropped: msg.dropped ?? 0, hz },
         }))
 
         setHistory(prev => {
@@ -70,21 +159,23 @@ export function useTelemetry() {
         })
       }
     }
-  }, [])
+  }
 
-  const reconnectTimer = useRef(null)
-  const scheduleReconnect = useCallback(() => {
+  function scheduleReconnect() {
     clearTimeout(reconnectTimer.current)
-    reconnectTimer.current = setTimeout(connect, 2000)
-  }, [connect])
+    reconnectTimer.current = setTimeout(() => connectRef.current(), 2000)
+  }
 
   useEffect(() => {
-    connect()
+    connectRef.current()
     return () => {
       clearTimeout(reconnectTimer.current)
-      ws.current?.close()
+      if (ws.current) {
+        ws.current.onclose = null
+        ws.current.close()
+      }
     }
-  }, [connect])
+  }, [])
 
   // Poll freshness every 500 ms
   useEffect(() => {
@@ -102,5 +193,5 @@ export function useTelemetry() {
     return () => clearInterval(id)
   }, [])
 
-  return { status, packets, history, freshness, wsReady }
+  return { status, packets, history, freshness, wsReady, alarms, alarmRules, events, stageNames, lastAck }
 }

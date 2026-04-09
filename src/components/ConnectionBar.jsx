@@ -25,18 +25,25 @@ export default function ConnectionBar({ status, wsReady, freshness = {} }) {
     if (lr && !selectedPort) setSelectedPort(lr.device)
   }, [ports])
 
-  const dotColor = status.connected ? 'var(--ok)' : wsReady ? 'var(--warn)' : 'var(--error)'
-  const dotLabel = status.connected
-    ? `Connected — ${status.port}`
-    : wsReady ? 'No serial link' : 'Backend offline'
+  const dotColor = status.emulating
+    ? '#a78bfa'
+    : status.connected ? 'var(--ok)' : wsReady ? 'var(--warn)' : 'var(--error)'
+  const dotLabel = status.emulating
+    ? 'Emulator active'
+    : status.connected
+      ? `Connected — ${status.port}`
+      : wsReady ? 'No serial link' : 'Backend offline'
 
   return (
     <header style={styles.bar}>
-      <span style={styles.title}>ALTAIR V2 GS</span>
+      <span style={styles.title}>ALTAIR Ground Station</span>
 
       <div style={styles.indicator}>
         <span style={{ ...styles.dot, background: dotColor }} />
         <span style={{ color: dotColor }}>{dotLabel}</span>
+        {status.emulating && (
+          <span style={styles.emulatorBadge}>EMULATOR</span>
+        )}
       </div>
 
       <div style={styles.controls}>
@@ -81,12 +88,19 @@ export default function ConnectionBar({ status, wsReady, freshness = {} }) {
         <button style={{ ...styles.btn, background: 'var(--border)' }} onClick={refreshPorts}>
           ↻
         </button>
+
+        <button
+          style={{ ...styles.btn, background: '#1e2d3d', color: 'var(--warn)', border: '1px solid var(--warn)' }}
+          onClick={() => fetch('/api/system/restart', { method: 'POST' })}
+          title="Restart backend process (uvicorn reload)"
+        >
+          Restart Backend
+        </button>
       </div>
 
       <div style={styles.packetStatus}>
-        {['Attitude', 'Power', 'VESC', 'Photodiode', 'GPS'].map(label => {
-          const state = freshness[label] ?? 'waiting'
-          const { color, label: dot } = FRESHNESS_STYLE[state]
+        {Object.entries(freshness).map(([label, state]) => {
+          const { color, label: dot } = FRESHNESS_STYLE[state] ?? FRESHNESS_STYLE.waiting
           return (
             <span key={label} style={styles.packetBadge} title={`${label}: ${state}`}>
               <span style={{ color }}>{dot}</span>
@@ -173,5 +187,16 @@ const styles = {
     color: 'var(--error)',
     fontSize: 11,
     width: '100%',
+  },
+  emulatorBadge: {
+    background:   '#4c1d95',
+    color:        '#a78bfa',
+    border:       '1px solid #7c3aed',
+    borderRadius: 3,
+    fontSize:     9,
+    fontWeight:   700,
+    padding:      '1px 6px',
+    letterSpacing: 1,
+    fontFamily:   'var(--font-mono)',
   },
 }

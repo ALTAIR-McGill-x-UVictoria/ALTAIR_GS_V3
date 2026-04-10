@@ -294,7 +294,7 @@ class SerialReader:
             return
         data = json.dumps(msg)
         dead: set[WebSocket] = set()
-        for ws in self._clients:
+        for ws in list(self._clients):
             try:
                 await ws.send_text(data)
             except Exception:

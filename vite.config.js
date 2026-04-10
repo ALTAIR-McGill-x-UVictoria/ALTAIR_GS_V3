@@ -8,7 +8,7 @@ export default defineConfig({
     // Proxy WebSocket and API calls to the Python backend
     proxy: {
       '/ws': { target: 'ws://localhost:8000',  ws: true,  changeOrigin: true },
-      '/api': { target: 'http://localhost:8000', changeOrigin: true },
+      '/api': { target: 'http://localhost:8000', changeOrigin: true, ws: true },
     },
   },
 })

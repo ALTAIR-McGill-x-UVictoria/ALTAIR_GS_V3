@@ -7,8 +7,9 @@ import AlarmSidebar from './components/AlarmSidebar'
 import MapView from './components/MapView'
 import TelescopeView from './components/TelescopeView'
 import DashboardView from './components/DashboardView'
+import GraphsView from './components/GraphsView'
 
-const TABS = ['Dashboard', 'Telemetry', 'Map', 'Telescope']
+const TABS = ['Dashboard', 'Telemetry', 'Graphs', 'Map', 'Telescope']
 
 export default function App() {
   const { status, packets, history, freshness, wsReady, alarms, alarmRules, events, stageNames, lastAck } = useTelemetry()
@@ -72,6 +73,10 @@ export default function App() {
                 />
               ))}
             </main>
+          )}
+
+          {activeTab === 'Graphs' && (
+            <GraphsView packets={packets} history={history} />
           )}
 
           {activeTab === 'Map' && (

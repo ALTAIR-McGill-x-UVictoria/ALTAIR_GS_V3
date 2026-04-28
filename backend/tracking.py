@@ -5,8 +5,8 @@ Converts flight payload GPS position to azimuth/elevation angles
 relative to the ground station, and optionally to equatorial RA/Dec
 for mounts that require it (e.g. ZWO AM5 via ASCOM).
 
-Ground station location is hardcoded pending COM port GPS integration.
-# TODO: replace GS_LAT/GS_LON/GS_ALT with live GPS feed from serial controller
+GS_LAT / GS_LON / GS_ALT start as hardcoded defaults and are overwritten
+at runtime by backend.gps_reader when the u-blox 7 dongle acquires a fix.
 """
 from __future__ import annotations
 
@@ -14,8 +14,7 @@ import math
 import time as _time
 
 # ---------------------------------------------------------------------------
-# Ground station fixed position
-# TODO: replace with COM port GPS feed
+# Ground station position — overwritten at runtime by GsGpsReader
 # ---------------------------------------------------------------------------
 GS_LAT: float =  45.5088   # deg N
 GS_LON: float = -73.5542   # deg E (negative = West)
@@ -98,7 +97,8 @@ def _gmst_deg(jd: float) -> float:
 def azalt_to_radec(
     azimuth: float,
     elevation: float,
-    observer_lat: float = GS_LAT,
+    observer_lat: float | None = None,
+    observer_lon: float | None = None,
     unix_utc: float | None = None,
 ) -> tuple[float, float]:
     """
@@ -108,13 +108,19 @@ def azalt_to_radec(
     ----------
     azimuth      : degrees, 0 = North, 90 = East
     elevation    : degrees, above horizon
-    observer_lat : observer geodetic latitude, degrees
+    observer_lat : observer geodetic latitude, degrees (defaults to GS_LAT)
+    observer_lon : observer geodetic longitude, degrees E (defaults to GS_LON)
     unix_utc     : UTC time as Unix timestamp; defaults to now
 
     Returns
     -------
     (ra_hours, dec_deg)  —  RA in decimal hours [0, 24), Dec in degrees [-90, 90]
     """
+    import backend.tracking as _self
+    if observer_lat is None:
+        observer_lat = _self.GS_LAT
+    if observer_lon is None:
+        observer_lon = _self.GS_LON
     if unix_utc is None:
         unix_utc = _time.time()
 
@@ -142,7 +148,7 @@ def azalt_to_radec(
 
     # Local Sidereal Time → RA = LST - HA
     jd  = _julian_date(unix_utc)
-    lst = (_gmst_deg(jd) + GS_LON) % 360.0   # add east longitude
+    lst = (_gmst_deg(jd) + observer_lon) % 360.0
     ra_deg = (lst - ha_deg) % 360.0
     ra_hours = ra_deg / 15.0
 

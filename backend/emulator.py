@@ -51,7 +51,7 @@ from typing import Any, Awaitable, Callable
 
 from backend.packets  import REGISTRY
 from backend.alarms   import ALARM_RULES
-from backend.tracking import GS_LAT, GS_LON
+import backend.tracking as _tracking
 
 logger = logging.getLogger("gs.emulator")
 
@@ -214,8 +214,8 @@ def _flight_pos(t: float) -> tuple[float, float]:
     offset_n = _DRIFT_SPEED_N * t_flying + wander_n
     offset_e = _DRIFT_SPEED_E * t_flying + wander_e
 
-    lat = GS_LAT + offset_n / _M_PER_DEG_LAT
-    lon = GS_LON + offset_e / _M_PER_DEG_LON
+    lat = _tracking.GS_LAT + offset_n / _M_PER_DEG_LAT
+    lon = _tracking.GS_LON + offset_e / _M_PER_DEG_LON
     return lat, lon
 
 

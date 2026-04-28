@@ -3,9 +3,9 @@ import { MapContainer, TileLayer, Marker, Polyline, Popup, ZoomControl, useMap }
 import L from 'leaflet'
 import 'leaflet/dist/leaflet.css'
 
-// Ground station position — must match backend/tracking.py GS_LAT / GS_LON
-const GS_LAT =  45.5088
-const GS_LON = -73.5542
+// Ground station fallback position — used until live GPS fix arrives
+const GS_LAT_DEFAULT =  45.5088
+const GS_LON_DEFAULT = -73.5542
 
 // Fix Leaflet default icon paths broken by bundlers
 delete L.Icon.Default.prototype._getIconUrl
@@ -57,7 +57,7 @@ const aircraftIcon = new L.DivIcon({
 // Keeps the map centred according to the active follow mode.
 // User zoom is always preserved — we only pan, never reset zoom.
 // For 'both' mode, fitBounds only fires when the mode first activates.
-function MapFollower({ position, mode }) {
+function MapFollower({ position, gsPosition, mode }) {
   const map = useMap()
 
   useEffect(() => {
@@ -65,22 +65,19 @@ function MapFollower({ position, mode }) {
 
     if (mode === 'payload') {
       if (!position) return
-      // Re-center on payload but keep current zoom
       map.setView(position, map.getZoom(), { animate: true })
     } else if (mode === 'both') {
-      const gs = [GS_LAT, GS_LON]
       if (!position) {
-        map.setView(gs, map.getZoom(), { animate: true })
+        map.setView(gsPosition, map.getZoom(), { animate: true })
         return
       }
-      // Re-center to fit both points, but cap at current zoom so user can zoom in freely
-      map.fitBounds([gs, position], {
+      map.fitBounds([gsPosition, position], {
         padding:  [40, 40],
         maxZoom:  map.getZoom(),
         animate:  true,
       })
     }
-  }, [position, mode, map])
+  }, [position, gsPosition, mode, map])
 
   return null
 }
@@ -317,7 +314,7 @@ function AltitudeSidebar({ currentAlt, maxAlt, stage, stageNames, terminationFir
 // Main component
 // ---------------------------------------------------------------------------
 
-export default function MapView({ gpsPacket, envPacket, evtPacket, history, tracking, stageNames }) {
+export default function MapView({ gpsPacket, envPacket, evtPacket, history, tracking, stageNames, gsGps }) {
   const [followMode, setFollowMode] = useState('payload') // 'free' | 'payload' | 'both'
 
   const position = useMemo(() => {
@@ -362,12 +359,15 @@ export default function MapView({ gpsPacket, envPacket, evtPacket, history, trac
     return points
   }, [history])
 
-  const gsPosition = [GS_LAT, GS_LON]
+  // Live GS position from u-blox 7; fall back to hardcoded default
+  const gsLat = gsGps?.lat ?? GS_LAT_DEFAULT
+  const gsLon = gsGps?.lon ?? GS_LON_DEFAULT
+  const gsPosition = [gsLat, gsLon]
 
   // Distance and bearing from GS to payload
   const distBearing = useMemo(() => {
     if (!position) return null
-    const [lat1, lon1] = [GS_LAT * Math.PI / 180, GS_LON * Math.PI / 180]
+    const [lat1, lon1] = [gsLat * Math.PI / 180, gsLon * Math.PI / 180]
     const [lat2, lon2] = [position[0] * Math.PI / 180, position[1] * Math.PI / 180]
     const R = 6_371_000
     const dLat = lat2 - lat1, dLon = lon2 - lon1
@@ -377,15 +377,15 @@ export default function MapView({ gpsPacket, envPacket, evtPacket, history, trac
     const x = Math.cos(lat1)*Math.sin(lat2) - Math.sin(lat1)*Math.cos(lat2)*Math.cos(lon2-lon1)
     const bearingDeg = ((Math.atan2(y, x) * 180 / Math.PI) + 360) % 360
     return { distM, bearingDeg }
-  }, [position])
+  }, [position, gsLat, gsLon])
 
   // Mount pointing arrow — 500 m long on the ground, direction = azimuth
   const mountArrow = useMemo(() => {
     const az = tracking?.azimuth
     if (az == null) return null
-    const tip = arrowTip(GS_LAT, GS_LON, az, 500)
+    const tip = arrowTip(gsLat, gsLon, az, 500)
     return { az, tip, elevation: tracking.elevation ?? null }
-  }, [tracking])
+  }, [tracking, gsLat, gsLon])
 
   const defaultCenter = position ?? gsPosition
   const defaultZoom   = position ? 14 : 12
@@ -429,8 +429,24 @@ export default function MapView({ gpsPacket, envPacket, evtPacket, history, trac
           )}
         </div>
 
-        {/* Left-column overlays: mount + alt events stacked */}
+        {/* Left-column overlays: GS GPS + mount + alt events stacked */}
         <div style={s.leftOverlayCol}>
+          {/* Ground station GPS fix badge */}
+          <div style={s.gsGpsOverlay}>
+            <div style={{ fontSize: 9, letterSpacing: 1, color: gsGps ? '#22c55e' : 'var(--muted)', marginBottom: 2 }}>
+              GS GPS {gsGps ? '● LIVE' : '○ DEFAULT'}
+            </div>
+            {gsGps
+              ? <>
+                  <InfoRow label="Lat" value={gsLat.toFixed(5)} unit="°" />
+                  <InfoRow label="Lon" value={gsLon.toFixed(5)} unit="°" />
+                  <InfoRow label="Alt" value={gsGps.alt.toFixed(1)} unit="m" />
+                  <InfoRow label="Sats" value={gsGps.sats} unit="" />
+                </>
+              : <span style={{ color: 'var(--muted)', fontSize: 10 }}>{gsLat.toFixed(4)}°, {gsLon.toFixed(4)}°</span>
+            }
+          </div>
+
           {mountArrow && (
             <div style={s.mountOverlay}>
               <div style={{ color: '#22c55e', fontSize: 10, letterSpacing: 1, marginBottom: 2 }}>MOUNT</div>
@@ -497,7 +513,7 @@ export default function MapView({ gpsPacket, envPacket, evtPacket, history, trac
           />
 
           <ZoomControl position="bottomleft" />
-          <MapFollower position={position} mode={followMode} />
+          <MapFollower position={position} gsPosition={gsPosition} mode={followMode} />
 
           {track.length > 1 && (
             <Polyline
@@ -511,8 +527,12 @@ export default function MapView({ gpsPacket, envPacket, evtPacket, history, trac
             <Popup>
               <div style={{ fontFamily: 'monospace', fontSize: 12 }}>
                 <b>Ground Station</b><br />
-                Lat: {GS_LAT.toFixed(6)}°<br />
-                Lon: {GS_LON.toFixed(6)}°
+                Lat: {gsLat.toFixed(6)}°<br />
+                Lon: {gsLon.toFixed(6)}°<br />
+                {gsGps
+                  ? <>Alt: {gsGps.alt.toFixed(1)} m &nbsp;|&nbsp; {gsGps.sats} sats &nbsp;|&nbsp; HDOP {gsGps.hdop.toFixed(1)}</>
+                  : <span style={{ color: '#888' }}>GPS: default position</span>
+                }
               </div>
             </Popup>
           </Marker>
@@ -686,6 +706,18 @@ const s = {
     flexDirection: 'column',
     gap:           6,
     alignItems:    'stretch',
+  },
+  gsGpsOverlay: {
+    background:  'rgba(20, 24, 32, 0.92)',
+    border:      '1px solid rgba(34, 197, 94, 0.25)',
+    borderRadius: 6,
+    padding:     '8px 12px',
+    display:     'flex',
+    flexDirection: 'column',
+    gap:         3,
+    minWidth:    140,
+    fontFamily:  'var(--font-mono)',
+    fontSize:    12,
   },
   mountOverlay: {
     background: 'rgba(20, 24, 32, 0.92)',

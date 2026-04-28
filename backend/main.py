@@ -42,6 +42,7 @@ from backend.logging_manager import TelemetryLogger
 from backend.alarms import ALARM_RULES
 from backend.emulator import PacketEmulator
 from backend.events import EVENT_DEFS, FLIGHT_STAGE_NAMES, BOOLEAN_EVENT_FIELDS
+from backend.gps_reader import GsGpsReader
 
 logger = logging.getLogger("gs.backend")
 logging.basicConfig(
@@ -330,6 +331,16 @@ _tracking_task: asyncio.Task | None = None
 _tracking_enabled = False
 
 # ---------------------------------------------------------------------------
+# Ground station GPS (u-blox 7)
+# ---------------------------------------------------------------------------
+
+async def _on_gs_fix(fix: dict) -> None:
+    """Broadcast a gs_gps message to all telemetry WebSocket clients."""
+    await serial_reader._broadcast({"type": "gs_gps", **fix})
+
+gs_gps_reader = GsGpsReader(on_fix=_on_gs_fix)
+
+# ---------------------------------------------------------------------------
 # Image gallery — capture directory + JPEG cache
 # ---------------------------------------------------------------------------
 
@@ -481,9 +492,14 @@ async def lifespan(app: FastAPI):
             except Exception:
                 pass
 
+    # Start GS GPS reader (non-blocking; logs a warning if dongle absent)
+    await gs_gps_reader.start()
+
     # Start telescope tracking poll loop
     _tracking_task = asyncio.create_task(_tracking_poll_loop())
     yield
+
+    await gs_gps_reader.stop()
 
     if _tracking_task:
         _tracking_task.cancel()
@@ -523,6 +539,20 @@ def get_ports():
 @app.get("/api/status")
 def get_status():
     return {"connected": serial_reader.connected, "port": serial_reader.port_name}
+
+
+@app.get("/api/gs/gps")
+def get_gs_gps():
+    """Current ground station GPS fix from the u-blox 7 dongle."""
+    return gs_gps_reader.status_dict()
+
+
+@app.post("/api/gs/gps/connect")
+async def post_gs_gps_connect(body: dict):
+    """Manually open the GS GPS dongle on a specific port."""
+    port = body.get("port") or None
+    ok = await gs_gps_reader.start(port=port)
+    return {"ok": ok, **gs_gps_reader.status_dict()}
 
 
 @app.post("/api/connect")

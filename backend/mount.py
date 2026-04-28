@@ -270,15 +270,16 @@ class AM5Controller(BaseMountController):
         ra_h  = self._telescope.RightAscension   # decimal hours
         dec_d = self._telescope.Declination      # degrees
         # Convert to Az/El for UI consistency using tracking math
-        from backend.tracking import GS_LAT, GS_LON, _gmst_deg, _julian_date, _DEG2RAD, _RAD2DEG
+        import backend.tracking as _tracking
+        from backend.tracking import _gmst_deg, _julian_date, _DEG2RAD, _RAD2DEG
         import math
         import time as t
         jd  = _julian_date(t.time())
-        lst = (_gmst_deg(jd) + GS_LON) % 360.0
+        lst = (_gmst_deg(jd) + _tracking.GS_LON) % 360.0
         ha_deg = lst - ra_h * 15.0
-        ha_r   = ha_deg  * _DEG2RAD
-        dec_r  = dec_d   * _DEG2RAD
-        lat_r  = GS_LAT  * _DEG2RAD
+        ha_r   = ha_deg            * _DEG2RAD
+        dec_r  = dec_d             * _DEG2RAD
+        lat_r  = _tracking.GS_LAT * _DEG2RAD
         sin_el = (math.sin(dec_r) * math.sin(lat_r)
                   + math.cos(dec_r) * math.cos(lat_r) * math.cos(ha_r))
         el_r   = math.asin(max(-1.0, min(1.0, sin_el)))

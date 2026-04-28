@@ -12,7 +12,7 @@ import GraphsView from './components/GraphsView'
 const TABS = ['Dashboard', 'Telemetry', 'Graphs', 'Map', 'Telescope']
 
 export default function App() {
-  const { status, packets, history, freshness, wsReady, alarms, alarmRules, events, stageNames, lastAck } = useTelemetry()
+  const { status, packets, history, freshness, wsReady, alarms, alarmRules, events, stageNames, lastAck, gsGps } = useTelemetry()
   const { tracking } = useTelescope()
   const [activeTab, setActiveTab] = useState('Telemetry')
   const [dismissed, setDismissed] = useState(new Set())
@@ -87,6 +87,7 @@ export default function App() {
               history={Object.entries(history).find(([k]) => k.toLowerCase() === 'gps')?.[1]}
               tracking={tracking}
               stageNames={stageNames}
+              gsGps={gsGps}
             />
           )}
 

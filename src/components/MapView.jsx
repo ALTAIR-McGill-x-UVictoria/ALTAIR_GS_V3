@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { MapContainer, TileLayer, Marker, Polyline, Popup, ZoomControl, useMap } from 'react-leaflet'
 import L from 'leaflet'
 import 'leaflet/dist/leaflet.css'
@@ -56,12 +56,20 @@ const aircraftIcon = new L.DivIcon({
 // MODE: 'free' | 'payload' | 'both'
 // Keeps the map centred according to the active follow mode.
 // User zoom is always preserved — we only pan, never reset zoom.
-// For 'both' mode, fitBounds only fires when the mode first activates.
+// For 'both' mode, fitBounds fires once when the mode activates, then
+// only pans to keep both markers visible without changing zoom.
 function MapFollower({ position, gsPosition, mode }) {
   const map = useMap()
+  const prevMode = useRef(null)
 
   useEffect(() => {
-    if (mode === 'free') return
+    if (mode === 'free') {
+      prevMode.current = mode
+      return
+    }
+
+    const modeJustChanged = prevMode.current !== mode
+    prevMode.current = mode
 
     if (mode === 'payload') {
       if (!position) return
@@ -71,11 +79,15 @@ function MapFollower({ position, gsPosition, mode }) {
         map.setView(gsPosition, map.getZoom(), { animate: true })
         return
       }
-      map.fitBounds([gsPosition, position], {
-        padding:  [40, 40],
-        maxZoom:  map.getZoom(),
-        animate:  true,
-      })
+      if (modeJustChanged) {
+        // Only fitBounds on initial activation; after that, just pan
+        map.fitBounds([gsPosition, position], { padding: [40, 40], animate: true })
+      } else {
+        // Pan to midpoint without touching zoom
+        const midLat = (gsPosition[0] + position[0]) / 2
+        const midLon = (gsPosition[1] + position[1]) / 2
+        map.setView([midLat, midLon], map.getZoom(), { animate: true })
+      }
     }
   }, [position, gsPosition, mode, map])
 
@@ -89,17 +101,17 @@ function MapFollower({ position, gsPosition, mode }) {
 // Altitude markers with labels and colours.
 // altM: absolute altitude MSL in metres; shown as a tick on the scale.
 const FIXED_MARKERS = [
-  { altM: 10000, label: 'Jet stream',  color: '#60a5fa' },
-  { altM: 18000, label: 'Stratosphere',color: '#a78bfa' },
+  { altM: 10000, label: '', color: '#60a5fa' },
+  { altM: 18000, label: '', color: '#a78bfa' },
 ]
 
 // Stage-based altitude markers — fired state is injected at render time
 const STAGE_ALT_MARKERS_BASE = [
-  { altM: 25000, label: 'Termination', colorDefault: '#f97316', colorFired: '#fb923c', key: 'termination' },
+  { altM: 25000, label: 'Release',     colorDefault: '#f97316', colorFired: '#fb923c', key: 'termination' },
   { altM: 30000, label: 'Burst',       colorDefault: '#ff4444', colorFired: '#f87171', key: 'burst'        },
 ]
 
-const SIDEBAR_W = 110  // px
+const SIDEBAR_W = 65  // px
 
 /**
  * Thin vertical altitude profile strip.
@@ -110,8 +122,9 @@ const SIDEBAR_W = 110  // px
  *   stage       — current flight_stage integer (0–8)
  *   stageNames  — {0: "Pre-flight", ...}
  */
-// Track column width (px) — narrow strip on the left for the SVG track
+// Track column width (px) — left-justified strip
 const TRACK_COL = 22
+const TRACK_LEFT = 0
 
 // Minimum vertical gap between adjacent labels, as a percentage of sidebar height.
 // ~3.5% ≈ 21px at 600px — enough for a two-line label block.
@@ -146,7 +159,7 @@ function resolveLabels(markers, maxAlt) {
 
 function AltitudeSidebar({ currentAlt, maxAlt, stage, stageNames, terminationFired, burstDetected }) {
   const balloonPct = currentAlt != null
-    ? (1 - Math.max(0, Math.min(1, currentAlt / maxAlt))) * 100
+    ? Math.max(2, Math.min(96, (1 - Math.max(0, Math.min(1, currentAlt / maxAlt))) * 100))
     : null
 
   const stageName = stageNames?.[stage] ?? null
@@ -189,7 +202,7 @@ function AltitudeSidebar({ currentAlt, maxAlt, stage, stageNames, terminationFir
           height="calc(100% - 16px)"
           viewBox={`0 0 ${TRACK_COL} 100`}
           preserveAspectRatio="none"
-          style={{ position: 'absolute', left: 0, top: 8, bottom: 8 }}
+          style={{ position: 'absolute', left: TRACK_LEFT, top: 8, bottom: 8 }}
         >
           <defs>
             <linearGradient id="altGrad" x1="0" y1="0" x2="0" y2="1">
@@ -238,10 +251,10 @@ function AltitudeSidebar({ currentAlt, maxAlt, stage, stageNames, terminationFir
             alt={stage >= 6 ? 'parachute' : 'balloon'}
             style={{
               position:      'absolute',
-              left:          TRACK_COL / 2 - 16,
+              left:          TRACK_COL + 2,
               top:           `${balloonPct}%`,
-              transform:     'translateY(-100%)',
-              width:         32,
+              transform:     'translateY(-50%)',
+              width:         28,
               height:        'auto',
               pointerEvents: 'none',
             }}
@@ -252,7 +265,7 @@ function AltitudeSidebar({ currentAlt, maxAlt, stage, stageNames, terminationFir
         {allMarkers.map(({ altM, label, color, dashed, fired, topPct }) => (
           <div key={altM} style={{
             position:   'absolute',
-            left:       TRACK_COL + 2,
+            left:       TRACK_COL + 3,
             right:      0,
             top:        topPct,
             transform:  'translateY(-50%)',
@@ -285,7 +298,7 @@ function AltitudeSidebar({ currentAlt, maxAlt, stage, stageNames, terminationFir
         {/* Ground label */}
         <div style={{
           position:   'absolute',
-          left:       TRACK_COL + 2,
+          left:       TRACK_COL + 3,
           bottom:     0,
           fontSize:   9,
           fontFamily: 'monospace',
@@ -461,7 +474,7 @@ export default function MapView({ gpsPacket, envPacket, evtPacket, history, trac
           <div style={s.altOverlay}>
             <div style={{ color: 'var(--muted)', fontSize: 9, letterSpacing: 1, marginBottom: 4 }}>ALT EVENTS</div>
             {[
-              { label: 'TERMINATION',  altM: 25000, fired: terminationFired, color: '#f97316' },
+              { label: 'RELEASE',      altM: 25000, fired: terminationFired, color: '#f97316' },
               { label: 'BURST', altM: 30000, fired: burstDetected,    color: '#ff4444' },
             ].map(({ label, altM, fired, color }) => (
               <div key={label} style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 3 }}>

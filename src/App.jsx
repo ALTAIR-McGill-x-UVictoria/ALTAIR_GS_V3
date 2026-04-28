@@ -4,17 +4,16 @@ import { useTelescope } from './hooks/useTelescope'
 import ConnectionBar from './components/ConnectionBar'
 import PacketPanel from './components/PacketPanel'
 import AlarmSidebar from './components/AlarmSidebar'
-import MapView from './components/MapView'
 import TelescopeView from './components/TelescopeView'
-import DashboardView from './components/DashboardView'
 import GraphsView from './components/GraphsView'
+import FlightView from './components/FlightView'
 
-const TABS = ['Dashboard', 'Telemetry', 'Graphs', 'Map', 'Telescope']
+const TABS = ['Flight', 'Telemetry', 'Graphs', 'Telescope']
 
 export default function App() {
   const { status, packets, history, freshness, wsReady, alarms, alarmRules, events, stageNames, lastAck, gsGps, gsGpsStatus } = useTelemetry()
   const { tracking, mountStatus, cameraStatus } = useTelescope()
-  const [activeTab, setActiveTab] = useState('Telemetry')
+  const [activeTab, setActiveTab] = useState('Flight')
   const [dismissed, setDismissed] = useState(new Set())
 
   const visibleAlarms = alarms.filter(
@@ -64,8 +63,19 @@ export default function App() {
       <div style={styles.body}>
 
         <div style={styles.tabContent}>
-          {activeTab === 'Dashboard' && (
-            <DashboardView packets={packets} events={events} stageNames={stageNames} lastAck={lastAck} />
+          {activeTab === 'Flight' && (
+            <FlightView
+              packets={packets}
+              events={events}
+              stageNames={stageNames}
+              lastAck={lastAck}
+              gpsPacket={Object.entries(packets).find(([k]) => k.toLowerCase() === 'gps')?.[1]}
+              envPacket={Object.entries(packets).find(([k]) => k.toLowerCase() === 'environment')?.[1]}
+              evtPacket={Object.entries(packets).find(([k]) => k.toLowerCase() === 'event')?.[1]}
+              history={Object.entries(history).find(([k]) => k.toLowerCase() === 'gps')?.[1]}
+              tracking={tracking}
+              gsGps={gsGps}
+            />
           )}
 
           {activeTab === 'Telemetry' && (
@@ -85,18 +95,6 @@ export default function App() {
 
           {activeTab === 'Graphs' && (
             <GraphsView packets={packets} history={history} />
-          )}
-
-          {activeTab === 'Map' && (
-            <MapView
-              gpsPacket={Object.entries(packets).find(([k]) => k.toLowerCase() === 'gps')?.[1]}
-              envPacket={Object.entries(packets).find(([k]) => k.toLowerCase() === 'environment')?.[1]}
-              evtPacket={Object.entries(packets).find(([k]) => k.toLowerCase() === 'event')?.[1]}
-              history={Object.entries(history).find(([k]) => k.toLowerCase() === 'gps')?.[1]}
-              tracking={tracking}
-              stageNames={stageNames}
-              gsGps={gsGps}
-            />
           )}
 
           {activeTab === 'Telescope' && (

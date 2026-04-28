@@ -262,34 +262,37 @@ export default function FlightView({
         {/* Mission Timers */}
         <div style={FL.bottomCell}>
           <div style={S.cardTitle}>MISSION TIMERS</div>
-          <div style={{ display:'flex', gap:8, alignItems:'center', flex:1, overflow:'hidden' }}>
-            <TimerDisplay
-              label="Launch T+"
-              value={launchEvent ? formatDuration(launchElapsed) : '—'}
-              color={launchEvent ? C.accent : C.muted}
-              subtitle={launchEvent ? null : 'waiting'}
-            />
-            <div style={{ width:1, alignSelf:'stretch', background:C.border, flexShrink:0 }} />
-            <TimerDisplay
-              label="Stage"
-              value={flightStage != null ? (stageNames[flightStage] ?? `${flightStage}`) : '—'}
-              color={C.accent}
-            />
-            {inDescent && <>
-              <div style={{ width:1, alignSelf:'stretch', background:C.border, flexShrink:0 }} />
-              <TimerDisplay
-                label="ETA Land"
-                value={landingEtaMs != null && landingEtaMs > 0 ? formatDuration(landingEtaMs) : '—'}
-                color={C.warn}
-              />
-            </>}
-          </div>
-          {/* ETA sub-row */}
-          <div style={{ display:'flex', gap:6, borderTop:`1px solid ${C.border}`, paddingTop:4 }}>
-            <div style={{ flex:1 }}>
-              <div style={{ color:C.muted, fontSize:9, fontFamily:'monospace', letterSpacing:1 }}>ETA TERM</div>
+          {/* Uniform 2-row × 3-col grid so all six cells are the same height */}
+          <div style={{ flex:1, display:'grid', gridTemplateColumns:'1fr 1fr 1fr', gridTemplateRows:'1fr 1fr', minHeight:0 }}>
+            {/* Row 1 */}
+            <div style={FL.timerCell}>
+              <div style={FL.timerLabel}>LAUNCH T+</div>
+              <div style={{ ...FL.timerValue, color: launchEvent ? C.accent : C.muted }}>
+                {launchEvent ? formatDuration(launchElapsed) : '—'}
+              </div>
+            </div>
+            <div style={{ ...FL.timerCell, borderLeft:`1px solid ${C.border}` }}>
+              <div style={FL.timerLabel}>STAGE</div>
+              <div style={{ ...FL.timerValue, color: C.accent }}>
+                {flightStage != null ? (stageNames[flightStage] ?? `${flightStage}`) : '—'}
+              </div>
+            </div>
+            <div style={{ ...FL.timerCell, borderLeft:`1px solid ${C.border}` }}>
+              <div style={FL.timerLabel}>LATENCY</div>
               <div style={{
-                fontFamily:'monospace', fontSize:12, fontWeight:700, letterSpacing:0.5,
+                ...FL.timerValue,
+                color: linkLatencyMs == null ? C.muted
+                     : linkLatencyMs > 2000 ? C.crit
+                     : linkLatencyMs > 500  ? C.warn : C.ok,
+              }}>
+                {linkLatencyMs == null ? '—' : `${linkLatencyMs} ms`}
+              </div>
+            </div>
+            {/* Row 2 */}
+            <div style={{ ...FL.timerCell, borderTop:`1px solid ${C.border}` }}>
+              <div style={FL.timerLabel}>ETA TERM</div>
+              <div style={{
+                ...FL.timerValue,
                 color: terminationFired ? C.ok
                      : (cutdownFired && burstDetected) || (!cutdownFired && burstDetected) ? C.crit
                      : cutdownFired && !terminationFired ? C.warn
@@ -304,27 +307,20 @@ export default function FlightView({
                   : etaTermMs == null ? '—' : formatEta(etaTermMs)}
               </div>
             </div>
-            <div style={{ width:1, background:C.border, flexShrink:0 }} />
-            <div style={{ flex:1 }}>
-              <div style={{ color:C.muted, fontSize:9, fontFamily:'monospace', letterSpacing:1 }}>ETA BURST</div>
+            <div style={{ ...FL.timerCell, borderTop:`1px solid ${C.border}`, borderLeft:`1px solid ${C.border}` }}>
+              <div style={FL.timerLabel}>ETA BURST</div>
               <div style={{
-                fontFamily:'monospace', fontSize:12, fontWeight:700, letterSpacing:0.5,
+                ...FL.timerValue,
                 color: isRecovery ? C.muted : burstDetected ? C.ok
                      : etaBurstMs == null ? C.muted : etaBurstMs < 0 ? C.crit : C.accent,
               }}>
                 {isRecovery ? '--:--' : etaBurstMs == null ? '—' : formatEta(etaBurstMs)}
               </div>
             </div>
-            <div style={{ width:1, background:C.border, flexShrink:0 }} />
-            <div style={{ flex:1 }}>
-              <div style={{ color:C.muted, fontSize:9, fontFamily:'monospace', letterSpacing:1 }}>LATENCY</div>
-              <div style={{
-                fontFamily:'monospace', fontSize:12, fontWeight:700,
-                color: linkLatencyMs == null ? C.muted
-                     : linkLatencyMs > 2000 ? C.crit
-                     : linkLatencyMs > 500  ? C.warn : C.ok,
-              }}>
-                {linkLatencyMs == null ? '—' : `${linkLatencyMs} ms`}
+            <div style={{ ...FL.timerCell, borderTop:`1px solid ${C.border}`, borderLeft:`1px solid ${C.border}` }}>
+              <div style={FL.timerLabel}>{inDescent ? 'ETA LAND' : ''}</div>
+              <div style={{ ...FL.timerValue, color: C.warn }}>
+                {inDescent && landingEtaMs != null && landingEtaMs > 0 ? formatDuration(landingEtaMs) : '—'}
               </div>
             </div>
           </div>
@@ -496,5 +492,24 @@ const FL = {
     display: 'flex',
     flexDirection: 'column',
     overflow: 'hidden',
+  },
+  timerCell: {
+    display: 'flex',
+    flexDirection: 'column',
+    justifyContent: 'center',
+    padding: '0 8px',
+  },
+  timerLabel: {
+    color: 'var(--muted)',
+    fontSize: 9,
+    fontFamily: 'monospace',
+    letterSpacing: 1,
+    marginBottom: 2,
+  },
+  timerValue: {
+    fontFamily: 'monospace',
+    fontSize: 15,
+    fontWeight: 700,
+    letterSpacing: 0.5,
   },
 }

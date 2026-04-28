@@ -8,7 +8,7 @@ Responsibilities:
   - Expose a REST API for port listing and connection control
 
 Start with:
-    uvicorn backend.main:app --reload --port 8000
+    uvicorn backend.main:app --reload --port 8000 --reload-dir backend --reload-dir src
 
 Or via the helper script:
     python -m backend.main
@@ -20,7 +20,6 @@ import io
 import json
 import logging
 import os
-import signal
 import sys
 import time
 from contextlib import asynccontextmanager
@@ -234,9 +233,17 @@ class SerialReader:
 
         # Log packet to CSV and evaluate alarms
         if msg.get("type") == "packet":
+            global _latest_packets, _latest_alarms
+            _latest_packets[msg["label"]] = msg
+
             alarms = telem_logger.ingest(msg)
             for alarm in alarms:
                 alarm_msg = json.dumps({"type": "alarm", **alarm})
+                # Mirror alarm in server-side list (replace by label+field, cap at 50)
+                entry = {k: v for k, v in alarm.items()}
+                _latest_alarms = [a for a in _latest_alarms
+                                  if not (a["label"] == alarm["label"] and a["field"] == alarm["field"])]
+                _latest_alarms = ([entry] + _latest_alarms)[:50]
                 for ws in list(self._clients):
                     try:
                         await ws.send_text(alarm_msg)
@@ -279,12 +286,12 @@ class SerialReader:
 
             _event_prev = fields
 
+            global _latest_events
             for ev in events_to_emit:
-                ev_msg = json.dumps({
-                    "type":      "event",
-                    "wall_time": time.time(),
-                    **ev,
-                })
+                full_ev = {"type": "event", "wall_time": time.time(), **ev}
+                ev_msg = json.dumps(full_ev)
+                # Mirror in server-side event list (cap at 200)
+                _latest_events = ([full_ev] + _latest_events)[:200]
                 for ws in list(self._clients):
                     try:
                         await ws.send_text(ev_msg)
@@ -310,6 +317,11 @@ _emulating = False
 
 # Previous values of Event packet fields — used to detect transitions
 _event_prev: dict[str, int] = {}
+
+# In-memory mirrors of broadcast state — persisted to state.json on restart
+_latest_packets: dict[str, dict] = {}   # label → last full packet dict
+_latest_alarms:  list[dict]      = []   # last 50 alarms (same dedup as frontend)
+_latest_events:  list[dict]      = []   # last 200 events
 
 # ---------------------------------------------------------------------------
 # Telescope hardware controllers
@@ -477,8 +489,28 @@ async def _tracking_poll_loop(interval_s: float = 1.0) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _tracking_task, _emulator, _emulating
-    telem_logger.open_session()
+    global _tracking_task, _emulator, _emulating, _latest_packets, _latest_alarms, _latest_events
+
+    # Attempt to resume the most recent session if it was saved within the last 5 minutes.
+    # Skip resume in emulator mode — emulator packets have synthetic timestamps that
+    # don't match a real session, and we always want a clean slate for debug runs.
+    _emulating_now = os.getenv("ALTAIR_DEBUG", "0") == "1"
+    if not _emulating_now:
+        resumable = TelemetryLogger.find_resumable_session(max_age_s=300)
+        if resumable:
+            try:
+                restored = telem_logger.resume_session(resumable)
+                _latest_packets.update(restored.get("packets", {}))
+                _latest_alarms[:] = restored.get("alarms", [])
+                _latest_events[:] = restored.get("events", [])
+                logger.info("Resumed session from %s", resumable)
+            except Exception:
+                logger.warning("Failed to resume session — starting fresh", exc_info=True)
+                telem_logger.open_session()
+        else:
+            telem_logger.open_session()
+    else:
+        telem_logger.open_session()
 
     if os.getenv("ALTAIR_DEBUG", "0") == "1":
         # Debug mode: synthesise packets instead of reading from serial
@@ -585,10 +617,21 @@ async def post_disconnect():
 
 @app.post("/api/system/restart")
 async def post_system_restart():
-    """Gracefully exit so uvicorn --reload restarts the process."""
-    logger.info("Restart requested via API — sending SIGTERM")
-    os.kill(os.getpid(), signal.SIGTERM)
+    """Save state then trigger a reload by touching this file so watchfiles picks it up."""
+    telem_logger.save_state(_latest_packets, _latest_alarms, _latest_events)
+    logger.info("Restart requested via API — touching main.py to trigger reload")
+    Path(__file__).touch()
     return {"restarting": True}
+
+
+@app.get("/api/state/snapshot")
+async def get_state_snapshot():
+    """Return last-known packets, alarms, and events for frontend pre-population."""
+    return {
+        "packets": _latest_packets,
+        "alarms":  _latest_alarms,
+        "events":  _latest_events,
+    }
 
 
 async def _emulated_ack(cmd_id: int, cmd_seq: int = 0, status: int = 0) -> None:
@@ -714,6 +757,8 @@ async def websocket_endpoint(ws: WebSocket):
         "has_fix":   gs_gps_reader.fix is not None,
         "port":      gs_gps_reader.port_name,
     }))
+    # Tell frontend to fetch the state snapshot (packets/alarms/events from last session)
+    await ws.send_text(json.dumps({"type": "snapshot_ready"}))
     try:
         while True:
             # Keep the connection alive; client messages are not expected
@@ -1281,4 +1326,12 @@ def get_gallery():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("backend.main:app", host="0.0.0.0", port=8000, reload=True)
+    # Watch only the backend and src directories — keeps logs/ and captures/ out of scope
+    _repo_root = Path(__file__).parent.parent
+    uvicorn.run(
+        "backend.main:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=True,
+        reload_dirs=[str(_repo_root / "backend"), str(_repo_root / "src")],
+    )

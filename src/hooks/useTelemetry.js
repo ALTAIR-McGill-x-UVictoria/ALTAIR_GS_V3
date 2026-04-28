@@ -143,6 +143,38 @@ export function useTelemetry() {
         return
       }
 
+      if (msg.type === 'snapshot_ready') {
+        fetch('/api/state/snapshot')
+          .then(r => r.json())
+          .then(snap => {
+            // Pre-populate packets only for labels not yet seen live
+            if (snap.packets && Object.keys(snap.packets).length) {
+              setPackets(prev => {
+                const next = { ...prev }
+                for (const [label, pkt] of Object.entries(snap.packets)) {
+                  if (!next[label]) next[label] = { ...pkt, _restored: true }
+                }
+                return next
+              })
+            }
+            // Pre-populate alarms (overwrite — server list is authoritative)
+            if (snap.alarms?.length) setAlarms(snap.alarms)
+            // Pre-populate events (overwrite — server list is authoritative)
+            if (snap.events?.length) {
+              setEvents(snap.events.map(ev => ({
+                wall_ms: ev.wall_time * 1000,
+                field:   ev.field,
+                new_val: ev.new_val,
+                old_val: ev.old_val,
+                message: ev.message,
+                stage:   ev.stage,
+              })))
+            }
+          })
+          .catch(() => {})
+        return
+      }
+
       if (msg.type === 'packet') {
         const { label, seq, timestamp, fields } = msg
 

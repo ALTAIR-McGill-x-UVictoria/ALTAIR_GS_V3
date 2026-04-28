@@ -53,6 +53,7 @@ from __future__ import annotations
 
 import csv
 import io
+import json
 import logging
 import time
 from datetime import datetime, timezone
@@ -88,6 +89,18 @@ class AlarmEngine:
 
     def reset(self) -> None:
         self._state.clear()
+
+    @property
+    def state_snapshot(self) -> dict:
+        """Return alarm engine state serialisable as JSON (tuple keys → 'label.field' strings)."""
+        return {f"{k[0]}.{k[1]}": v for k, v in self._state.items()}
+
+    def restore_state(self, snapshot: dict) -> None:
+        """Restore alarm engine state from a state_snapshot dict."""
+        self._state = {
+            tuple(k.split(".", 1)): v
+            for k, v in snapshot.items()
+        }
 
     def evaluate(self, packet: dict[str, Any]) -> list[dict]:
         """
@@ -237,17 +250,18 @@ class AlarmEngine:
 class _CsvFile:
     """Manages a single open CSV file for one packet label."""
 
-    def __init__(self, path: Path, field_names: list[str]) -> None:
+    def __init__(self, path: Path, field_names: list[str], append: bool = False) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         self._path   = path
-        self._fh     = open(path, "w", newline="", encoding="utf-8")
+        self._fh     = open(path, "a" if append else "w", newline="", encoding="utf-8")
         self._writer = csv.writer(self._fh)
 
-        header = ["wall_time_utc", "seq", "timestamp"] + field_names
-        self._writer.writerow(header)
-        self._fh.flush()
+        if not append:
+            header = ["wall_time_utc", "seq", "timestamp"] + field_names
+            self._writer.writerow(header)
+            self._fh.flush()
         self._fields = field_names
-        logger.info("CSV log opened: %s", path)
+        logger.info("CSV log %s: %s", "resumed" if append else "opened", path)
 
     def write(self, packet: dict[str, Any]) -> None:
         wall = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
@@ -286,6 +300,7 @@ class TelemetryLogger:
         self._alarm_engine  = AlarmEngine()
         self._flush_counter = 0
         self._FLUSH_EVERY   = 10   # flush to disk every N packets
+        self._resuming      = False  # True after resume_session(); CSVs append instead of overwrite
 
     # ------------------------------------------------------------------
     # Session lifecycle
@@ -326,6 +341,64 @@ class TelemetryLogger:
 
         logger.info("Telemetry log session closed: %s", self._session_dir)
         self._session_dir = None
+        self._resuming = False
+
+    def save_state(self, packets: dict, alarms: list, events: list) -> None:
+        """Persist current runtime state to state.json in the session dir."""
+        if not self._session_dir:
+            return
+        state = {
+            "session_stamp":    self._session_dir.name,
+            "saved_at":         time.time(),
+            "packets":          packets,
+            "alarms":           alarms,
+            "events":           events,
+            "alarm_engine_state": self._alarm_engine.state_snapshot,
+        }
+        (self._session_dir / "state.json").write_text(
+            json.dumps(state), encoding="utf-8"
+        )
+        logger.info("Session state saved: %s/state.json", self._session_dir)
+
+    @staticmethod
+    def find_resumable_session(max_age_s: float = 300.0) -> "Path | None":
+        """Return the most recent session dir with a fresh state.json, or None."""
+        if not _LOGS_ROOT.exists():
+            return None
+        for d in sorted(_LOGS_ROOT.iterdir(), reverse=True):
+            if not d.is_dir():
+                continue
+            f = d / "state.json"
+            if f.exists() and (time.time() - f.stat().st_mtime) < max_age_s:
+                return d
+        return None
+
+    def resume_session(self, session_dir: Path) -> dict:
+        """
+        Reopen an existing session directory for appending.
+        Returns the restored state dict (packets, alarms, events).
+        Raises on parse error — caller should fall back to open_session().
+        """
+        state = json.loads((session_dir / "state.json").read_text(encoding="utf-8"))
+        self._session_dir = session_dir
+        self._resuming = True
+
+        # Ensure csv/ subdir exists (it always should, but be safe)
+        (session_dir / "csv").mkdir(parents=True, exist_ok=True)
+
+        # Reopen alarm log in append mode
+        alarm_path = session_dir / "alarms.log"
+        self._alarm_log_fh = open(alarm_path, "a", encoding="utf-8")
+        ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        self._alarm_log_fh.write(f"\n# --- resumed {ts} ---\n")
+        self._alarm_log_fh.flush()
+
+        # Restore alarm engine state so severity-transition logic is continuous
+        if "alarm_engine_state" in state:
+            self._alarm_engine.restore_state(state["alarm_engine_state"])
+
+        logger.info("Telemetry log session resumed: %s", session_dir)
+        return state
 
     # ------------------------------------------------------------------
     # Packet ingestion
@@ -366,7 +439,8 @@ class TelemetryLogger:
         if label not in self._csv_files:
             csv_path    = self._session_dir / "csv" / f"{label}.csv"
             field_names = [f["name"] for f in packet.get("fields", [])]
-            self._csv_files[label] = _CsvFile(csv_path, field_names)
+            append      = self._resuming and csv_path.exists()
+            self._csv_files[label] = _CsvFile(csv_path, field_names, append=append)
 
         self._csv_files[label].write(packet)
 

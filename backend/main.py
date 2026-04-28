@@ -335,10 +335,17 @@ _tracking_enabled = False
 # ---------------------------------------------------------------------------
 
 async def _on_gs_fix(fix: dict) -> None:
-    """Broadcast a gs_gps message to all telemetry WebSocket clients."""
     await serial_reader._broadcast({"type": "gs_gps", **fix})
 
-gs_gps_reader = GsGpsReader(on_fix=_on_gs_fix)
+async def _on_gs_status(connected: bool, has_fix: bool, port: str) -> None:
+    await serial_reader._broadcast({
+        "type":      "gs_gps_status",
+        "connected": connected,
+        "has_fix":   has_fix,
+        "port":      port,
+    })
+
+gs_gps_reader = GsGpsReader(on_fix=_on_gs_fix, on_status=_on_gs_status)
 
 # ---------------------------------------------------------------------------
 # Image gallery — capture directory + JPEG cache
@@ -699,6 +706,13 @@ async def websocket_endpoint(ws: WebSocket):
         "type": "status",
         "connected": serial_reader.connected,
         "port": serial_reader.port_name,
+    }))
+    # Send current GS GPS status so the badge is accurate on page load
+    await ws.send_text(json.dumps({
+        "type":      "gs_gps_status",
+        "connected": gs_gps_reader.connected,
+        "has_fix":   gs_gps_reader.fix is not None,
+        "port":      gs_gps_reader.port_name,
     }))
     try:
         while True:

@@ -1,6 +1,39 @@
 import { useEffect, useState } from 'react'
 import { useSerial } from '../hooks/useSerial'
 
+// Square hardware indicator — visually distinct from the round packet dots
+function HwIndicator({ label, state, detail }) {
+  // state: 'connected' | 'partial' | 'disconnected'
+  const COLOR = {
+    connected:    '#22c55e',
+    partial:      '#fbbf24',
+    disconnected: '#374151',
+  }
+  const color = COLOR[state] ?? COLOR.disconnected
+  return (
+    <span style={hw.badge} title={detail ?? label}>
+      <span style={{ ...hw.square, background: color, boxShadow: state === 'connected' ? `0 0 5px ${color}66` : 'none' }} />
+      <span style={{ color: state === 'disconnected' ? 'var(--muted)' : 'var(--text)', fontSize: 11 }}>{label}</span>
+    </span>
+  )
+}
+
+const hw = {
+  badge: {
+    display:    'flex',
+    alignItems: 'center',
+    gap:        5,
+    fontFamily: 'var(--font-mono)',
+  },
+  square: {
+    width:        8,
+    height:       8,
+    borderRadius: 2,
+    flexShrink:   0,
+    display:      'inline-block',
+  },
+}
+
 const BAUD_RATES = [9600, 19200, 38400, 57600, 115200]
 
 const FRESHNESS_STYLE = {
@@ -10,7 +43,7 @@ const FRESHNESS_STYLE = {
   waiting: { color: 'var(--muted)', label: '○' },
 }
 
-export default function ConnectionBar({ status, wsReady, freshness = {} }) {
+export default function ConnectionBar({ status, wsReady, freshness = {}, gsGps, gsGpsStatus, mountStatus, cameraStatus }) {
   const { ports, loading, error, refreshPorts, connectPort, disconnectPort } = useSerial()
   const [selectedPort, setSelectedPort] = useState('')
   const [selectedBaud, setSelectedBaud] = useState(57600)
@@ -110,6 +143,59 @@ export default function ConnectionBar({ status, wsReady, freshness = {} }) {
         })}
       </div>
 
+      {/* Hardware peripheral indicators — square badges, separated from packet dots */}
+      <div style={styles.hwStatus}>
+        <span style={styles.hwLabel}>HW</span>
+
+        {/* Radio: connected = serial port open */}
+        <HwIndicator
+          label="Radio"
+          state={status.emulating ? 'partial' : status.connected ? 'connected' : 'disconnected'}
+          detail={
+            status.emulating ? 'Radio — emulator active' :
+            status.connected ? `Radio — ${status.port}` :
+            'Radio — not connected'
+          }
+        />
+
+        {/* GS GPS: partial = port open but no fix yet, connected = has live fix */}
+        <HwIndicator
+          label="GS GPS"
+          state={
+            gsGpsStatus.has_fix   ? 'connected' :
+            gsGpsStatus.connected ? 'partial'   :
+            'disconnected'
+          }
+          detail={
+            gsGpsStatus.has_fix   ? `GS GPS — fix (${gsGps?.sats ?? '?'} sats, HDOP ${gsGps?.hdop?.toFixed(1) ?? '?'}) on ${gsGpsStatus.port}` :
+            gsGpsStatus.connected ? `GS GPS — port open on ${gsGpsStatus.port}, waiting for fix` :
+            'GS GPS — dongle not found'
+          }
+        />
+
+        {/* Mount: connected = mount controller reports connected */}
+        <HwIndicator
+          label="Mount"
+          state={mountStatus?.connected ? 'connected' : 'disconnected'}
+          detail={
+            mountStatus?.connected
+              ? `Mount — ${mountStatus.mount_type} on ${mountStatus.port}`
+              : 'Mount — not connected'
+          }
+        />
+
+        {/* Camera: connected = camera controller reports connected */}
+        <HwIndicator
+          label="Camera"
+          state={cameraStatus?.connected ? 'connected' : 'disconnected'}
+          detail={
+            cameraStatus?.connected
+              ? `Camera — ${cameraStatus.camera_name ?? 'connected'}`
+              : 'Camera — not connected'
+          }
+        />
+      </div>
+
       {error && <span style={styles.error}>{error}</span>}
     </header>
   )
@@ -182,6 +268,20 @@ const styles = {
     alignItems: 'center',
     gap: 4,
     fontSize: 11,
+  },
+  hwStatus: {
+    display:     'flex',
+    gap:         12,
+    alignItems:  'center',
+    borderLeft:  '1px solid var(--border)',
+    paddingLeft: 12,
+  },
+  hwLabel: {
+    fontSize:      9,
+    letterSpacing: 1.5,
+    color:         'var(--muted)',
+    fontFamily:    'var(--font-mono)',
+    marginRight:   2,
   },
   error: {
     color: 'var(--error)',

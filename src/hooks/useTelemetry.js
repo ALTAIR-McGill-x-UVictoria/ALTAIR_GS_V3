@@ -31,6 +31,7 @@ export function useTelemetry() {
   const [stageNames,  setStageNames]  = useState({})   // {0: "Pre-flight", ...}
   const [lastAck,     setLastAck]     = useState(null) // {cmd_id, cmd_seq, status, wall_ms}
   const [gsGps,       setGsGps]       = useState(null) // {lat, lon, alt, utc_unix, sats, hdop, fix_quality}
+  const [gsGpsStatus, setGsGpsStatus] = useState({ connected: false, has_fix: false, port: '' })
   const lastSeen     = useRef({})
   const arrivalTimes = useRef({})
   const [freshness, setFreshness] = useState({})
@@ -123,6 +124,11 @@ export function useTelemetry() {
         return
       }
 
+      if (msg.type === 'gs_gps_status') {
+        setGsGpsStatus({ connected: msg.connected, has_fix: msg.has_fix, port: msg.port })
+        return
+      }
+
       if (msg.type === 'gs_gps') {
         setGsGps({
           lat:         msg.lat,
@@ -208,5 +214,5 @@ export function useTelemetry() {
     return () => clearInterval(id)
   }, [])
 
-  return { status, packets, history, freshness, wsReady, alarms, alarmRules, events, stageNames, lastAck, gsGps }
+  return { status, packets, history, freshness, wsReady, alarms, alarmRules, events, stageNames, lastAck, gsGps, gsGpsStatus }
 }

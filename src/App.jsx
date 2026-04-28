@@ -12,8 +12,8 @@ import GraphsView from './components/GraphsView'
 const TABS = ['Dashboard', 'Telemetry', 'Graphs', 'Map', 'Telescope']
 
 export default function App() {
-  const { status, packets, history, freshness, wsReady, alarms, alarmRules, events, stageNames, lastAck, gsGps } = useTelemetry()
-  const { tracking } = useTelescope()
+  const { status, packets, history, freshness, wsReady, alarms, alarmRules, events, stageNames, lastAck, gsGps, gsGpsStatus } = useTelemetry()
+  const { tracking, mountStatus, cameraStatus } = useTelescope()
   const [activeTab, setActiveTab] = useState('Telemetry')
   const [dismissed, setDismissed] = useState(new Set())
 
@@ -32,7 +32,15 @@ export default function App() {
 
   return (
     <div style={styles.root}>
-      <ConnectionBar status={status} wsReady={wsReady} freshness={freshness} />
+      <ConnectionBar
+        status={status}
+        wsReady={wsReady}
+        freshness={freshness}
+        gsGps={gsGps}
+        gsGpsStatus={gsGpsStatus}
+        mountStatus={mountStatus}
+        cameraStatus={cameraStatus}
+      />
 
       <nav style={styles.tabBar}>
         {TABS.map(tab => (

@@ -56,8 +56,9 @@ class GsGpsReader:
     whenever a new valid fix arrives.
     """
 
-    def __init__(self, on_fix: Callable | None = None) -> None:
-        self._on_fix = on_fix
+    def __init__(self, on_fix: Callable | None = None, on_status: Callable | None = None) -> None:
+        self._on_fix    = on_fix
+        self._on_status = on_status   # called with (connected: bool, has_fix: bool, port: str)
         self._task: asyncio.Task | None = None
         self._port: serial.Serial | None = None
         self.port_name: str = ""
@@ -90,6 +91,7 @@ class GsGpsReader:
             self.connected = True
             self._task = asyncio.create_task(self._read_loop())
             logger.info("GS GPS opened on %s @ %d baud", port, _BAUD)
+            await self._emit_status()
             return True
         except serial.SerialException as e:
             logger.error("GsGpsReader: cannot open %s: %s", port, e)
@@ -107,13 +109,25 @@ class GsGpsReader:
         self.connected = False
         self.port_name = ""
         logger.info("GS GPS port closed")
+        await self._emit_status()
 
     def status_dict(self) -> dict:
         return {
             "connected": self.connected,
+            "has_fix":   self.fix is not None,
             "port":      self.port_name,
             "fix":       self.fix,
         }
+
+    async def _emit_status(self) -> None:
+        if self._on_status is None:
+            return
+        try:
+            result = self._on_status(self.connected, self.fix is not None, self.port_name)
+            if asyncio.iscoroutine(result):
+                await result
+        except Exception as e:
+            logger.warning("GsGpsReader on_status callback error: %s", e)
 
     # ------------------------------------------------------------------
     # Background read loop
@@ -249,6 +263,8 @@ class GsGpsReader:
             "hdop":        hdop,
             "fix_quality": fix_quality,
         }
+
+        first_fix = (self.fix is None)
         self.fix = fix
 
         # Push live position into tracking module
@@ -259,6 +275,8 @@ class GsGpsReader:
         logger.debug("GS fix: lat=%.6f lon=%.6f alt=%.1fm sats=%d hdop=%.1f",
                      lat, lon, alt, sats, hdop)
 
+        if first_fix:
+            await self._emit_status()
         await self._emit_fix_event(fix)
 
     async def _emit_fix_event(self, fix: dict) -> None:

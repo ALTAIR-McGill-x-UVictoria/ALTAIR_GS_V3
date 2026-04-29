@@ -7,8 +7,9 @@ import AlarmSidebar from './components/AlarmSidebar'
 import TelescopeView from './components/TelescopeView'
 import GraphsView from './components/GraphsView'
 import FlightView from './components/FlightView'
+import SettingsView from './components/SettingsView'
 
-const TABS = ['Flight', 'Telemetry', 'Graphs', 'Telescope']
+const TABS = ['Flight', 'Telemetry', 'Graphs', 'Telescope', 'Settings']
 
 export default function App() {
   const { status, packets, history, freshness, wsReady, alarms, alarmRules, events, stageNames, lastAck, gsGps, gsGpsStatus } = useTelemetry()
@@ -68,7 +69,6 @@ export default function App() {
               packets={packets}
               events={events}
               stageNames={stageNames}
-              lastAck={lastAck}
               gpsPacket={Object.entries(packets).find(([k]) => k.toLowerCase() === 'gps')?.[1]}
               envPacket={Object.entries(packets).find(([k]) => k.toLowerCase() === 'environment')?.[1]}
               evtPacket={Object.entries(packets).find(([k]) => k.toLowerCase() === 'event')?.[1]}
@@ -100,6 +100,10 @@ export default function App() {
           {activeTab === 'Telescope' && (
             <TelescopeView />
           )}
+
+          {activeTab === 'Settings' && (
+            <SettingsView packets={packets} lastAck={lastAck} />
+          )}
         </div>
 
         <AlarmSidebar
@@ -108,6 +112,8 @@ export default function App() {
           onDismissOne={dismissOne}
           events={events}
           stageNames={stageNames}
+          lastAck={lastAck}
+          packets={packets}
           currentStage={(() => {
             const evtPkt = Object.entries(packets).find(([k]) => k.toLowerCase() === 'event')?.[1]
             const v = evtPkt?.fields?.find(f => f.name === 'flight_stage')?.value

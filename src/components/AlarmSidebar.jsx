@@ -1,8 +1,15 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, useMemo } from 'react'
+
+// ─── Constants ────────────────────────────────────────────────────────────────
+
+const ACCENT      = '#00d4ff'
+const CMD_ARM       = 0xC0
+const CMD_LAUNCH_OK = 0xC1
+const CMD_PING      = 0xC2
+const CMD_LABELS    = { [CMD_ARM]: 'ARM', [CMD_LAUNCH_OK]: 'LAUNCH OK', [CMD_PING]: 'PING' }
+const CMD_LOG_MAX   = 20
 
 // ─── Event log helpers ────────────────────────────────────────────────────────
-
-const ACCENT = '#00d4ff'
 
 
 function formatEventTime(wall_ms) {
@@ -124,13 +131,63 @@ function fmtValue(v) {
   return v.toFixed(3)
 }
 
-export default function AlarmSidebar({ alarms, onDismissAll, onDismissOne, events = [], stageNames = {}, currentStage = -1 }) {
+export default function AlarmSidebar({ alarms, onDismissAll, onDismissOne, events = [], stageNames = {}, currentStage = -1, lastAck = null, packets = {} }) {
   const now = useNow(1000)
   const [collapsed, setCollapsed] = useState(false)
 
-  const active   = alarms.filter(a => a.severity !== 'ok')
-  const hasCrit  = active.some(a => a.severity === 'critical')
-  const hasWarn  = active.some(a => a.severity === 'warning')
+  // ── Command state ──────────────────────────────────────────────────────────
+  const [cmdLog, setCmdLog]   = useState([])
+  const cmdSeqRef             = useRef(0)
+
+  const fv = (pkt, name, fallback = null) =>
+    pkt?.fields?.find(f => f.name === name)?.value ?? fallback
+  const findPkt = (label) =>
+    Object.entries(packets).find(([k]) => k.toLowerCase() === label.toLowerCase())?.[1] ?? null
+
+  const hb    = findPkt('heartbeat')
+  const gps   = findPkt('gps')
+  const evpkt = findPkt('event')
+
+  const gpsFix      = gps != null && fv(gps, 'lat', 0) !== 0
+  const pixhawkOk   = fv(hb, 'pixhawk_connected',    null) != null && fv(hb, 'pixhawk_connected',    0) > 0.5
+  const vescOk      = fv(hb, 'vesc_connected',        null) != null && fv(hb, 'vesc_connected',        0) > 0.5
+  const powerOk     = fv(hb, 'power_connected',       null) != null && fv(hb, 'power_connected',       0) > 0.5
+  const photodiodeOk= fv(hb, 'photodiode_connected',  null) != null && fv(hb, 'photodiode_connected',  0) > 0.5
+  const dataLogging = fv(evpkt, 'data_logging_active', 0) === 1
+  const armState    = fv(evpkt, 'arm_state', 0) === 1
+
+  const allOk     = gpsFix && pixhawkOk && vescOk && powerOk && photodiodeOk && dataLogging
+  const canArm    = allOk
+  const canLaunch = allOk && armState
+
+  const logCommandSent = (cmd_id) => {
+    const seq   = cmdSeqRef.current++
+    const entry = { seq, wall_ms: Date.now(), label: CMD_LABELS[cmd_id] ?? `0x${cmd_id.toString(16)}`, cmd_id, status: 'sent', rtt_ms: null }
+    setCmdLog(prev => [entry, ...prev].slice(0, CMD_LOG_MAX))
+  }
+
+  const logCommandAck = (cmd_id, status, ack_wall_ms) => {
+    setCmdLog(prev => {
+      const idx = prev.findIndex(e => e.cmd_id === cmd_id && e.status === 'sent')
+      const ackStatus = status === 0 ? 'ack' : 'nack'
+      if (idx !== -1) {
+        const updated = [...prev]
+        updated[idx]  = { ...updated[idx], status: ackStatus, rtt_ms: ack_wall_ms - updated[idx].wall_ms }
+        return updated
+      }
+      return [{ seq: -1, wall_ms: ack_wall_ms, label: CMD_LABELS[cmd_id] ?? `0x${cmd_id.toString(16)}`, cmd_id, status: ackStatus, rtt_ms: null }, ...prev].slice(0, CMD_LOG_MAX)
+    })
+  }
+
+  useEffect(() => {
+    if (!lastAck) return
+    logCommandAck(lastAck.cmd_id, lastAck.status, lastAck.wall_ms)
+  }, [lastAck])
+
+  // ── Alarm derived state ────────────────────────────────────────────────────
+  const active    = alarms.filter(a => a.severity !== 'ok')
+  const hasCrit   = active.some(a => a.severity === 'critical')
+  const hasWarn   = active.some(a => a.severity === 'warning')
   const critCount = active.filter(a => a.severity === 'critical').length
   const warnCount = active.filter(a => a.severity === 'warning').length
 
@@ -152,7 +209,6 @@ export default function AlarmSidebar({ alarms, onDismissAll, onDismissOne, event
           </span>
         )}
 
-        {/* Alarm count pills — visible even when collapsed */}
         {!collapsed && active.length > 0 && (
           <div style={styles.countRow}>
             {critCount > 0 && (
@@ -168,13 +224,12 @@ export default function AlarmSidebar({ alarms, onDismissAll, onDismissOne, event
           </div>
         )}
 
-        {/* Collapsed: show single dot indicator */}
         {collapsed && active.length > 0 && (
           <div style={{ ...styles.collapsedDot, background: accentColor }} title={`${active.length} alarm(s)`} />
         )}
 
         <button style={styles.collapseBtn} onClick={() => setCollapsed(v => !v)}
-          title={collapsed ? 'Show alarms' : 'Collapse alarms'}>
+          title={collapsed ? 'Show sidebar' : 'Collapse sidebar'}>
           {collapsed ? '◀' : '▶'}
         </button>
       </div>
@@ -194,11 +249,7 @@ export default function AlarmSidebar({ alarms, onDismissAll, onDismissOne, event
           {/* Alarm list */}
           <div style={styles.list}>
             {active.length === 0
-              ? (
-                <div style={styles.empty}>
-                  No active alarms
-                </div>
-              )
+              ? <div style={styles.empty}>No active alarms</div>
               : active.map(a => {
                   const s = SEV[a.severity]
                   return (
@@ -206,32 +257,22 @@ export default function AlarmSidebar({ alarms, onDismissAll, onDismissOne, event
                       key={`${a.label}.${a.field}`}
                       style={{ ...styles.card, background: s.rowBg, borderLeft: `3px solid ${s.border}` }}
                     >
-                      {/* Top row: badge + icon + dismiss */}
                       <div style={styles.cardTop}>
                         <span style={{ ...styles.sevBadge, background: s.badgeBg, color: s.badgeFg }}>
                           {a.severity.toUpperCase()}
                         </span>
-                        <span style={{ fontSize: 9, color: s.fg, marginLeft: 4 }}
-                          title={a.rule_type}>
+                        <span style={{ fontSize: 9, color: s.fg, marginLeft: 4 }} title={a.rule_type}>
                           {RULE_ICON[a.rule_type] ?? '?'}
                         </span>
                         <span style={styles.cardAge}>{fmtAge(a.wall_ms, now)}</span>
-                        <button style={styles.dismissBtn}
-                          onClick={() => onDismissOne(a.label, a.field)}
-                          title="Dismiss">✕</button>
+                        <button style={styles.dismissBtn} onClick={() => onDismissOne(a.label, a.field)} title="Dismiss">✕</button>
                       </div>
-
-                      {/* Source */}
                       <div style={styles.cardSource}>
                         <span style={{ color: '#c9d1d9' }}>{a.label}</span>
                         <span style={{ color: '#607080' }}>.</span>
                         <span style={{ color: s.fg }}>{a.field}</span>
-                        <span style={{ color: s.fg, marginLeft: 'auto', fontWeight: 700 }}>
-                          {fmtValue(a.value)}
-                        </span>
+                        <span style={{ color: s.fg, marginLeft: 'auto', fontWeight: 700 }}>{fmtValue(a.value)}</span>
                       </div>
-
-                      {/* Message */}
                       <div style={styles.cardMsg}>{a.message}</div>
                     </div>
                   )
@@ -239,13 +280,81 @@ export default function AlarmSidebar({ alarms, onDismissAll, onDismissOne, event
             }
           </div>
 
-          {/* ── Flight events ── */}
-          <div style={styles.eventsSection}>
-            <div style={styles.eventsSectionHeader}>
-              FLIGHT EVENTS
+          {/* ── Commands ── */}
+          <div style={styles.commandsSection}>
+            <div style={styles.sectionHeader}>COMMANDS</div>
+            <div style={{ display: 'flex', gap: 8, padding: '6px 8px', flex: 1, minHeight: 0, overflow: 'hidden' }}>
+              {/* Buttons */}
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 5, justifyContent: 'center', flexShrink: 0 }}>
+                <button
+                  disabled={!canArm}
+                  style={{
+                    fontFamily: 'var(--font-mono)', fontSize: 11, fontWeight: 700, letterSpacing: 1,
+                    padding: '5px 10px', borderRadius: 4,
+                    border: `1px solid ${canArm ? '#eab308' : '#1e2d3d'}`,
+                    background: canArm ? 'rgba(234,179,8,0.12)' : 'rgba(255,255,255,0.03)',
+                    color: canArm ? '#eab308' : '#607080',
+                    cursor: canArm ? 'pointer' : 'not-allowed',
+                  }}
+                  onClick={async () => {
+                    logCommandSent(CMD_ARM)
+                    await fetch('/api/fc/command/arm', { method: 'POST' })
+                  }}
+                >ARM</button>
+                <button
+                  disabled={!canLaunch}
+                  style={{
+                    fontFamily: 'var(--font-mono)', fontSize: 11, fontWeight: 700, letterSpacing: 1,
+                    padding: '5px 10px', borderRadius: 4,
+                    border: `1px solid ${canLaunch ? '#22c55e' : '#1e2d3d'}`,
+                    background: canLaunch ? 'rgba(34,197,94,0.12)' : 'rgba(255,255,255,0.03)',
+                    color: canLaunch ? '#22c55e' : '#607080',
+                    cursor: canLaunch ? 'pointer' : 'not-allowed',
+                  }}
+                  onClick={async () => {
+                    logCommandSent(CMD_LAUNCH_OK)
+                    await fetch('/api/fc/command/launch_ok', { method: 'POST' })
+                  }}
+                >LAUNCH OK</button>
+                <button
+                  style={{
+                    fontFamily: 'var(--font-mono)', fontSize: 11, fontWeight: 700, letterSpacing: 1,
+                    padding: '5px 10px', borderRadius: 4,
+                    border: `1px solid ${ACCENT}`,
+                    background: 'rgba(0,212,255,0.07)',
+                    color: ACCENT, cursor: 'pointer',
+                  }}
+                  onClick={async () => {
+                    logCommandSent(CMD_PING)
+                    await fetch('/api/fc/command/ping', { method: 'POST' })
+                  }}
+                >PING</button>
+              </div>
+
+              {/* Command log */}
+              <div style={{
+                flex: 1, borderLeft: '1px solid #1e2d3d', paddingLeft: 8,
+                overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 2,
+              }}>
+                {cmdLog.length === 0
+                  ? <div style={{ fontSize: 10, color: '#607080', fontFamily: 'var(--font-mono)' }}>—</div>
+                  : cmdLog.map((e, i) => {
+                      const t  = new Date(e.wall_ms)
+                      const ts = `${String(t.getHours()).padStart(2,'0')}:${String(t.getMinutes()).padStart(2,'0')}:${String(t.getSeconds()).padStart(2,'0')}`
+                      const statusColor = e.status === 'ack' ? '#22c55e' : e.status === 'nack' ? '#ff4444' : '#607080'
+                      const statusLabel = e.status === 'ack' ? '✓ ACK' : e.status === 'nack' ? '✗ NACK' : '···'
+                      return (
+                        <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 5, fontFamily: 'var(--font-mono)', fontSize: 10 }}>
+                          <span style={{ color: '#607080', flexShrink: 0 }}>{ts}</span>
+                          <span style={{ color: '#c9d1d9', flexShrink: 0 }}>{e.label}</span>
+                          <span style={{ color: statusColor, flexShrink: 0 }}>{statusLabel}</span>
+                          {e.rtt_ms != null && <span style={{ color: '#607080' }}>{e.rtt_ms}ms</span>}
+                        </div>
+                      )
+                    })
+                }
+              </div>
             </div>
-            <FlightStageStrip stage={currentStage} stageNames={stageNames} />
-            <EventLog events={events} stageNames={stageNames} />
           </div>
         </>
       )}
@@ -384,14 +493,14 @@ const styles = {
     color:     '#8b949e',
     lineHeight: 1.3,
   },
-  eventsSection: {
+  commandsSection: {
     display:       'flex',
     flexDirection: 'column',
-    flex:          1,
-    minHeight:     0,
+    flexShrink:    0,
     borderTop:     '1px solid #1e2d3d',
+    minHeight:     130,
   },
-  eventsSectionHeader: {
+  sectionHeader: {
     fontSize:      9,
     fontWeight:    700,
     letterSpacing: 2,

@@ -7,12 +7,8 @@ import {
   TimerDisplay, CheckItem,
 } from './instruments/FlightInstruments'
 
-const CMD_ARM       = 0xC0
-const CMD_LAUNCH_OK = 0xC1
-const CMD_PING      = 0xC2
-
 export default function FlightView({
-  packets, events = [], stageNames = {}, lastAck = null,
+  packets, events = [], stageNames = {},
   gpsPacket, envPacket, evtPacket, history, tracking, gsGps,
 }) {
   const att   = findPacket(packets, 'attitude')
@@ -120,42 +116,6 @@ export default function FlightView({
   const armState     = fv(evpkt, 'arm_state', 0) === 1
   const gpsHdop      = fv(gps, 'eph', null)
 
-  // ── Command log ───────────────────────────────────────────────────────────
-  const [cmdLog, setCmdLog] = useState([])
-  const cmdSeqRef = useRef(0)
-
-  const CMD_LABELS  = { [CMD_ARM]: 'ARM', [CMD_LAUNCH_OK]: 'LAUNCH OK', [CMD_PING]: 'PING' }
-  const CMD_LOG_MAX = 20
-
-  const logCommandSent = (cmd_id) => {
-    const seq   = cmdSeqRef.current++
-    const entry = { seq, wall_ms: Date.now(), label: CMD_LABELS[cmd_id] ?? `0x${cmd_id.toString(16)}`, cmd_id, status: 'sent', rtt_ms: null }
-    setCmdLog(prev => [entry, ...prev].slice(0, CMD_LOG_MAX))
-    return seq
-  }
-
-  const logCommandAck = (cmd_id, status, ack_wall_ms) => {
-    setCmdLog(prev => {
-      const idx       = prev.findIndex(e => e.cmd_id === cmd_id && e.status === 'sent')
-      const ackStatus = status === 0 ? 'ack' : 'nack'
-      if (idx !== -1) {
-        const updated = [...prev]
-        updated[idx]  = { ...updated[idx], status: ackStatus, rtt_ms: ack_wall_ms - updated[idx].wall_ms }
-        return updated
-      }
-      const entry = { seq: -1, wall_ms: ack_wall_ms, label: CMD_LABELS[cmd_id] ?? `0x${cmd_id.toString(16)}`, cmd_id, status: ackStatus, rtt_ms: null }
-      return [entry, ...prev].slice(0, CMD_LOG_MAX)
-    })
-  }
-
-  useEffect(() => {
-    if (!lastAck) return
-    logCommandAck(lastAck.cmd_id, lastAck.status, lastAck.wall_ms)
-  }, [lastAck])
-
-  const allOk     = gpsFix && pixhawkOk && vescOk && powerOk && photodiodeOk && dataLogging
-  const canArm    = allOk
-  const canLaunch = allOk && armState
 
   return (
     <div style={FL.root}>
@@ -340,84 +300,50 @@ export default function FlightView({
           </div>
         </div>
 
-        {/* Commands */}
+        {/* Flight Events */}
         <div style={{ ...FL.bottomCell, borderRight: 'none' }}>
-          <div style={S.cardTitle}>COMMANDS</div>
-          <div style={{ flex:1, display:'flex', gap:8, overflow:'hidden' }}>
-            <div style={{ display:'flex', flexDirection:'column', gap:5, justifyContent:'center', flexShrink:0 }}>
-              <button
-                disabled={!canArm}
-                style={{
-                  fontFamily:'monospace', fontSize:11, fontWeight:700, letterSpacing:1,
-                  padding:'5px 10px', borderRadius:4,
-                  border:`1px solid ${canArm ? C.warn : C.border}`,
-                  background: canArm ? 'rgba(234,179,8,0.12)' : 'rgba(255,255,255,0.03)',
-                  color: canArm ? C.warn : C.muted,
-                  cursor: canArm ? 'pointer' : 'not-allowed',
-                }}
-                onClick={async () => {
-                  logCommandSent(CMD_ARM)
-                  const r = await fetch('/api/fc/command/arm', { method:'POST' })
-                  const j = await r.json()
-                  if (!j.ok) console.error('ARM failed:', j.error)
-                }}
-              >ARM</button>
-              <button
-                disabled={!canLaunch}
-                style={{
-                  fontFamily:'monospace', fontSize:11, fontWeight:700, letterSpacing:1,
-                  padding:'5px 10px', borderRadius:4,
-                  border:`1px solid ${canLaunch ? C.ok : C.border}`,
-                  background: canLaunch ? 'rgba(34,197,94,0.12)' : 'rgba(255,255,255,0.03)',
-                  color: canLaunch ? C.ok : C.muted,
-                  cursor: canLaunch ? 'pointer' : 'not-allowed',
-                }}
-                onClick={async () => {
-                  logCommandSent(CMD_LAUNCH_OK)
-                  const r = await fetch('/api/fc/command/launch_ok', { method:'POST' })
-                  const j = await r.json()
-                  if (!j.ok) console.error('LAUNCH_OK failed:', j.error)
-                }}
-              >LAUNCH OK</button>
-              <button
-                style={{
-                  fontFamily:'monospace', fontSize:11, fontWeight:700, letterSpacing:1,
-                  padding:'5px 10px', borderRadius:4,
-                  border:`1px solid ${C.accent}`,
-                  background:'rgba(0,212,255,0.07)',
-                  color:C.accent, cursor:'pointer',
-                }}
-                onClick={async () => {
-                  logCommandSent(CMD_PING)
-                  const r = await fetch('/api/fc/command/ping', { method:'POST' })
-                  const j = await r.json()
-                  if (!j.ok) console.error('PING failed:', j.error)
-                }}
-              >PING</button>
-            </div>
-
-            <div style={{
-              flex:1, borderLeft:`1px solid ${C.border}`, paddingLeft:8,
-              overflowY:'auto', display:'flex', flexDirection:'column', gap:2,
-            }}>
-              {cmdLog.length === 0
-                ? <div style={{ fontSize:10, color:C.muted, fontFamily:'monospace' }}>—</div>
-                : cmdLog.map((e, i) => {
-                    const t  = new Date(e.wall_ms)
-                    const ts = `${String(t.getHours()).padStart(2,'0')}:${String(t.getMinutes()).padStart(2,'0')}:${String(t.getSeconds()).padStart(2,'0')}`
-                    const statusColor = e.status === 'ack' ? C.ok : e.status === 'nack' ? C.crit : C.muted
-                    const statusLabel = e.status === 'ack' ? '✓ ACK' : e.status === 'nack' ? '✗ NACK' : '···'
-                    return (
-                      <div key={i} style={{ display:'flex', alignItems:'center', gap:5, fontFamily:'monospace', fontSize:10 }}>
-                        <span style={{ color:C.muted,     flexShrink:0 }}>{ts}</span>
-                        <span style={{ color:C.text,      flexShrink:0 }}>{e.label}</span>
-                        <span style={{ color:statusColor, flexShrink:0 }}>{statusLabel}</span>
-                        {e.rtt_ms != null && <span style={{ color:C.muted }}>{e.rtt_ms} ms</span>}
-                      </div>
-                    )
-                  })
-              }
-            </div>
+          <div style={S.cardTitle}>FLIGHT EVENTS</div>
+          {/* Stage strip */}
+          <div style={{ display:'flex', flexWrap:'wrap', gap:2, paddingBottom:4, flexShrink:0 }}>
+            {Object.entries(stageNames).map(([k, name]) => {
+              const id     = Number(k)
+              const stage  = flightStage != null ? Math.round(flightStage) : -1
+              const active = id === stage
+              const past   = id < stage
+              return (
+                <div key={id} style={{
+                  fontSize:9, fontFamily:'monospace', padding:'1px 5px', borderRadius:3, letterSpacing:0.5,
+                  background: active ? C.accent : past ? 'rgba(0,212,255,0.1)' : 'transparent',
+                  color:      active ? '#000' : past ? C.accent : C.muted,
+                  border:     active ? `1px solid ${C.accent}` : past ? '1px solid rgba(0,212,255,0.25)' : `1px solid ${C.border}`,
+                }}>
+                  {name}
+                </div>
+              )
+            })}
+          </div>
+          {/* Event list */}
+          <div style={{ flex:1, overflowY:'auto', display:'flex', flexDirection:'column', gap:1 }}>
+            {events.length === 0
+              ? <div style={{ fontSize:10, color:C.muted, fontFamily:'monospace' }}>Waiting for events…</div>
+              : [...events].reverse().map((ev, i) => {
+                  const isStage = ev.field === 'flight_stage'
+                  const d = new Date(ev.wall_ms)
+                  const ts = `${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}:${String(d.getSeconds()).padStart(2,'0')}`
+                  return (
+                    <div key={i} style={{
+                      display:'flex', alignItems:'flex-start', gap:5, padding:'3px 4px', borderRadius:3,
+                      background: isStage ? 'rgba(0,212,255,0.07)' : 'rgba(255,255,255,0.02)',
+                      borderLeft: isStage ? `2px solid ${C.accent}` : `2px solid ${C.border}`,
+                    }}>
+                      <span style={{ color:C.muted, fontSize:9, fontFamily:'monospace', flexShrink:0, paddingTop:1, minWidth:48 }}>{ts}</span>
+                      <span style={{ color: isStage ? C.accent : C.text, fontSize:10, fontFamily:'monospace', fontWeight: isStage ? 700 : 400, lineHeight:1.4 }}>
+                        {ev.message}
+                      </span>
+                    </div>
+                  )
+                })
+            }
           </div>
         </div>
 

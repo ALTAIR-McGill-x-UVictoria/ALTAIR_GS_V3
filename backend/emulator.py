@@ -458,12 +458,7 @@ class PacketEmulator:
                 phase = i * (2 * math.pi / max(len(entry["fields"]), 1))
                 value = base + amplitude * math.sin(2 * math.pi * t / _SWEEP_PERIOD + phase)
 
-            fields.append({
-                "name":  name,
-                "label": fd["label"],
-                "unit":  fd["unit"],
-                "value": round(value, 6),
-            })
+            fields.append({**fd, "value": round(value, 6)})
 
         return {
             "type":      "packet",

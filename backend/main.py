@@ -19,6 +19,7 @@ import asyncio
 import io
 import json
 import logging
+import math
 import os
 import sys
 import time
@@ -682,6 +683,32 @@ async def post_fc_ping():
     return {"ok": ok, "error": None if ok else "Serial port not connected"}
 
 
+@app.post("/api/fc/command/update_setting")
+async def post_fc_update_setting(body: dict):
+    try:
+        field_id = int(body["field_id"])
+    except (KeyError, TypeError, ValueError):
+        return {"ok": False, "error": "field_id must be an integer"}
+    if not (0 <= field_id <= 15):
+        return {"ok": False, "error": f"field_id {field_id} out of range [0, 15]"}
+    try:
+        value = float(body["value"])
+    except (KeyError, TypeError, ValueError):
+        return {"ok": False, "error": "value must be a number"}
+    if not math.isfinite(value):
+        return {"ok": False, "error": "value must be finite"}
+
+    if _emulating:
+        await _emulated_ack(0xC3)
+        return {"ok": True, "emulated": True}
+
+    from backend.commands import build_command_frame
+    from telemetry.commands.update_setting import UpdateSettingCommandPacket
+    frame = build_command_frame(UpdateSettingCommandPacket(field_id=field_id, value=value))
+    ok = await asyncio.get_event_loop().run_in_executor(None, serial_reader.send_command, frame)
+    return {"ok": ok, "error": None if ok else "Serial port not connected"}
+
+
 @app.post("/api/debug/emulate")
 async def post_debug_emulate(body: dict):
     """Toggle the packet emulator on or off at runtime."""
@@ -713,6 +740,15 @@ async def post_debug_emulate(body: dict):
         return {"ok": True, "emulating": False}
 
     return {"ok": True, "emulating": _emulating}
+
+
+@app.get("/api/debug/registry_fields")
+async def get_debug_registry_fields():
+    from backend.packets import REGISTRY
+    out = {}
+    for pid, entry in REGISTRY.items():
+        out[entry["label"]] = entry["fields"]
+    return out
 
 
 @app.get("/api/debug/emulate")

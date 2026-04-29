@@ -60,18 +60,26 @@ def _label_from_classname(name: str) -> str:
 def _build_fields(cls: type) -> list[dict]:
     """
     Extract display metadata from each dataclass field's FieldMeta.
-    Returns a list of {"name", "label", "unit"} dicts in field order.
+    Returns a list of {"name", "label", "unit", "group", "min", "max"} dicts in field order.
     """
     result = []
     for f in dataclasses.fields(cls):
         meta: FieldMeta = f.metadata.get("field_meta")
         if meta is None:
             continue
-        result.append({
+        entry: dict = {
             "name":  f.name,
             "label": meta.description,
             "unit":  meta.units,
-        })
+            "group": getattr(meta, "group", ""),
+        }
+        min_val = getattr(meta, "min_val", None)
+        max_val = getattr(meta, "max_val", None)
+        if min_val is not None:
+            entry["min"] = min_val
+        if max_val is not None:
+            entry["max"] = max_val
+        result.append(entry)
     return result
 
 

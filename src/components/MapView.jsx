@@ -55,12 +55,19 @@ const aircraftIcon = new L.DivIcon({
 
 // MODE: 'free' | 'payload' | 'both'
 // Keeps the map centred according to the active follow mode.
-// User zoom is always preserved — we only pan, never reset zoom.
-// For 'both' mode, fitBounds fires once when the mode activates, then
-// only pans to keep both markers visible without changing zoom.
+// We only ever pan — zoom is never touched after initial fitBounds.
+// A short suppression window after any zoom event prevents the follow
+// pan from fighting the user's scroll wheel mid-animation.
 function MapFollower({ position, gsPosition, mode }) {
-  const map = useMap()
-  const prevMode = useRef(null)
+  const map          = useMap()
+  const prevMode     = useRef(null)
+  const zoomingUntil = useRef(0)   // epoch ms — suppress panning while zooming
+
+  useEffect(() => {
+    const onZoomStart = () => { zoomingUntil.current = Date.now() + 600 }
+    map.on('zoomstart', onZoomStart)
+    return () => { map.off('zoomstart', onZoomStart) }
+  }, [map])
 
   useEffect(() => {
     if (mode === 'free') {
@@ -68,25 +75,26 @@ function MapFollower({ position, gsPosition, mode }) {
       return
     }
 
+    // Suppress follow panning while the user is actively zooming
+    if (Date.now() < zoomingUntil.current) return
+
     const modeJustChanged = prevMode.current !== mode
     prevMode.current = mode
 
     if (mode === 'payload') {
       if (!position) return
-      map.setView(position, map.getZoom(), { animate: true })
+      map.panTo(position, { animate: true, duration: 0.5 })
     } else if (mode === 'both') {
       if (!position) {
-        map.setView(gsPosition, map.getZoom(), { animate: true })
+        map.panTo(gsPosition, { animate: true, duration: 0.5 })
         return
       }
       if (modeJustChanged) {
-        // Only fitBounds on initial activation; after that, just pan
         map.fitBounds([gsPosition, position], { padding: [40, 40], animate: true })
       } else {
-        // Pan to midpoint without touching zoom
         const midLat = (gsPosition[0] + position[0]) / 2
         const midLon = (gsPosition[1] + position[1]) / 2
-        map.setView([midLat, midLon], map.getZoom(), { animate: true })
+        map.panTo([midLat, midLon], { animate: true, duration: 0.5 })
       }
     }
   }, [position, gsPosition, mode, map])

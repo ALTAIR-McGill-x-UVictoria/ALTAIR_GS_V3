@@ -11,6 +11,54 @@ import SettingsView from './components/SettingsView'
 
 const TABS = ['Flight', 'Telemetry', 'Graphs', 'Telescope', 'Settings']
 
+/**
+ * Resolve the best available GPS packet, normalizing field names to the
+ * MavlinkGps schema (lat, lon, alt, relative_alt, hdg) so all consumers
+ * can use the same field names regardless of which source is active.
+ *
+ * Priority:
+ *   1. MavlinkGpsPacket ("MavlinkGps") — if lat/lon are non-zero
+ *   2. LocalGpsPacket   ("LocalGps")   — fallback, with field remapping:
+ *        alt_msl      → alt
+ *        heading_deg  → hdg
+ *        relative_alt → 0 (not provided by local GPS)
+ */
+function resolveGpsPacket(packets) {
+  const mavlink = Object.entries(packets).find(([k]) => k === 'MavlinkGps')?.[1]
+  if (mavlink) {
+    const lat = mavlink.fields.find(f => f.name === 'lat')?.value ?? 0
+    const lon = mavlink.fields.find(f => f.name === 'lon')?.value ?? 0
+    if (lat !== 0 || lon !== 0) return mavlink
+  }
+
+  const local = Object.entries(packets).find(([k]) => k === 'LocalGps')?.[1]
+  if (!local) return null
+
+  // Remap LocalGps fields to MavlinkGps schema
+  const remapped = local.fields.map(f => {
+    if (f.name === 'alt_msl')     return { ...f, name: 'alt' }
+    if (f.name === 'heading_deg') return { ...f, name: 'hdg' }
+    return f
+  })
+  if (!remapped.find(f => f.name === 'relative_alt')) {
+    remapped.push({ name: 'relative_alt', label: 'Altitude AGL', unit: 'm', value: 0 })
+  }
+  return { ...local, fields: remapped }
+}
+
+function resolveGpsHistory(history, packets) {
+  // Use MavlinkGps history if available and active, else LocalGps history
+  const mavlink = Object.entries(packets).find(([k]) => k === 'MavlinkGps')?.[1]
+  if (mavlink) {
+    const lat = mavlink.fields.find(f => f.name === 'lat')?.value ?? 0
+    const lon = mavlink.fields.find(f => f.name === 'lon')?.value ?? 0
+    if (lat !== 0 || lon !== 0) {
+      return Object.entries(history).find(([k]) => k === 'MavlinkGps')?.[1]
+    }
+  }
+  return Object.entries(history).find(([k]) => k === 'LocalGps')?.[1]
+}
+
 export default function App() {
   const { status, packets, history, freshness, wsReady, alarms, alarmRules, events, stageNames, lastAck, gsGps, gsGpsStatus } = useTelemetry()
   const { tracking, mountStatus, cameraStatus } = useTelescope()
@@ -69,10 +117,10 @@ export default function App() {
               packets={packets}
               events={events}
               stageNames={stageNames}
-              gpsPacket={Object.entries(packets).find(([k]) => k.toLowerCase() === 'gps')?.[1]}
+              gpsPacket={resolveGpsPacket(packets)}
               envPacket={Object.entries(packets).find(([k]) => k.toLowerCase() === 'environment')?.[1]}
               evtPacket={Object.entries(packets).find(([k]) => k.toLowerCase() === 'event')?.[1]}
-              history={Object.entries(history).find(([k]) => k.toLowerCase() === 'gps')?.[1]}
+              history={resolveGpsHistory(history, packets)}
               tracking={tracking}
               gsGps={gsGps}
             />

@@ -12,12 +12,15 @@ export default function FlightView({
   gpsPacket, envPacket, evtPacket, history, tracking, gsGps,
 }) {
   const att   = findPacket(packets, 'attitude')
-  const gps   = findPacket(packets, 'gps')
   const pwr   = findPacket(packets, 'power')
   const vesc  = findPacket(packets, 'vesc')
   const hb    = findPacket(packets, 'heartbeat')
   const env   = findPacket(packets, 'environment')
   const evpkt = findPacket(packets, 'event')
+
+  // gpsPacket is pre-resolved and normalized by App.jsx (MavlinkGps preferred, LocalGps fallback)
+  // Fields use MavlinkGps schema: lat, lon, alt, relative_alt, hdg
+  const gps = gpsPacket
 
   const roll    = fv(att, 'roll',  0)
   const pitch   = fv(att, 'pitch', 0)

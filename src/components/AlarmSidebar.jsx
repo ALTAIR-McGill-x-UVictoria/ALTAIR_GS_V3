@@ -145,8 +145,12 @@ export default function AlarmSidebar({ alarms, onDismissAll, onDismissOne, event
     Object.entries(packets).find(([k]) => k.toLowerCase() === label.toLowerCase())?.[1] ?? null
 
   const hb    = findPkt('heartbeat')
-  const gps   = findPkt('gps')
   const evpkt = findPkt('event')
+  // Prefer MavlinkGps when lat/lon non-zero, else fall back to LocalGps
+  const _mavGps = findPkt('mavlinkgps')
+  const _mavLat = fv(_mavGps, 'lat', 0)
+  const _mavLon = fv(_mavGps, 'lon', 0)
+  const gps = (_mavGps && (_mavLat !== 0 || _mavLon !== 0)) ? _mavGps : findPkt('localgps')
 
   const gpsFix      = gps != null && fv(gps, 'lat', 0) !== 0
   const pixhawkOk   = fv(hb, 'pixhawk_connected',    null) != null && fv(hb, 'pixhawk_connected',    0) > 0.5

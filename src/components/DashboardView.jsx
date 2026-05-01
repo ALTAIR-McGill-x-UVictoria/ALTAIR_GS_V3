@@ -221,7 +221,7 @@ export default function DashboardView({ packets, events = [], stageNames = {}, l
 
         <Card title="POWER" style={{ flex:'2 1 0' }}>
           <div style={{ flex:1, display:'grid', gridTemplateColumns:'1fr 1fr', gridTemplateRows:'1fr 1fr', gap:4, alignItems:'center', justifyItems:'center' }}>
-            <ArcGauge label="Voltage" value={voltage} unit="V" min={9} max={14} warnLo={10.9} warnHi={12.9} size={100} />
+            <ArcGauge label="Voltage" value={voltage} unit="V" min={19.8} max={25.2} warnLo={21.0} warnHi={24.6} size={100} />
             <ArcGauge label="Current" value={current} unit="A" min={0} max={15} warnHi={12} size={100} />
             <ArcGauge label="Temp"    value={pwrTemp} unit="°C" min={0} max={80} warnHi={60} size={100} />
             <ArcGauge

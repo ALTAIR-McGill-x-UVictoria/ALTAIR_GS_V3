@@ -54,18 +54,9 @@ function AckPill({ isPending, ack }) {
 
 function SettingRow({ field, liveValue, draft, onDraftChange, onSend, isPending, ack, touched }) {
   const parsed  = parseFloat(draft)
-  const isNum   = draft.trim() !== '' && isFinite(parsed)
-  const inRange = isNum
-    && (field.min == null || parsed >= field.min)
-    && (field.max == null || parsed <= field.max)
-  const isValid = inRange
+  const isValid = draft.trim() !== '' && isFinite(parsed)
   const canSend = isValid && !isPending
-
-  const rangeHint = field.min != null && field.max != null
-    ? `${formatLive(field.min)} – ${formatLive(field.max)}`
-    : field.min != null ? `≥ ${formatLive(field.min)}`
-    : field.max != null ? `≤ ${formatLive(field.max)}`
-    : null
+  const rangeHint = null
 
   return (
     <div style={SV.row}>
@@ -124,10 +115,7 @@ export default function SettingsView({ packets, lastAck }) {
       const next = { ...prev }
       settingsPkt.fields.forEach((f, idx) => {
         if (next[idx] === undefined && f.value != null) {
-          let v = f.value
-          if (f.min != null) v = Math.max(v, f.min)
-          if (f.max != null) v = Math.min(v, f.max)
-          next[idx] = String(parseFloat(v.toPrecision(6)))
+          next[idx] = String(parseFloat(f.value.toPrecision(6)))
         }
       })
       return next

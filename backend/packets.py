@@ -96,10 +96,11 @@ for _pid, _cls in packet_registry.all_packets().items():
         continue
     _, _pkt_struct = packet_registry.get_by_id(_pid)
     REGISTRY[_pid] = {
-        "cls":    _cls,
-        "struct": _pkt_struct,
-        "label":  getattr(_cls, "LABEL", _label_from_classname(_cls.__name__)),
-        "fields": _build_fields(_cls),
+        "cls":       _cls,
+        "struct":    _pkt_struct,
+        "label":     getattr(_cls, "LABEL", _label_from_classname(_cls.__name__)),
+        "fields":    _build_fields(_cls),
+        "target_hz": getattr(_cls, "TX_RATE_HZ", None),
     }
 
 # ---------------------------------------------------------------------------
@@ -107,8 +108,10 @@ for _pid, _cls in packet_registry.all_packets().items():
 # ---------------------------------------------------------------------------
 
 SYNC_BYTE   = 0xAA
+ACK_PACKET_ID = 0xA0
 _HEADER     = struct.Struct("<BBBdH")   # sync, pkt_id, seq, timestamp, length
 _CRC        = struct.Struct("<H")
+_ACK_PAYLOAD = struct.Struct("<BBB")   # cmd_id, cmd_seq, status
 HEADER_SIZE = _HEADER.size              # 13
 CRC_SIZE    = _CRC.size                 # 2
 MIN_FRAME   = HEADER_SIZE + CRC_SIZE    # 15
@@ -116,6 +119,29 @@ MIN_FRAME   = HEADER_SIZE + CRC_SIZE    # 15
 # ---------------------------------------------------------------------------
 # Decoder
 # ---------------------------------------------------------------------------
+
+def decode_ack_frame(raw: bytes) -> dict[str, Any] | None:
+    """
+    Decode an AckPacket (0xA0) frame. Returns {cmd_id, cmd_seq, status} on
+    success, None on any validation failure.
+    """
+    if len(raw) < MIN_FRAME:
+        return None
+    sync, pkt_id, _, _, length = _HEADER.unpack_from(raw, 0)
+    if sync != SYNC_BYTE or pkt_id != ACK_PACKET_ID:
+        return None
+    if len(raw) < HEADER_SIZE + length + CRC_SIZE:
+        return None
+    received_crc = _CRC.unpack_from(raw, HEADER_SIZE + length)[0]
+    computed_crc = binascii.crc_hqx(raw[1: HEADER_SIZE + length], 0xFFFF)
+    if received_crc != computed_crc:
+        return None
+    payload = raw[HEADER_SIZE: HEADER_SIZE + length]
+    if len(payload) != _ACK_PAYLOAD.size:
+        return None
+    cmd_id, cmd_seq, status = _ACK_PAYLOAD.unpack(payload)
+    return {"cmd_id": cmd_id, "cmd_seq": cmd_seq, "status": status}
+
 
 def decode_frame(raw: bytes) -> dict[str, Any] | None:
     """
@@ -159,7 +185,7 @@ def decode_frame(raw: bytes) -> dict[str, Any] | None:
 
     values = entry["struct"].unpack(payload)
 
-    return {
+    result = {
         "packet_id": pkt_id,
         "label":     entry["label"],
         "seq":       seq,
@@ -169,3 +195,6 @@ def decode_frame(raw: bytes) -> dict[str, Any] | None:
             for fd, v in zip(entry["fields"], values)
         ],
     }
+    if entry["target_hz"] is not None:
+        result["target_hz"] = entry["target_hz"]
+    return result

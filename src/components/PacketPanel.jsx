@@ -103,7 +103,16 @@ export default function PacketPanel({ label, packet, history, alarms = [], rules
     )
   }
 
-  const { fields, seq, timestamp, wall_ms, dropped, hz } = packet
+  const { fields, seq, timestamp, wall_ms, dropped, hz, target_hz } = packet
+
+  // Rate badge color: green ≥80% of target, yellow ≥50%, red below, grey if no target
+  const rateColor = (() => {
+    if (target_hz == null || hz == null) return 'var(--muted)'
+    const ratio = hz / target_hz
+    if (ratio >= 0.8) return 'var(--ok)'
+    if (ratio >= 0.5) return 'var(--warn)'
+    return 'var(--error)'
+  })()
 
   // Worst severity across all alarming fields
   const panelSev = alarms.find(a => a.severity === 'critical')?.severity
@@ -141,11 +150,13 @@ export default function PacketPanel({ label, packet, history, alarms = [], rules
             {panelSev.toUpperCase()}
           </span>
         )}
-        <span style={{ ...styles.badge, background: 'var(--border)', color: 'var(--muted)', marginLeft: 'auto', display: 'inline-flex', alignItems: 'center', gap: 3 }}>
+        <span style={{ ...styles.badge, background: 'var(--border)', color: rateColor, marginLeft: 'auto', display: 'inline-flex', alignItems: 'center', gap: 3 }}>
           <span style={{ display: 'inline-block', width: 36, textAlign: 'right' }}>
-            {hz !== null && hz !== undefined ? String(hz) : '—'}
+            {hz != null ? String(hz) : '—'}
           </span>
-          <span>Hz</span>
+          <span style={{ color: 'var(--muted)' }}>/</span>
+          <span style={{ color: 'var(--muted)' }}>{target_hz != null ? `${target_hz}` : '—'}</span>
+          <span style={{ color: 'var(--muted)' }}>Hz</span>
         </span>
       </div>
 

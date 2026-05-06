@@ -155,12 +155,10 @@ export default function AlarmSidebar({ alarms, onDismissAll, onDismissOne, event
   const gpsFix      = gps != null && fv(gps, 'lat', 0) !== 0
   const pixhawkOk   = fv(hb, 'pixhawk_connected',    null) != null && fv(hb, 'pixhawk_connected',    0) > 0.5
   const vescOk      = fv(hb, 'vesc_connected',        null) != null && fv(hb, 'vesc_connected',        0) > 0.5
-  const powerOk     = fv(hb, 'power_connected',       null) != null && fv(hb, 'power_connected',       0) > 0.5
-  const photodiodeOk= fv(hb, 'photodiode_connected',  null) != null && fv(hb, 'photodiode_connected',  0) > 0.5
   const dataLogging = fv(evpkt, 'data_logging_active', 0) === 1
   const armState    = fv(evpkt, 'arm_state', 0) === 1
 
-  const allOk     = gpsFix && pixhawkOk && vescOk && powerOk && photodiodeOk && dataLogging
+  const allOk     = gpsFix && pixhawkOk && vescOk && dataLogging
   const canArm    = allOk
   const canLaunch = allOk && armState
 
@@ -502,7 +500,8 @@ const styles = {
     flexDirection: 'column',
     flexShrink:    0,
     borderTop:     '1px solid #1e2d3d',
-    minHeight:     130,
+    height:        280,
+    overflow:      'hidden',
   },
   sectionHeader: {
     fontSize:      9,

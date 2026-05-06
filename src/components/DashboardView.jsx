@@ -47,8 +47,6 @@ export default function DashboardView({ packets, events = [], stageNames = {}, l
   const uptime  = fv(hb,   'uptime_s',           null)
   const pixConn        = fv(hb, 'pixhawk_connected',    null)
   const vescConn       = fv(hb, 'vesc_connected',       null)
-  const powerConn      = fv(hb, 'power_connected',      null)
-  const photodiodeConn = fv(hb, 'photodiode_connected', null)
 
   const flightStage  = fv(evpkt, 'flight_stage', null)
 
@@ -113,8 +111,6 @@ export default function DashboardView({ packets, events = [], stageNames = {}, l
   const gpsFix        = gps != null && fv(gps, 'lat', 0) !== 0
   const pixhawkOk     = pixConn        != null && pixConn        > 0.5
   const vescOk        = vescConn       != null && vescConn       > 0.5
-  const powerOk       = powerConn      != null && powerConn      > 0.5
-  const photodiodeOk  = photodiodeConn != null && photodiodeConn > 0.5
   const dataLogging   = fv(evpkt, 'data_logging_active', 0) === 1
   const armState      = fv(evpkt, 'arm_state', 0) === 1
   const gpsHdop       = fv(gps, 'eph', null)
@@ -367,15 +363,13 @@ export default function DashboardView({ packets, events = [], stageNames = {}, l
             <CheckItem label="GPS Fix" ok={gps ? gpsFix : null} detail={gpsFix && gpsHdop != null ? `HDOP ${gpsHdop.toFixed(1)}` : null} />
             <CheckItem label="Pixhawk Connected" ok={hb ? pixhawkOk : null} />
             <CheckItem label="VESC Connected"    ok={hb ? vescOk : null} />
-            <CheckItem label="Power Board"       ok={hb ? powerOk : null} />
-            <CheckItem label="Photodiode Board"  ok={hb ? photodiodeOk : null} />
             <CheckItem label="Data Logging Active" ok={evpkt ? dataLogging : null} />
             <CheckItem label="Arm State" ok={evpkt ? armState : null} detail={armState ? 'ARMED' : evpkt ? 'DISARMED' : null} />
           </div>
         </Card>
 
         {(() => {
-          const allOk    = gpsFix && pixhawkOk && vescOk && powerOk && photodiodeOk && dataLogging
+          const allOk    = gpsFix && pixhawkOk && vescOk && dataLogging
           const canArm   = allOk
           const canLaunch = allOk && armState
           return (

@@ -28,21 +28,29 @@ import backend.tracking as tracking
 logger = logging.getLogger("gs.gps")
 
 # u-blox 7 USB VID / PID
-_UBLOX7_VID = 0x1546
-_UBLOX7_PID = 0x01A7
+# PID 0x01A7 = u-blox 7 (most firmware), 0x01A8 = alternate enumeration on some Windows drivers
+_UBLOX7_VID  = 0x1546
+_UBLOX7_PIDS = {0x01A7, 0x01A8}
 
 # NMEA baud rate (u-blox default)
 _BAUD = 9600
 
 # Minimum satellite count to accept a fix
-_MIN_SATS = 4
+_MIN_SATS = 3
+
+# How often to retry auto-detection if the dongle wasn't found at startup (seconds)
+_RETRY_INTERVAL_S = 10
 
 
 def find_ublox7() -> str | None:
     """Return the first COM port that looks like a u-blox 7 dongle, or None."""
     for p in serial.tools.list_ports.comports():
-        if p.vid == _UBLOX7_VID and p.pid == _UBLOX7_PID:
+        if p.vid == _UBLOX7_VID and p.pid in _UBLOX7_PIDS:
+            logger.debug("u-blox 7 candidate: %s VID=%04x PID=%04x desc=%s",
+                         p.device, p.vid, p.pid, p.description)
             return p.device
+    all_ports = [(p.device, p.vid, p.pid) for p in serial.tools.list_ports.comports()]
+    logger.debug("find_ublox7: no match. Ports seen: %s", all_ports)
     return None
 
 
@@ -60,12 +68,16 @@ class GsGpsReader:
         self._on_fix    = on_fix
         self._on_status = on_status   # called with (connected: bool, has_fix: bool, port: str)
         self._task: asyncio.Task | None = None
+        self._retry_task: asyncio.Task | None = None
         self._port: serial.Serial | None = None
         self.port_name: str = ""
         self.connected: bool = False
 
         # Latest fix — None until first valid sentence
         self.fix: dict | None = None
+
+        # Ring buffer of last 10 raw NMEA sentences for debug inspection
+        self._raw_buf: list[str] = []
 
     # ------------------------------------------------------------------
     # Public API
@@ -75,16 +87,28 @@ class GsGpsReader:
         """
         Open the GPS serial port and start reading.
         Auto-detects the u-blox 7 if port is omitted.
-        Returns True if started successfully.
+        If the dongle is not found, a background retry task polls every
+        _RETRY_INTERVAL_S seconds until it appears.
+        Returns True if opened immediately, False if deferred to retry loop.
         """
         if self.connected:
             await self.stop()
 
         port = port or find_ublox7()
         if port is None:
-            logger.warning("GsGpsReader: u-blox 7 not found — GS position remains hardcoded")
+            logger.warning(
+                "GsGpsReader: u-blox 7 not found — will retry every %ds. "
+                "GS position remains hardcoded until a fix is acquired.",
+                _RETRY_INTERVAL_S,
+            )
+            if self._retry_task is None or self._retry_task.done():
+                self._retry_task = asyncio.create_task(self._retry_loop())
             return False
 
+        return await self._open(port)
+
+    async def _open(self, port: str) -> bool:
+        """Open the serial port and start the read loop. Returns True on success."""
         try:
             self._port = serial.Serial(port, _BAUD, timeout=1)
             self.port_name = port
@@ -97,7 +121,24 @@ class GsGpsReader:
             logger.error("GsGpsReader: cannot open %s: %s", port, e)
             return False
 
+    async def _retry_loop(self) -> None:
+        """Poll for the u-blox 7 dongle until it appears, then open it."""
+        while not self.connected:
+            await asyncio.sleep(_RETRY_INTERVAL_S)
+            port = find_ublox7()
+            if port:
+                logger.info("GsGpsReader: u-blox 7 found on retry — opening %s", port)
+                await self._open(port)
+                return
+            logger.debug("GsGpsReader: retry — dongle still not found")
+
     async def stop(self) -> None:
+        if self._retry_task and not self._retry_task.done():
+            self._retry_task.cancel()
+            try:
+                await self._retry_task
+            except asyncio.CancelledError:
+                pass
         if self._task:
             self._task.cancel()
             try:
@@ -113,10 +154,11 @@ class GsGpsReader:
 
     def status_dict(self) -> dict:
         return {
-            "connected": self.connected,
-            "has_fix":   self.fix is not None,
-            "port":      self.port_name,
-            "fix":       self.fix,
+            "connected":  self.connected,
+            "has_fix":    self.fix is not None,
+            "port":       self.port_name,
+            "fix":        self.fix,
+            "raw_nmea":   list(self._raw_buf),
         }
 
     async def _emit_status(self) -> None:
@@ -167,6 +209,11 @@ class GsGpsReader:
         if not sentence.startswith("$"):
             return
 
+        # Keep last 10 raw sentences for debug inspection
+        self._raw_buf.append(sentence)
+        if len(self._raw_buf) > 10:
+            self._raw_buf.pop(0)
+
         try:
             import pynmea2
             msg = pynmea2.parse(sentence)
@@ -189,6 +236,7 @@ class GsGpsReader:
             return
 
         if fix_quality == 0 or sats < _MIN_SATS:
+            logger.debug("GGA: no fix yet (quality=%d sats=%d hdop=%.1f)", fix_quality, sats, hdop)
             return
 
         try:
@@ -265,6 +313,14 @@ class GsGpsReader:
         }
 
         first_fix = (self.fix is None)
+
+        # Suppress broadcast when position hasn't meaningfully changed (RMC fires
+        # every second and duplicates GGA with the same coordinates)
+        if not first_fix and not self._position_changed(fix):
+            self.fix = fix  # still update alt/utc/hdop quietly
+            tracking.GS_ALT = fix["alt"]
+            return
+
         self.fix = fix
 
         # Push live position into tracking module
@@ -272,12 +328,26 @@ class GsGpsReader:
         tracking.GS_LON = fix["lon"]
         tracking.GS_ALT = fix["alt"]
 
-        logger.debug("GS fix: lat=%.6f lon=%.6f alt=%.1fm sats=%d hdop=%.1f",
-                     lat, lon, alt, sats, hdop)
+        logger.info("GS fix: lat=%.6f lon=%.6f alt=%.1fm sats=%d hdop=%.1f",
+                    lat, lon, alt, sats, hdop)
 
         if first_fix:
             await self._emit_status()
         await self._emit_fix_event(fix)
+
+    def _position_changed(self, new: dict) -> bool:
+        """True if position changed meaningfully or sats/quality changed."""
+        old = self.fix
+        if abs(new["lat"] - old["lat"]) > 1e-4:  # ~10 m
+            return True
+        if abs(new["lon"] - old["lon"]) > 1e-4:
+            return True
+        if new["sats"] != old["sats"] or new["fix_quality"] != old["fix_quality"]:
+            return True
+        # Always broadcast at least once per minute so the frontend stays fresh
+        if (_time.time() - old.get("utc_unix", 0)) > 60:
+            return True
+        return False
 
     async def _emit_fix_event(self, fix: dict) -> None:
         if self._on_fix is None:

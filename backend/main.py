@@ -33,7 +33,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, Response
 
-from backend.packets import REGISTRY, HEADER_SIZE, CRC_SIZE, MIN_FRAME, SYNC_BYTE, decode_frame
+from backend.packets import REGISTRY, HEADER_SIZE, CRC_SIZE, MIN_FRAME, SYNC_BYTE, ACK_PACKET_ID, decode_frame, decode_ack_frame
 from backend.packets import _HEADER, _CRC
 from backend.tracking import calculate_tracking_params
 from backend.mount import BaseMountController, create_mount
@@ -93,6 +93,9 @@ class SerialReader:
         self.connected = False
         self.port_name = ""
         self._clients: set[WebSocket]    = set()
+        # Restart coalescing: track pending gaps to detect FC reboot vs link loss
+        self._pending_gaps: dict[int, int] = {}   # pkt_id → dropped count
+        self._pending_gap_time: float = 0.0
 
     def add_client(self, ws: WebSocket)    -> None: self._clients.add(ws)
     def remove_client(self, ws: WebSocket) -> None: self._clients.discard(ws)
@@ -188,11 +191,21 @@ class SerialReader:
             frame = bytes(self._buf[:frame_size])
             del self._buf[:frame_size]
 
+            # ACK frames (0xA0) are not in REGISTRY — decode and broadcast directly
+            _, pkt_id_peek, _, _, _ = _HEADER.unpack_from(frame, 0)
+            if pkt_id_peek == ACK_PACKET_ID:
+                ack = decode_ack_frame(frame)
+                if ack:
+                    await self._broadcast({"type": "ack", **ack})
+                continue
+
             result = decode_frame(frame)
             if result is None:
                 continue
 
-            # Sequence gap detection
+            # Sequence gap detection with FC-restart coalescing.
+            # When all packet types jump by a similar amount within 100 ms,
+            # that's a reboot — emit one INFO instead of N warnings.
             pkt_id = result["packet_id"]
             seq    = result["seq"]
             prev   = self._seq_prev.get(pkt_id)
@@ -200,32 +213,33 @@ class SerialReader:
                 expected = (prev + 1) & 0xFF
                 if seq != expected:
                     dropped = (seq - expected) & 0xFF
-                    logger.warning("SEQ gap PKT_ID=0x%02X: expected %d got %d (%d dropped)",
-                                   pkt_id, expected, seq, dropped)
                     result["dropped"] = dropped
+                    now = time.time()
+                    # Flush old pending gaps if the window expired
+                    if now - self._pending_gap_time > 1.0:
+                        if self._pending_gaps:
+                            logger.warning(
+                                "SEQ gap (link loss) on %d packet type(s): %s",
+                                len(self._pending_gaps),
+                                ", ".join(f"0x{k:02X}={v}dropped"
+                                          for k, v in self._pending_gaps.items()),
+                            )
+                        self._pending_gaps.clear()
+                    self._pending_gaps[pkt_id] = dropped
+                    self._pending_gap_time = now
+                    # If every known packet type has a gap, it's a restart
+                    known = set(self._seq_prev.keys())
+                    if known and known.issubset(self._pending_gaps.keys()):
+                        logger.info("FC restart detected — seq counters reset across all %d packet types",
+                                    len(known))
+                        self._pending_gaps.clear()
+                        self._seq_prev.clear()
             self._seq_prev[pkt_id] = seq
 
             result["wall_ms"] = round(time.time() * 1000)
             await self._broadcast({"type": "packet", **result})
 
     async def _broadcast(self, msg: dict[str, Any]) -> None:
-        # Intercept ACK packets — re-emit as a dedicated "ack" message type
-        # so the frontend can react without treating it as a regular telemetry packet.
-        if msg.get("type") == "packet" and msg.get("label", "").lower() == "ack":
-            fields = {f["name"]: int(f["value"]) for f in msg.get("fields", [])}
-            ack_msg = json.dumps({
-                "type":    "ack",
-                "cmd_id":  fields.get("cmd_id",  0),
-                "cmd_seq": fields.get("cmd_seq", 0),
-                "status":  fields.get("status",  0),  # 0=ok, 1=rejected
-            })
-            for ws in list(self._clients):
-                try:
-                    await ws.send_text(ack_msg)
-                except Exception:
-                    pass
-            return  # do not broadcast ACK as a regular packet
-
         # Intercept GPS packets to keep _latest_gps up-to-date for telescope tracking
         if msg.get("type") == "packet" and msg.get("label", "").lower() == "gps":
             global _latest_gps
@@ -341,6 +355,7 @@ _latest_tracking: dict | None = None
 _telescope_clients: set[WebSocket] = set()
 
 _tracking_task: asyncio.Task | None = None
+_gs_gps_task: asyncio.Task | None = None
 _tracking_enabled = False
 
 # ---------------------------------------------------------------------------
@@ -484,13 +499,40 @@ async def _tracking_poll_loop(interval_s: float = 1.0) -> None:
             logger.warning("Tracking poll error: %s", e)
 
 
+async def _gs_gps_beacon_loop(interval_s: float = 5.0) -> None:
+    """
+    Broadcast the GS position to the FC every 2 seconds while the serial
+    link is open. The FC uses this to aim its downward light source at us.
+    """
+    from backend.commands import build_command_frame
+    from telemetry.commands.gs_gps import GsGpsCommandPacket
+    import backend.tracking as _tracking
+
+    while True:
+        await asyncio.sleep(interval_s)
+        if serial_reader.port_name is None:
+            continue
+        try:
+            pkt = GsGpsCommandPacket(
+                lat=_tracking.GS_LAT,
+                lon=_tracking.GS_LON,
+                alt=_tracking.GS_ALT,
+            )
+            frame = build_command_frame(pkt)
+            await asyncio.get_event_loop().run_in_executor(
+                None, serial_reader.send_command, frame
+            )
+        except Exception as e:
+            logger.warning("GS GPS beacon error: %s", e)
+
+
 # ---------------------------------------------------------------------------
 # FastAPI app
 # ---------------------------------------------------------------------------
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _tracking_task, _emulator, _emulating, _latest_packets, _latest_alarms, _latest_events
+    global _tracking_task, _gs_gps_task, _emulator, _emulating, _latest_packets, _latest_alarms, _latest_events
 
     # Attempt to resume the most recent session if it was saved within the last 5 minutes.
     # Skip resume in emulator mode — emulator packets have synthetic timestamps that
@@ -537,6 +579,9 @@ async def lifespan(app: FastAPI):
 
     # Start telescope tracking poll loop
     _tracking_task = asyncio.create_task(_tracking_poll_loop())
+
+    # Periodically beacon GS position to FC for optical pointing
+    _gs_gps_task = asyncio.create_task(_gs_gps_beacon_loop())
     yield
 
     await gs_gps_reader.stop()
@@ -545,6 +590,12 @@ async def lifespan(app: FastAPI):
         _tracking_task.cancel()
         try:
             await _tracking_task
+        except asyncio.CancelledError:
+            pass
+    if _gs_gps_task:
+        _gs_gps_task.cancel()
+        try:
+            await _gs_gps_task
         except asyncio.CancelledError:
             pass
     if _emulator:
@@ -585,6 +636,23 @@ def get_status():
 def get_gs_gps():
     """Current ground station GPS fix from the u-blox 7 dongle."""
     return gs_gps_reader.status_dict()
+
+
+@app.get("/api/gs/gps/scan")
+def get_gs_gps_scan():
+    """List all COM ports visible to the backend, for debugging dongle detection."""
+    import serial.tools.list_ports as lp
+    from backend.gps_reader import _UBLOX7_VID, _UBLOX7_PIDS
+    ports = []
+    for p in lp.comports():
+        ports.append({
+            "device":      p.device,
+            "description": p.description,
+            "vid":         hex(p.vid) if p.vid else None,
+            "pid":         hex(p.pid) if p.pid else None,
+            "is_ublox7":   p.vid == _UBLOX7_VID and p.pid in _UBLOX7_PIDS,
+        })
+    return {"ports": ports}
 
 
 @app.post("/api/gs/gps/connect")
@@ -793,6 +861,10 @@ async def websocket_endpoint(ws: WebSocket):
         "has_fix":   gs_gps_reader.fix is not None,
         "port":      gs_gps_reader.port_name,
     }))
+    # Send the current fix if one exists — without this, clients that connect
+    # after the fix was acquired never receive the coordinates
+    if gs_gps_reader.fix is not None:
+        await ws.send_text(json.dumps({"type": "gs_gps", **gs_gps_reader.fix}))
     # Tell frontend to fetch the state snapshot (packets/alarms/events from last session)
     await ws.send_text(json.dumps({"type": "snapshot_ready"}))
     try:

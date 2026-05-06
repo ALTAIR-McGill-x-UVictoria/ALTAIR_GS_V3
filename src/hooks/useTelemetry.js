@@ -195,7 +195,7 @@ export function useTelemetry() {
 
         setPackets(prev => ({
           ...prev,
-          [label]: { fields, seq, timestamp, wall_ms: msg.wall_ms ?? null, dropped: msg.dropped ?? 0, hz },
+          [label]: { fields, seq, timestamp, wall_ms: msg.wall_ms ?? null, dropped: msg.dropped ?? 0, hz, target_hz: msg.target_hz ?? null },
         }))
 
         setHistory(prev => {

@@ -16,25 +16,27 @@ const TABS = ['Flight', 'Telemetry', 'Graphs', 'Telescope', 'Settings']
  * MavlinkGps schema (lat, lon, alt, relative_alt, hdg) so all consumers
  * can use the same field names regardless of which source is active.
  *
- * Priority:
- *   1. MavlinkGpsPacket ("MavlinkGps") — if lat/lon are non-zero
- *   2. LocalGpsPacket   ("LocalGps")   — fallback, with field remapping:
- *        alt_msl      → alt
- *        heading_deg  → hdg
- *        relative_alt → 0 (not provided by local GPS)
+ * Selects the source with the better fix, scored as:
+ *   fix_type (LocalGps field, 0–5; MavlinkGps treated as 3 when lat/lon non-zero)
+ *   then num_sv as tiebreaker.
+ *
+ * LocalGps field remapping applied when selected:
+ *   alt_msl      → alt
+ *   heading_deg  → hdg
+ *   relative_alt → 0 (not provided by local GPS)
  */
-function resolveGpsPacket(packets) {
-  const mavlink = Object.entries(packets).find(([k]) => k === 'MavlinkGps')?.[1]
-  if (mavlink) {
-    const lat = mavlink.fields.find(f => f.name === 'lat')?.value ?? 0
-    const lon = mavlink.fields.find(f => f.name === 'lon')?.value ?? 0
-    if (lat !== 0 || lon !== 0) return mavlink
+function gpsScore(pkt, isMavlink) {
+  if (!pkt) return { fixType: 0, numSv: 0 }
+  const fv = (name, def) => pkt.fields.find(f => f.name === name)?.value ?? def
+  const lat = fv('lat', 0), lon = fv('lon', 0)
+  if (isMavlink) {
+    const hasFix = lat !== 0 || lon !== 0
+    return { fixType: hasFix ? 3 : 0, numSv: fv('num_sv', 0) }
   }
+  return { fixType: fv('fix_type', 0), numSv: fv('num_sv', 0) }
+}
 
-  const local = Object.entries(packets).find(([k]) => k === 'LocalGps')?.[1]
-  if (!local) return null
-
-  // Remap LocalGps fields to MavlinkGps schema
+function remapLocalGps(local) {
   const remapped = local.fields.map(f => {
     if (f.name === 'alt_msl')     return { ...f, name: 'alt' }
     if (f.name === 'heading_deg') return { ...f, name: 'hdg' }
@@ -46,17 +48,32 @@ function resolveGpsPacket(packets) {
   return { ...local, fields: remapped }
 }
 
+function resolveGpsPacket(packets) {
+  const mavlink = Object.entries(packets).find(([k]) => k === 'MavlinkGps')?.[1] ?? null
+  const local   = Object.entries(packets).find(([k]) => k === 'LocalGps')?.[1]   ?? null
+
+  if (!mavlink && !local) return null
+  if (!mavlink) return remapLocalGps(local)
+  if (!local)   return mavlink
+
+  const ms = gpsScore(mavlink, true)
+  const ls = gpsScore(local,   false)
+  const mavWins = ms.fixType > ls.fixType || (ms.fixType === ls.fixType && ms.numSv >= ls.numSv)
+  return mavWins ? mavlink : remapLocalGps(local)
+}
+
 function resolveGpsHistory(history, packets) {
-  // Use MavlinkGps history if available and active, else LocalGps history
-  const mavlink = Object.entries(packets).find(([k]) => k === 'MavlinkGps')?.[1]
-  if (mavlink) {
-    const lat = mavlink.fields.find(f => f.name === 'lat')?.value ?? 0
-    const lon = mavlink.fields.find(f => f.name === 'lon')?.value ?? 0
-    if (lat !== 0 || lon !== 0) {
-      return Object.entries(history).find(([k]) => k === 'MavlinkGps')?.[1]
-    }
-  }
-  return Object.entries(history).find(([k]) => k === 'LocalGps')?.[1]
+  const mavlink = Object.entries(packets).find(([k]) => k === 'MavlinkGps')?.[1] ?? null
+  const local   = Object.entries(packets).find(([k]) => k === 'LocalGps')?.[1]   ?? null
+  if (!mavlink && !local) return Object.entries(history).find(([k]) => k === 'LocalGps')?.[1]
+  if (!local) return Object.entries(history).find(([k]) => k === 'MavlinkGps')?.[1]
+  if (!mavlink) return Object.entries(history).find(([k]) => k === 'LocalGps')?.[1]
+  const ms = gpsScore(mavlink, true)
+  const ls = gpsScore(local,   false)
+  const mavWins = ms.fixType > ls.fixType || (ms.fixType === ls.fixType && ms.numSv >= ls.numSv)
+  return mavWins
+    ? Object.entries(history).find(([k]) => k === 'MavlinkGps')?.[1]
+    : Object.entries(history).find(([k]) => k === 'LocalGps')?.[1]
 }
 
 export default function App() {

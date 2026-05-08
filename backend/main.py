@@ -530,9 +530,35 @@ async def _gs_gps_beacon_loop(interval_s: float = 5.0) -> None:
 # FastAPI app
 # ---------------------------------------------------------------------------
 
+async def _sync_system_clock() -> None:
+    """Force a W32TM clock resync on Windows to minimise GS/FC timestamp skew."""
+    if sys.platform != "win32":
+        return
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "w32tm", "/resync", "/force",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
+        if proc.returncode == 0:
+            logger.info("W32TM resync succeeded: %s", stdout.decode().strip())
+        else:
+            logger.warning("W32TM resync failed (rc=%d) — run backend as administrator for clock sync: %s",
+                           proc.returncode, stderr.decode().strip())
+    except asyncio.TimeoutError:
+        logger.warning("W32TM resync timed out")
+    except FileNotFoundError:
+        logger.warning("w32tm not found — clock sync skipped")
+    except Exception:
+        logger.warning("W32TM resync error", exc_info=True)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _tracking_task, _gs_gps_task, _emulator, _emulating, _latest_packets, _latest_alarms, _latest_events
+
+    await _sync_system_clock()
 
     # Attempt to resume the most recent session if it was saved within the last 5 minutes.
     # Skip resume in emulator mode — emulator packets have synthetic timestamps that
@@ -757,8 +783,8 @@ async def post_fc_update_setting(body: dict):
         field_id = int(body["field_id"])
     except (KeyError, TypeError, ValueError):
         return {"ok": False, "error": "field_id must be an integer"}
-    if not (0 <= field_id <= 15):
-        return {"ok": False, "error": f"field_id {field_id} out of range [0, 15]"}
+    if not (0 <= field_id <= 17):
+        return {"ok": False, "error": f"field_id {field_id} out of range [0, 17]"}
     try:
         value = float(body["value"])
     except (KeyError, TypeError, ValueError):

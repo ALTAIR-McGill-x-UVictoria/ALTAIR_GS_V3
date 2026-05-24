@@ -3,9 +3,13 @@ import { useEffect, useRef, useState, useCallback } from 'react'
 const WS_URL = 'ws://localhost:5173/ws'
 const HISTORY_LEN = 200   // data points kept per field for sparklines
 
-// Staleness thresholds in milliseconds
-const STALE_WARN_MS = 2000   // yellow  — no packet for 2 s
-const STALE_LOST_MS = 5000   // red     — no packet for 5 s
+// Staleness multipliers: warn after 3 expected periods, lost after 6.
+// These scale with target_hz so slow packets (e.g. 0.1 Hz at Low data rate)
+// don't false-alarm. Floor at 2 s / 5 s for fast packets.
+const STALE_WARN_PERIODS = 3
+const STALE_LOST_PERIODS = 6
+const STALE_WARN_MS_MIN  = 2000
+const STALE_LOST_MS_MIN  = 5000
 
 /**
  * Central telemetry hook.
@@ -34,6 +38,7 @@ export function useTelemetry() {
   const [gsGpsStatus, setGsGpsStatus] = useState({ connected: false, has_fix: false, port: '' })
   const lastSeen     = useRef({})
   const arrivalTimes = useRef({})
+  const targetHzRef  = useRef({})   // { [label]: target_hz } — updated on each packet
   const [freshness, setFreshness] = useState({})
 
   const RATE_WINDOW = 10   // use last N arrivals to compute Hz
@@ -180,6 +185,7 @@ export function useTelemetry() {
 
         const now = Date.now()
         lastSeen.current[label] = now
+        if (msg.target_hz != null) targetHzRef.current[label] = msg.target_hz
 
         // Rolling arrival window → update Hz
         const buf = arrivalTimes.current[label] ?? []
@@ -230,16 +236,22 @@ export function useTelemetry() {
     }
   }, [])
 
-  // Poll freshness every 500 ms
+  // Poll freshness every 500 ms.
+  // Thresholds scale with the packet's target_hz so slow packets at low data
+  // rates (e.g. 0.1 Hz) don't immediately show stale. Floored at fixed mins.
   useEffect(() => {
     const id = setInterval(() => {
       const now = Date.now()
       const next = {}
       for (const [label, ts] of Object.entries(lastSeen.current)) {
         const age = now - ts
-        if      (age > STALE_LOST_MS) next[label] = 'lost'
-        else if (age > STALE_WARN_MS) next[label] = 'stale'
-        else                          next[label] = 'ok'
+        const hz = targetHzRef.current[label]
+        const periodMs = hz > 0 ? 1000 / hz : 0
+        const warnMs = periodMs > 0 ? Math.max(periodMs * STALE_WARN_PERIODS, STALE_WARN_MS_MIN) : STALE_WARN_MS_MIN
+        const lostMs = periodMs > 0 ? Math.max(periodMs * STALE_LOST_PERIODS, STALE_LOST_MS_MIN) : STALE_LOST_MS_MIN
+        if      (age > lostMs) next[label] = 'lost'
+        else if (age > warnMs) next[label] = 'stale'
+        else                   next[label] = 'ok'
       }
       setFreshness(next)
     }, 500)

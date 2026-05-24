@@ -81,6 +81,7 @@ export default function App() {
   const { tracking, mountStatus, cameraStatus } = useTelescope()
   const [activeTab, setActiveTab] = useState('Flight')
   const [dismissed, setDismissed] = useState(new Set())
+  const [overrideChecks, setOverrideChecks] = useState(false)
 
   const visibleAlarms = alarms.filter(
     a => a.severity !== 'ok' && !dismissed.has(`${a.label}.${a.field}`)
@@ -94,6 +95,12 @@ export default function App() {
 
   const critCount = visibleAlarms.filter(a => a.severity === 'critical').length
   const warnCount = visibleAlarms.filter(a => a.severity === 'warning').length
+
+  const currentStage = (() => {
+    const evtPkt = Object.entries(packets).find(([k]) => k.toLowerCase() === 'event')?.[1]
+    const v = evtPkt?.fields?.find(f => f.name === 'flight_stage')?.value
+    return v != null ? Math.round(v) : -1
+  })()
 
   return (
     <div style={styles.root}>
@@ -167,7 +174,7 @@ export default function App() {
           )}
 
           {activeTab === 'Settings' && (
-            <SettingsView packets={packets} lastAck={lastAck} />
+            <SettingsView packets={packets} lastAck={lastAck} overrideChecks={overrideChecks} onOverrideChange={setOverrideChecks} currentStage={currentStage} />
           )}
         </div>
 
@@ -179,11 +186,8 @@ export default function App() {
           stageNames={stageNames}
           lastAck={lastAck}
           packets={packets}
-          currentStage={(() => {
-            const evtPkt = Object.entries(packets).find(([k]) => k.toLowerCase() === 'event')?.[1]
-            const v = evtPkt?.fields?.find(f => f.name === 'flight_stage')?.value
-            return v != null ? Math.round(v) : -1
-          })()}
+          overrideChecks={overrideChecks}
+          currentStage={currentStage}
         />
       </div>
 

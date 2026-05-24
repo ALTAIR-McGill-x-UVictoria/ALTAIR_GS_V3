@@ -27,6 +27,9 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
+import threading
+import tomllib
+
 import serial
 import serial.tools.list_ports
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -51,6 +54,109 @@ logging.basicConfig(
     datefmt="%Y-%m-%dT%H:%M:%S",
     stream=sys.stdout,
 )
+
+# ---------------------------------------------------------------------------
+# LR-900p modem protocol (runs on the same UART as telemetry)
+#
+# Two protocols share one UART:
+#   • Telemetry frames  SOF=0xAA  (defined in altairfc/telemetry/serializer.py)
+#   • Modem config frames  SOF=0xEF  (LR-900p proprietary)
+#
+# The modem config protocol is muxed transparently by the radio — telemetry
+# payloads pass straight through; 0xEF frames talk to the modem's local CPU.
+# ---------------------------------------------------------------------------
+_LR_SOF           = 0xEF
+_LR_TYPE_REQUEST  = 0x01
+_LR_TYPE_RESPONSE = 0x1E
+_LR_CMD_HEARTBEAT   = 0x01
+_LR_CMD_CONFIG_REQ  = 0x02
+_LR_CMD_CONFIG_RESP = 0x03
+_LR_SUBBLOCK_READ   = 0x03
+_LR_SUBBLOCK_WRITE  = 0x04
+_LR_CONFIG_BLOCK_ID = 0x12
+_LR_FREQ_WORD_LO    = 0xE8
+_LR_FREQ_WORD_HI    = 0x03
+_LR_HB_INTERVAL     = 0.625   # seconds between heartbeats
+
+# Exact packet lengths keyed by (TYPE, CMD)
+_LR_PACKET_LENGTHS: dict[tuple[int, int], int] = {
+    (_LR_TYPE_REQUEST,  _LR_CMD_HEARTBEAT):   20,
+    (_LR_TYPE_RESPONSE, _LR_CMD_HEARTBEAT):   20,
+    (_LR_TYPE_REQUEST,  _LR_CMD_CONFIG_REQ):  25,
+    (_LR_TYPE_RESPONSE, _LR_CMD_CONFIG_RESP): 25,
+}
+
+
+def _lr_checksum(data: bytes) -> int:
+    return sum(data) & 0xFF
+
+
+def _lr_build_heartbeat(seq: int, pc_uptime_ms: int, link_flag: int = 0x00) -> bytes:
+    body = bytes([
+        _LR_SOF, _LR_TYPE_REQUEST, 0x00, _LR_CMD_HEARTBEAT,
+        seq & 0xFF,
+        0x0D,
+        pc_uptime_ms & 0xFF, (pc_uptime_ms >> 8) & 0xFF,
+        0x0E, 0x00,
+        link_flag,  # 0x1E = config mode, 0x00 = transparent bridge (pass-through)
+        0x01, 0x00, 0x01,
+        0x00, 0x00, 0x00, 0x00, 0x00,
+    ])
+    return body + bytes([_lr_checksum(body)])
+
+
+def _lr_build_config_read(seq: int) -> bytes:
+    body = bytes([
+        _LR_SOF, _LR_TYPE_REQUEST, 0x00, _LR_CMD_CONFIG_REQ,
+        seq & 0xFF,
+        _LR_CONFIG_BLOCK_ID,
+        _LR_SUBBLOCK_READ,
+    ]) + bytes(17)
+    return body + bytes([_lr_checksum(body)])
+
+
+def _lr_build_config_write(seq: int, data_rate: int, tx_power: int, channel: int) -> bytes:
+    body = bytes([
+        _LR_SOF, _LR_TYPE_REQUEST, 0x00, _LR_CMD_CONFIG_REQ,
+        seq & 0xFF,
+        _LR_CONFIG_BLOCK_ID,
+        _LR_SUBBLOCK_WRITE,
+        0x00, 0x00,
+        data_rate & 0xFF,
+        tx_power  & 0xFF,
+        channel   & 0xFF,
+        _LR_FREQ_WORD_LO, _LR_FREQ_WORD_HI,
+        0x03, 0x00,
+    ]) + bytes(8)
+    return body + bytes([_lr_checksum(body)])
+
+
+def _lr_parse_config_response(raw: bytes) -> dict | None:
+    """Return parsed config dict or None if the frame is not a valid config-read response."""
+    if len(raw) != 25:
+        return None
+    if raw[1] != _LR_TYPE_RESPONSE or raw[3] != _LR_CMD_CONFIG_RESP:
+        return None
+    if raw[6] != _LR_SUBBLOCK_READ:
+        return None
+    p = raw[5:-1]
+    return {
+        "data_rate":  p[4],
+        "tx_power":   p[5],
+        "channel":    p[6],
+        "session_id": raw[20:24].hex(),
+    }
+
+
+def _lr_parse_write_ack(raw: bytes) -> bool:
+    """Return True if raw is a valid write-ack response."""
+    return (
+        len(raw) == 25
+        and raw[1] == _LR_TYPE_RESPONSE
+        and raw[3] == _LR_CMD_CONFIG_RESP
+        and raw[6] == _LR_SUBBLOCK_WRITE
+    )
+
 
 # ---------------------------------------------------------------------------
 # CP210x auto-detect (LR-900p)
@@ -88,7 +194,9 @@ class SerialReader:
     def __init__(self) -> None:
         self._port: serial.Serial | None = None
         self._task: asyncio.Task | None  = None
+        self._hb_task: asyncio.Task | None = None
         self._buf  = bytearray()
+        self._lr_buf = bytearray()   # accumulates LR-900p frames (SOF=0xEF)
         self._seq_prev: dict[int, int]   = {}
         self.connected = False
         self.port_name = ""
@@ -96,9 +204,52 @@ class SerialReader:
         # Restart coalescing: track pending gaps to detect FC reboot vs link loss
         self._pending_gaps: dict[int, int] = {}   # pkt_id → dropped count
         self._pending_gap_time: float = 0.0
+        self._diag_frame_count: int = 0            # total frames successfully decoded
+
+        # Single threading.Lock serialises all port.write() calls regardless of
+        # whether the caller is the asyncio event loop or a run_in_executor thread.
+        # Queue of frames waiting to be written. The read loop drains this
+        # between reads so all port I/O stays on the event loop thread,
+        # eliminating concurrent read+write on the Windows CP210x driver.
+        self._write_queue: asyncio.Queue[bytes] = asyncio.Queue()
+
+        # threading.Lock only used by _lr_read_response (executor thread) and
+        # the heartbeat writer (also executor) — not needed for normal writes
+        # now that send_command posts to _write_queue instead.
+        self._port_write_lock = threading.Lock()
+
+        # Effective TX rate scale from FC's radio config — updated when a
+        # RadioConfigPacket (0x0C) is received. Mirrors the FC's rate_scale[]
+        # lookup from settings.toml so target_hz shown in the GUI matches reality.
+        self._current_rate_scale: float = 1.0
+
+        # LR-900p modem state
+        self._lr_seq: int = 0
+        self._lr_start_t: float = 0.0
+        self._lr_linked: bool = False
+        # True only while a config read/write is in progress.
+        # The heartbeat loop sends link_flag=0x1E (config mode) when set,
+        # and link_flag=0x00 (transparent bridge / pass-through) otherwise.
+        self._lr_config_active: bool = False
+        # Cached result of the last successful read_radio_config call.
+        # Returned by GET /api/radio/config without touching the modem again.
+        self._lr_live_config: dict | None = None
+        # Signalled by _process_lr_buf when a config read/write response arrives
+        self._lr_cfg_read_event:  asyncio.Event = asyncio.Event()
+        self._lr_cfg_write_event: asyncio.Event = asyncio.Event()
+        self._lr_cfg_read_result:  dict | None  = None
+        self._lr_cfg_write_ok:     bool         = False
 
     def add_client(self, ws: WebSocket)    -> None: self._clients.add(ws)
     def remove_client(self, ws: WebSocket) -> None: self._clients.discard(ws)
+
+    def _lr_next_seq(self) -> int:
+        s = self._lr_seq
+        self._lr_seq = (self._lr_seq + 1) & 0xFF
+        return s
+
+    def _lr_uptime_ms(self) -> int:
+        return int((time.monotonic() - self._lr_start_t) * 1000) & 0xFFFF
 
     async def connect(self, port: str, baud: int = 57600) -> None:
         if self.connected:
@@ -108,8 +259,13 @@ class SerialReader:
             self.connected = True
             self.port_name = port
             self._buf.clear()
+            self._lr_buf.clear()
             self._seq_prev.clear()
-            self._task = asyncio.create_task(self._read_loop())
+            self._lr_seq = 0
+            self._lr_start_t = time.monotonic()
+            self._lr_linked = False
+            self._task    = asyncio.create_task(self._read_loop())
+            self._hb_task = asyncio.create_task(self._lr_heartbeat_loop())
             logger.info("Serial port %s opened @ %d baud", port, baud)
             await self._broadcast({"type": "status", "connected": True, "port": port})
         except serial.SerialException as e:
@@ -117,58 +273,112 @@ class SerialReader:
             raise
 
     async def disconnect(self) -> None:
-        if self._task:
-            self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
+        for task in (self._task, self._hb_task):
+            if task:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+        self._task = self._hb_task = None
         if self._port and self._port.is_open:
             self._port.close()
         self.connected = False
         self.port_name = ""
+        self._lr_linked = False
+        self._lr_config_active = False
+        self._lr_live_config = None
+        # Discard any queued writes — they belong to the closed session
+        while not self._write_queue.empty():
+            try:
+                self._write_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
         logger.info("Serial port closed")
         await self._broadcast({"type": "status", "connected": False, "port": ""})
 
     async def _read_loop(self) -> None:
-        loop = asyncio.get_event_loop()
+        _consecutive_errors = 0
+        _MAX_CONSECUTIVE_ERRORS = 10
+        _diag_bytes   = 0      # raw bytes received since last log
+        _diag_frames  = 0      # decoded frames since last log
+        _diag_last_t  = time.monotonic()
+        _DIAG_INTERVAL = 30.0  # log a throughput line every 30 s
         while True:
             try:
-                chunk = await loop.run_in_executor(None, self._read_chunk)
+                # Drain pending writes first so TX and RX never overlap on the
+                # Windows CP210x driver (concurrent read+write corrupts the FIFO).
+                # All port I/O is on the event loop thread; send_command() posts
+                # frames to _write_queue instead of writing directly.
+                while not self._write_queue.empty() and not self._lr_config_active:
+                    frame = self._write_queue.get_nowait()
+                    if self._port and self._port.is_open:
+                        self._port.write(frame)
+                        logger.info("send_command: sent %d bytes (CMD_ID=0x%02X)",
+                                    len(frame), frame[1] if len(frame) > 1 else 0xFF)
+
+                chunk = self._read_chunk()
                 if chunk:
+                    _consecutive_errors = 0
+                    _diag_bytes += len(chunk)
                     self._buf.extend(chunk)
+                    prev_frames = self._diag_frame_count
                     await self._process_buffer()
+                    _diag_frames += self._diag_frame_count - prev_frames
                 else:
-                    await asyncio.sleep(0.005)
+                    await asyncio.sleep(0.002)
+
+                now = time.monotonic()
+                if now - _diag_last_t >= _DIAG_INTERVAL:
+                    elapsed = now - _diag_last_t
+                    logger.info("Serial RX: %.0f B/s  ~%d frames in %.0fs",
+                                _diag_bytes / elapsed, _diag_frames, elapsed)
+                    _diag_bytes  = 0
+                    _diag_frames = 0
+                    _diag_last_t = now
             except serial.SerialException as e:
-                logger.error("Serial read error: %s", e)
-                await self._broadcast({"type": "status", "connected": False, "port": "", "error": str(e)})
-                break
+                _consecutive_errors += 1
+                if _consecutive_errors >= _MAX_CONSECUTIVE_ERRORS:
+                    logger.error("Serial read: %d consecutive errors — closing port: %s",
+                                 _consecutive_errors, e)
+                    await self._broadcast({"type": "status", "connected": False, "port": "", "error": str(e)})
+                    break
+                logger.warning("Serial read transient error (%d/%d): %s",
+                               _consecutive_errors, _MAX_CONSECUTIVE_ERRORS, e)
+                self._buf.clear()
+                await asyncio.sleep(0.1)
 
     def _read_chunk(self) -> bytes:
-        if self._port and self._port.is_open and self._port.in_waiting:
-            return self._port.read(self._port.in_waiting)
+        if self._port is None or not self._port.is_open:
+            return b""
+        # Yield port to _lr_read_response (executor thread) during config ops.
+        if self._lr_config_active:
+            return b""
+        waiting = self._port.in_waiting
+        if waiting:
+            return self._port.read(waiting)
         return b""
 
     def send_command(self, frame: bytes) -> bool:
         """
-        Write a pre-built command frame to the serial port.
-        Blocking — call via run_in_executor from async route handlers.
-        Returns True on success.
+        Enqueue a command frame for transmission. The read loop writes it
+        between reads so TX and RX never overlap on the same thread.
+        Safe to call from any thread.
         """
-        if self._port is None or not self._port.is_open:
+        if not self.connected:
             logger.warning("send_command: serial port not open")
             return False
         try:
-            self._port.write(frame)
-            logger.info(
-                "send_command: sent %d bytes (CMD_ID=0x%02X)",
-                len(frame), frame[1] if len(frame) > 1 else 0xFF,
-            )
+            self._write_queue.put_nowait(frame)
             return True
-        except serial.SerialException as e:
-            logger.error("send_command: write error: %s", e)
+        except asyncio.QueueFull:
+            logger.error("send_command: write queue full, frame dropped")
             return False
+
+    # Largest plausible frame: header + 512 payload bytes + CRC.
+    # A length field larger than this means we locked onto a false sync byte
+    # inside a payload — skip it and search for the next real sync byte.
+    _MAX_PAYLOAD = 512
 
     async def _process_buffer(self) -> None:
         while len(self._buf) >= MIN_FRAME:
@@ -179,10 +389,16 @@ class SerialReader:
             if sync_pos > 0:
                 del self._buf[:sync_pos]
 
-            if len(self._buf) < 13:  # need full header
+            if len(self._buf) < 13:
                 return
 
             _, _, _, _, length = _HEADER.unpack_from(self._buf, 0)
+
+            if length > self._MAX_PAYLOAD:
+                # Bogus length — this sync byte is inside a payload, skip it
+                del self._buf[0]
+                continue
+
             frame_size = HEADER_SIZE + length + CRC_SIZE
 
             if len(self._buf) < frame_size:
@@ -191,7 +407,6 @@ class SerialReader:
             frame = bytes(self._buf[:frame_size])
             del self._buf[:frame_size]
 
-            # ACK frames (0xA0) are not in REGISTRY — decode and broadcast directly
             _, pkt_id_peek, _, _, _ = _HEADER.unpack_from(frame, 0)
             if pkt_id_peek == ACK_PACKET_ID:
                 ack = decode_ack_frame(frame)
@@ -203,9 +418,6 @@ class SerialReader:
             if result is None:
                 continue
 
-            # Sequence gap detection with FC-restart coalescing.
-            # When all packet types jump by a similar amount within 100 ms,
-            # that's a reboot — emit one INFO instead of N warnings.
             pkt_id = result["packet_id"]
             seq    = result["seq"]
             prev   = self._seq_prev.get(pkt_id)
@@ -215,7 +427,6 @@ class SerialReader:
                     dropped = (seq - expected) & 0xFF
                     result["dropped"] = dropped
                     now = time.time()
-                    # Flush old pending gaps if the window expired
                     if now - self._pending_gap_time > 1.0:
                         if self._pending_gaps:
                             logger.warning(
@@ -227,7 +438,6 @@ class SerialReader:
                         self._pending_gaps.clear()
                     self._pending_gaps[pkt_id] = dropped
                     self._pending_gap_time = now
-                    # If every known packet type has a gap, it's a restart
                     known = set(self._seq_prev.keys())
                     if known and known.issubset(self._pending_gaps.keys()):
                         logger.info("FC restart detected — seq counters reset across all %d packet types",
@@ -236,10 +446,200 @@ class SerialReader:
                         self._seq_prev.clear()
             self._seq_prev[pkt_id] = seq
 
+            self._diag_frame_count += 1
             result["wall_ms"] = round(time.time() * 1000)
+
+            # Update rate scale when RadioConfigPacket (0x0C) arrives so that
+            # target_hz shown in the GUI reflects the effective scaled rate.
+            if pkt_id == 0x0C:
+                data_rate_field = next(
+                    (f["value"] for f in result.get("fields", []) if f["name"] == "data_rate"),
+                    None,
+                )
+                if data_rate_field is not None:
+                    rate_scale = _radio_defaults.get("rate_scale", [0.1, 0.33, 1.0])
+                    idx = int(data_rate_field)
+                    if 0 <= idx < len(rate_scale):
+                        self._current_rate_scale = float(rate_scale[idx])
+
+            # Scale target_hz to match the FC's effective TX rate at the current data_rate.
+            if "target_hz" in result and result["target_hz"] is not None:
+                result["target_hz"] = round(result["target_hz"] * self._current_rate_scale, 3)
+
             await self._broadcast({"type": "packet", **result})
 
+    def _lr_read_response(self, subblock: int, timeout: float) -> bytes | None:
+        """
+        Blocking. Read from the port until a valid LR-900p response frame for
+        the given subblock arrives or timeout expires. Called from a thread via
+        run_in_executor while _lr_config_active is True (heartbeats running).
+        """
+        buf  = bytearray()
+        dead = time.monotonic() + timeout
+        while time.monotonic() < dead:
+            chunk = self._port.read(64)
+            if chunk:
+                buf.extend(chunk)
+            else:
+                time.sleep(0.005)
+            # Scan for a complete LR-900p frame
+            while len(buf) >= 6:
+                idx = buf.find(_LR_SOF)
+                if idx < 0:
+                    buf.clear()
+                    break
+                if idx > 0:
+                    del buf[:idx]
+                type_byte = buf[1] if len(buf) > 1 else 0
+                cmd       = buf[3] if len(buf) > 3 else 0
+                expected  = _LR_PACKET_LENGTHS.get((type_byte, cmd))
+                if expected is None:
+                    del buf[0]
+                    continue
+                if len(buf) < expected:
+                    break
+                raw = bytes(buf[:expected])
+                del buf[:expected]
+                if _lr_checksum(raw[:-1]) != raw[-1]:
+                    continue
+                if (type_byte == _LR_TYPE_RESPONSE
+                        and cmd == _LR_CMD_CONFIG_RESP
+                        and raw[6] == subblock):
+                    return raw
+                if type_byte == _LR_TYPE_RESPONSE and cmd == _LR_CMD_HEARTBEAT:
+                    if not self._lr_linked:
+                        self._lr_linked = True
+                        logger.info("LR-900p modem link established")
+        return None
+
+    async def _lr_heartbeat_loop(self) -> None:
+        """Send 0xEF heartbeat frames only while a config operation is active."""
+        _hb_count = 0
+        while True:
+            if not _LR_CONFIG_ENABLED or not self._lr_config_active:
+                _hb_count = 0
+                await asyncio.sleep(0.05)
+                continue
+            next_tick = time.monotonic()
+            while self._lr_config_active:
+                await asyncio.sleep(max(0, next_tick - time.monotonic()))
+                next_tick += _LR_HB_INTERVAL
+                if self._port is None or not self._port.is_open:
+                    break
+                _hb_count += 1
+                frame = _lr_build_heartbeat(self._lr_next_seq(), self._lr_uptime_ms(), 0x1E)
+                logger.info("LR-900p HB #%d → modem (link_flag=0x1E, config mode)", _hb_count)
+                try:
+                    with self._port_write_lock:
+                        self._port.write(frame)
+                except serial.SerialException as e:
+                    logger.warning("LR-900p heartbeat write error: %s", e)
+
+    def _lr_exit_config_mode(self) -> None:
+        """Clear the config-active flag. The modem returns to transparent bridge
+        mode on its own once heartbeats with link_flag=0x1E stop arriving."""
+        logger.info("LR-900p config mode OFF — modem will auto-return to transparent bridge")
+        self._lr_config_active = False
+
+    async def read_radio_config(self, timeout: float = 3.0) -> dict | None:
+        """
+        Put the modem into config mode, send a read request, and return the
+        parsed config. Blocks the calling coroutine via run_in_executor.
+        """
+        if not _LR_CONFIG_ENABLED:
+            logger.info("LR-900p modem config disabled (_LR_CONFIG_ENABLED=False) — skipping read")
+            return None
+        if self._port is None or not self._port.is_open:
+            return None
+        logger.info("LR-900p config mode ON — reading modem config (telemetry paused ~%.1fs)", timeout)
+        self._lr_config_active = True
+        # Wait for at least one config-mode heartbeat to be sent and acknowledged
+        await asyncio.sleep(_LR_HB_INTERVAL * 1.5)
+        try:
+            def _do() -> dict | None:
+                logger.info("LR-900p sending config-read request to modem")
+                frame = _lr_build_config_read(self._lr_next_seq())
+                with self._port_write_lock:
+                    self._port.write(frame)
+                raw = self._lr_read_response(_LR_SUBBLOCK_READ, timeout)
+                if raw:
+                    logger.info("LR-900p config-read response received (%d bytes)", len(raw))
+                else:
+                    logger.warning("LR-900p config-read timed out — no response from modem")
+                return _lr_parse_config_response(raw) if raw else None
+            result = await asyncio.get_event_loop().run_in_executor(None, _do)
+        except serial.SerialException as e:
+            logger.error("LR-900p read_radio_config error: %s", e)
+            result = None
+        finally:
+            self._lr_exit_config_mode()
+        if result is not None:
+            logger.info("LR-900p live config: data_rate=%d tx_power=%d channel=%d",
+                        result["data_rate"], result["tx_power"], result["channel"])
+            self._lr_live_config = result
+        return result
+
+    async def write_radio_config(
+        self,
+        data_rate: int,
+        tx_power: int,
+        channel: int,
+        fc_ack_event: asyncio.Event,
+        timeout: float = 5.0,
+    ) -> bool:
+        """
+        ACK-gated GS modem channel switch. Waits for the FC to ACK on the old
+        channel before switching the GS modem, then exits config mode.
+        """
+        if not _LR_CONFIG_ENABLED:
+            logger.info("LR-900p modem config disabled (_LR_CONFIG_ENABLED=False) — skipping write")
+            return False
+        if self._port is None or not self._port.is_open:
+            return False
+        logger.info("LR-900p write_radio_config: waiting for FC ACK (timeout=%.1fs)", timeout)
+        try:
+            await asyncio.wait_for(fc_ack_event.wait(), timeout)
+        except asyncio.TimeoutError:
+            logger.warning("LR-900p write_radio_config: timed out waiting for FC ACK")
+            return False
+
+        logger.info("LR-900p config mode ON — writing modem config dr=%d pwr=%d ch=%d",
+                    data_rate, tx_power, channel)
+        self._lr_config_active = True
+        await asyncio.sleep(_LR_HB_INTERVAL * 1.5)
+        try:
+            def _do() -> bool:
+                logger.info("LR-900p sending config-write request to modem")
+                frame = _lr_build_config_write(self._lr_next_seq(), data_rate, tx_power, channel)
+                with self._port_write_lock:
+                    self._port.write(frame)
+                raw = self._lr_read_response(_LR_SUBBLOCK_WRITE, timeout)
+                if raw:
+                    logger.info("LR-900p config-write ACK received (%d bytes)", len(raw))
+                else:
+                    logger.warning("LR-900p config-write timed out — no ACK from modem")
+                return raw is not None and _lr_parse_write_ack(raw)
+            ok = await asyncio.get_event_loop().run_in_executor(None, _do)
+        except serial.SerialException as e:
+            logger.error("LR-900p write_radio_config error: %s", e)
+            ok = False
+        finally:
+            self._lr_exit_config_mode()
+        if ok:
+            self._lr_live_config = {"data_rate": data_rate, "tx_power": tx_power, "channel": channel}
+            logger.info("LR-900p GS modem reconfigured: data_rate=%d tx_power=%d channel=%d",
+                        data_rate, tx_power, channel)
+        else:
+            logger.warning("LR-900p GS modem write failed — config not applied")
+        return ok
+
     async def _broadcast(self, msg: dict[str, Any]) -> None:
+        # Signal the radio-config REST handler when the FC ACKs cmd 0xC5
+        if msg.get("type") == "ack" and msg.get("cmd_id") == 0xC5:
+            global _fc_radio_ack_event
+            if _fc_radio_ack_event is not None:
+                _fc_radio_ack_event.set()
+
         # Intercept GPS packets to keep _latest_gps up-to-date for telescope tracking
         if msg.get("type") == "packet" and msg.get("label", "").lower() == "gps":
             global _latest_gps
@@ -357,6 +757,39 @@ _telescope_clients: set[WebSocket] = set()
 _tracking_task: asyncio.Task | None = None
 _gs_gps_task: asyncio.Task | None = None
 _tracking_enabled = False
+
+# ---------------------------------------------------------------------------
+# Radio config defaults — loaded from FC settings.toml at startup
+# ---------------------------------------------------------------------------
+# Set to False to disable all LR-900p modem config activity (no 0xEF frames
+# sent, read/write endpoints return immediately).  Useful for diagnosing
+# whether modem config traffic is causing RF link disruptions.
+_LR_CONFIG_ENABLED: bool = False
+_FC_SETTINGS_TOML = (
+    Path(__file__).parent.parent.parent / "Altairfc_V2" / "altairfc" / "config" / "settings.toml"
+).resolve()
+
+def _load_radio_defaults() -> dict:
+    try:
+        with open(_FC_SETTINGS_TOML, "rb") as f:
+            cfg = tomllib.load(f)
+        rc = cfg.get("radio_config", {})
+        return {
+            "data_rate":  int(rc.get("data_rate",  1)),
+            "tx_power":   int(rc.get("tx_power",   2)),
+            "channel":    int(rc.get("channel",    0)),
+            "watchdog_s": float(rc.get("watchdog_s", 30.0)),
+            "rate_scale": list(rc.get("rate_scale", [0.1, 0.33, 1.0])),
+        }
+    except Exception as e:
+        logger.warning("Could not load radio defaults from settings.toml: %s", e)
+        return {"data_rate": 1, "tx_power": 2, "channel": 0, "watchdog_s": 30.0, "rate_scale": [0.1, 0.33, 1.0]}
+
+_radio_defaults: dict = _load_radio_defaults()
+
+# One-shot asyncio.Event signalled when the FC ACKs a RadioConfigCommand (0xC5).
+# The REST handler creates a fresh event per request; write_radio_config waits on it.
+_fc_radio_ack_event: asyncio.Event | None = None
 
 # ---------------------------------------------------------------------------
 # Ground station GPS (u-blox 7)
@@ -519,9 +952,7 @@ async def _gs_gps_beacon_loop(interval_s: float = 5.0) -> None:
                 alt=_tracking.GS_ALT,
             )
             frame = build_command_frame(pkt)
-            await asyncio.get_event_loop().run_in_executor(
-                None, serial_reader.send_command, frame
-            )
+            serial_reader.send_command(frame)
         except Exception as e:
             logger.warning("GS GPS beacon error: %s", e)
 
@@ -534,19 +965,20 @@ async def _sync_system_clock() -> None:
     """Force a W32TM clock resync on Windows to minimise GS/FC timestamp skew."""
     if sys.platform != "win32":
         return
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "w32tm", "/resync", "/force",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+    import subprocess as _sp
+    def _do_resync():
+        return _sp.run(
+            ["w32tm", "/resync", "/force"],
+            capture_output=True, timeout=10,
         )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
-        if proc.returncode == 0:
-            logger.info("W32TM resync succeeded: %s", stdout.decode().strip())
+    try:
+        result = await asyncio.get_event_loop().run_in_executor(None, _do_resync)
+        if result.returncode == 0:
+            logger.info("W32TM resync succeeded: %s", result.stdout.decode().strip())
         else:
             logger.warning("W32TM resync failed (rc=%d) — run backend as administrator for clock sync: %s",
-                           proc.returncode, stderr.decode().strip())
-    except asyncio.TimeoutError:
+                           result.returncode, result.stderr.decode().strip())
+    except _sp.TimeoutExpired:
         logger.warning("W32TM resync timed out")
     except FileNotFoundError:
         logger.warning("w32tm not found — clock sync skipped")
@@ -749,7 +1181,7 @@ async def post_fc_arm():
     from backend.commands import build_command_frame
     from telemetry.commands.arm import ArmCommandPacket
     frame = build_command_frame(ArmCommandPacket(arm_state=1))
-    ok = await asyncio.get_event_loop().run_in_executor(None, serial_reader.send_command, frame)
+    ok = serial_reader.send_command(frame)
     return {"ok": ok, "error": None if ok else "Serial port not connected"}
 
 
@@ -761,7 +1193,7 @@ async def post_fc_launch_ok():
     from backend.commands import build_command_frame
     from telemetry.commands.launch_ok import LaunchOkCommandPacket
     frame = build_command_frame(LaunchOkCommandPacket(confirm=1))
-    ok = await asyncio.get_event_loop().run_in_executor(None, serial_reader.send_command, frame)
+    ok = serial_reader.send_command(frame)
     return {"ok": ok, "error": None if ok else "Serial port not connected"}
 
 
@@ -773,7 +1205,7 @@ async def post_fc_ping():
     from backend.commands import build_command_frame
     from telemetry.commands.ping import PingCommandPacket
     frame = build_command_frame(PingCommandPacket(token=0))
-    ok = await asyncio.get_event_loop().run_in_executor(None, serial_reader.send_command, frame)
+    ok = serial_reader.send_command(frame)
     return {"ok": ok, "error": None if ok else "Serial port not connected"}
 
 
@@ -799,8 +1231,108 @@ async def post_fc_update_setting(body: dict):
     from backend.commands import build_command_frame
     from telemetry.commands.update_setting import UpdateSettingCommandPacket
     frame = build_command_frame(UpdateSettingCommandPacket(field_id=field_id, value=value))
-    ok = await asyncio.get_event_loop().run_in_executor(None, serial_reader.send_command, frame)
+    ok = serial_reader.send_command(frame)
     return {"ok": ok, "error": None if ok else "Serial port not connected"}
+
+
+@app.get("/api/radio/config")
+async def get_radio_config(refresh: bool = False):
+    """Return radio defaults from settings.toml plus the live GS modem config.
+
+    By default returns the cached live config from the last successful modem
+    read — no serial traffic is generated.  Pass ?refresh=1 to force a fresh
+    read from the modem (suspends telemetry reception for ~1-4 s).
+    """
+    if refresh and serial_reader.connected:
+        await serial_reader.read_radio_config(timeout=3.0)
+    return {
+        "defaults": _radio_defaults,
+        "live":     serial_reader._lr_live_config,
+        "linked":   serial_reader._lr_linked,
+    }
+
+
+@app.post("/api/radio/config")
+async def post_radio_config(body: dict):
+    """
+    Apply a new radio configuration to both FC and GS modem.
+
+    Body: { "data_rate": 0|1|2, "tx_power": 0|1|2, "channel": 0-63 }
+
+    Blocked when the FC is in ARM state or later (flight_stage >= 1).
+    The FC is commanded first; its ACK gates the GS modem switch so the
+    ACK itself is always transmitted on the old channel.
+    """
+    global _fc_radio_ack_event
+
+    # Validate
+    try:
+        data_rate = int(body["data_rate"])
+        tx_power  = int(body["tx_power"])
+        channel   = int(body["channel"])
+    except (KeyError, TypeError, ValueError):
+        return {"ok": False, "error": "data_rate, tx_power, and channel are required integers"}
+
+    if not (0 <= data_rate <= 2):
+        return {"ok": False, "error": "data_rate must be 0, 1, or 2"}
+    if not (0 <= tx_power <= 2):
+        return {"ok": False, "error": "tx_power must be 0, 1, or 2"}
+    if not (0 <= channel <= 63):
+        return {"ok": False, "error": "channel must be 0-63"}
+
+    # Block if armed or beyond (flight_stage >= 1)
+    event_pkt = _latest_packets.get("Event") or _latest_packets.get("event")
+    if event_pkt:
+        stage = next(
+            (int(f["value"]) for f in event_pkt.get("fields", []) if f["name"] == "flight_stage"),
+            0,
+        )
+        if stage >= 1:
+            return {"ok": False, "error": "Radio config locked — vehicle is armed or in flight"}
+
+    if _emulating:
+        # In emulator mode, synthesise both ACKs without touching hardware
+        await _emulated_ack(0xC5)
+        return {"ok": True, "emulated": True, "gs_switched": False}
+
+    if not serial_reader.connected:
+        return {"ok": False, "error": "Serial port not connected"}
+
+    # Arm a fresh ACK event before sending the command so we can't miss it
+    _fc_radio_ack_event = asyncio.Event()
+
+    from backend.commands import build_command_frame
+    from telemetry.commands.radio_config import RadioConfigCommandPacket
+    frame = build_command_frame(RadioConfigCommandPacket(
+        data_rate=data_rate, tx_power=tx_power, channel=channel,
+    ))
+    ok = serial_reader.send_command(frame)
+    if not ok:
+        _fc_radio_ack_event = None
+        return {"ok": False, "error": "Serial write failed"}
+
+    # Fire off the GS modem switch concurrently — it will wait for the FC ACK event
+    gs_switched = False
+    if serial_reader._lr_linked:
+        gs_switched = await serial_reader.write_radio_config(
+            data_rate=data_rate,
+            tx_power=tx_power,
+            channel=channel,
+            fc_ack_event=_fc_radio_ack_event,
+            timeout=10.0,
+        )
+    else:
+        logger.warning("post_radio_config: GS modem not linked — FC commanded but GS modem not reconfigured")
+
+    _fc_radio_ack_event = None
+    await serial_reader._broadcast({
+        "type":       "radio_config",
+        "data_rate":  data_rate,
+        "tx_power":   tx_power,
+        "channel":    channel,
+        "gs_switched": gs_switched,
+    })
+    return {"ok": True, "gs_switched": gs_switched}
 
 
 @app.post("/api/debug/emulate")
@@ -1460,12 +1992,32 @@ def get_gallery():
 
 if __name__ == "__main__":
     import uvicorn
-    # Watch only the backend and src directories — keeps logs/ and captures/ out of scope
-    _repo_root = Path(__file__).parent.parent
-    uvicorn.run(
+
+    _server = uvicorn.Server(uvicorn.Config(
         "backend.main:app",
         host="0.0.0.0",
         port=8000,
-        reload=True,
-        reload_dirs=[str(_repo_root / "backend"), str(_repo_root / "src")],
+        reload=False,
+    ))
+
+    # Prevent uvicorn from installing its own signal handlers — on Windows,
+    # asyncio.run() blocks the main thread in the ProactorEventLoop's C-level
+    # I/O completion port, so signal.signal() handlers never fire.  Instead we
+    # run uvicorn's serve() coroutine on a daemon thread and spin the main
+    # thread in a KeyboardInterrupt-sensitive sleep loop.
+    _server.install_signal_handlers = lambda: None
+
+    _serve_thread = threading.Thread(
+        target=_server.run,
+        daemon=True,
+        name="uvicorn-serve",
     )
+    _serve_thread.start()
+
+    try:
+        while _serve_thread.is_alive():
+            _serve_thread.join(timeout=0.5)
+    except KeyboardInterrupt:
+        logger.info("Ctrl+C received — shutting down")
+        _server.should_exit = True
+        _serve_thread.join(timeout=10)

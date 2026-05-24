@@ -131,7 +131,7 @@ function fmtValue(v) {
   return v.toFixed(3)
 }
 
-export default function AlarmSidebar({ alarms, onDismissAll, onDismissOne, events = [], stageNames = {}, currentStage = -1, lastAck = null, packets = {} }) {
+export default function AlarmSidebar({ alarms, onDismissAll, onDismissOne, events = [], stageNames = {}, currentStage = -1, lastAck = null, packets = {}, overrideChecks = false }) {
   const now = useNow(1000)
   const [collapsed, setCollapsed] = useState(false)
 
@@ -159,8 +159,8 @@ export default function AlarmSidebar({ alarms, onDismissAll, onDismissOne, event
   const armState    = fv(evpkt, 'arm_state', 0) === 1
 
   const allOk     = gpsFix && pixhawkOk && vescOk && dataLogging
-  const canArm    = allOk
-  const canLaunch = allOk && armState
+  const canArm    = allOk    || overrideChecks
+  const canLaunch = (allOk && armState) || overrideChecks
 
   const logCommandSent = (cmd_id) => {
     const seq   = cmdSeqRef.current++
@@ -285,6 +285,15 @@ export default function AlarmSidebar({ alarms, onDismissAll, onDismissOne, event
           {/* ── Commands ── */}
           <div style={styles.commandsSection}>
             <div style={styles.sectionHeader}>COMMANDS</div>
+            {overrideChecks && (
+              <div style={{
+                background: 'rgba(239,68,68,0.12)', border: '1px solid rgba(239,68,68,0.4)',
+                color: '#ef4444', fontFamily: 'var(--font-mono)', fontSize: 9, letterSpacing: 1,
+                padding: '3px 8px', flexShrink: 0, textAlign: 'center',
+              }}>
+                CHECK OVERRIDE ACTIVE
+              </div>
+            )}
             <div style={{ display: 'flex', gap: 8, padding: '6px 8px', flex: 1, minHeight: 0, overflow: 'hidden' }}>
               {/* Buttons */}
               <div style={{ display: 'flex', flexDirection: 'column', gap: 5, justifyContent: 'center', flexShrink: 0 }}>

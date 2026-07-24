@@ -46,6 +46,8 @@ from backend.alarms import ALARM_RULES
 from backend.emulator import PacketEmulator
 from backend.events import EVENT_DEFS, FLIGHT_STAGE_NAMES, BOOLEAN_EVENT_FIELDS
 from backend.gps_reader import GsGpsReader
+from backend.metrics import PROMETHEUS_CONTENT_TYPE, TelemetryMetrics
+from backend.remote_metrics import RemoteMetricsReporter
 
 logger = logging.getLogger("gs.backend")
 logging.basicConfig(
@@ -634,6 +636,11 @@ class SerialReader:
         return ok
 
     async def _broadcast(self, msg: dict[str, Any]) -> None:
+        # Best-effort, in-memory metrics only. This call never performs I/O and
+        # skips updates instead of waiting if a Prometheus scrape holds its lock.
+        metrics_exporter.observe_message(msg)
+        remote_metrics.submit_message(msg)
+
         # Signal the radio-config REST handler when the FC ACKs cmd 0xC5
         if msg.get("type") == "ack" and msg.get("cmd_id") == 0xC5:
             global _fc_radio_ack_event
@@ -653,6 +660,8 @@ class SerialReader:
 
             alarms = telem_logger.ingest(msg)
             for alarm in alarms:
+                metrics_exporter.observe_alarm(alarm)
+                remote_metrics.submit_alarm(alarm)
                 alarm_msg = json.dumps({"type": "alarm", **alarm})
                 # Mirror alarm in server-side list (replace by label+field, cap at 50)
                 entry = {k: v for k, v in alarm.items()}
@@ -703,6 +712,8 @@ class SerialReader:
 
             global _latest_events
             for ev in events_to_emit:
+                metrics_exporter.observe_event(ev)
+                remote_metrics.submit_event(ev)
                 full_ev = {"type": "event", "wall_time": time.time(), **ev}
                 ev_msg = json.dumps(full_ev)
                 # Mirror in server-side event list (cap at 200)
@@ -727,6 +738,8 @@ class SerialReader:
 
 serial_reader   = SerialReader()
 telem_logger    = TelemetryLogger()
+metrics_exporter = TelemetryMetrics()
+remote_metrics = RemoteMetricsReporter()
 _emulator: PacketEmulator | None = None
 _emulating = False
 
@@ -1013,6 +1026,10 @@ async def lifespan(app: FastAPI):
     else:
         telem_logger.open_session()
 
+    # All OTLP setup and network activity runs outside the asyncio event loop.
+    # Without hosted endpoint configuration this is a no-op.
+    remote_metrics.start()
+
     if os.getenv("ALTAIR_DEBUG", "0") == "1":
         # Debug mode: synthesise packets instead of reading from serial
         _emulating = True
@@ -1064,6 +1081,7 @@ async def lifespan(app: FastAPI):
     if camera_controller.connected:
         await camera_controller.disconnect()
     telem_logger.close_session()
+    await asyncio.to_thread(remote_metrics.stop)
 
 
 app = FastAPI(title="ALTAIR GS", lifespan=lifespan)
@@ -1088,6 +1106,21 @@ def get_ports():
 @app.get("/api/status")
 def get_status():
     return {"connected": serial_reader.connected, "port": serial_reader.port_name}
+
+
+@app.get("/metrics", include_in_schema=False)
+async def get_metrics():
+    """Prometheus scrape endpoint; reads only an in-memory telemetry snapshot."""
+    return Response(
+        content=metrics_exporter.render(),
+        headers={"Content-Type": PROMETHEUS_CONTENT_TYPE},
+    )
+
+
+@app.get("/api/metrics/remote")
+def get_remote_metrics_status():
+    """Hosted metrics health without exposing endpoint credentials."""
+    return remote_metrics.status()
 
 
 @app.get("/api/gs/gps")

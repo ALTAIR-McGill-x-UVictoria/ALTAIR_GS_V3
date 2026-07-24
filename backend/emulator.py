@@ -224,15 +224,17 @@ def _gps_value(field_name: str, t: float) -> float:
     relative_alt = max(0.0, alt_msl - _ALT_MSL_LAUNCH)
     lat, lon = _flight_pos(t)
 
+    if field_name == "active":
+        return 1.0
     if field_name == "lat":
         return lat
     if field_name == "lon":
         return lon
-    if field_name == "alt":
+    if field_name in {"alt", "alt_msl"}:
         return alt_msl
     if field_name == "relative_alt":
         return relative_alt
-    if field_name == "hdg":
+    if field_name in {"hdg", "heading_deg"}:
         if t >= _T_LAND:
             return 0.0   # stationary — heading undefined, report North
         # Instantaneous heading from drift + wander derivative
@@ -241,6 +243,18 @@ def _gps_value(field_name: str, t: float) -> float:
         vel_n = _DRIFT_SPEED_N + _WANDER_R * dw * math.cos(2 * math.pi * t_flying / _WANDER_P)
         vel_e = _DRIFT_SPEED_E - _WANDER_R * dw * math.sin(2 * math.pi * t_flying / _WANDER_P)
         return math.degrees(math.atan2(vel_e, vel_n)) % 360
+    if field_name == "speed_ms":
+        if t < _T_LAUNCH or t >= _T_LAND:
+            return 0.0
+        t_flying = t - _T_LAUNCH
+        dw = 2 * math.pi / _WANDER_P
+        vel_n = _DRIFT_SPEED_N + _WANDER_R * dw * math.cos(2 * math.pi * t_flying / _WANDER_P)
+        vel_e = _DRIFT_SPEED_E - _WANDER_R * dw * math.sin(2 * math.pi * t_flying / _WANDER_P)
+        return math.hypot(vel_n, vel_e)
+    if field_name == "fix_type":
+        return 3.0
+    if field_name == "num_sv":
+        return 10.0
     return 0.0
 
 
@@ -438,7 +452,7 @@ class PacketEmulator:
         for i, fd in enumerate(entry["fields"]):
             name = fd["name"]
 
-            if label.lower() == "gps":
+            if label.lower().endswith("gps"):
                 value = _gps_value(name, t)
             elif label == "Heartbeat":
                 value = _heartbeat_value(name, t)

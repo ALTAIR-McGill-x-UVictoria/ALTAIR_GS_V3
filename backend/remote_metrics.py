@@ -20,6 +20,9 @@ from typing import Any, Callable, Protocol
 
 logger = logging.getLogger("gs.remote_metrics")
 
+_PHOTODIODE_PACKET_LABEL = "PhotodiodeSignal"
+_PHOTODIODE_FIELDS = ("sergeant_voltage_v", "soldier_voltage_v")
+
 
 def _env_bool(name: str, default: bool) -> bool:
     value = os.getenv(name)
@@ -84,6 +87,52 @@ class RemoteMetricsConfig:
         )
 
 
+@dataclass(frozen=True)
+class _PhotodiodeSignalPoint:
+    field: str
+    value: float
+    time_unix_nano: int
+
+
+def _photodiode_signal_points(
+    packet: dict[str, Any],
+) -> list[_PhotodiodeSignalPoint]:
+    """Return every valid, timestamped voltage sample carried by a batch."""
+
+    if packet.get("label") != _PHOTODIODE_PACKET_LABEL:
+        return []
+
+    points: list[_PhotodiodeSignalPoint] = []
+    for sample in packet.get("samples", []):
+        try:
+            time_unix_nano = int(sample["time_unix_us"]) * 1_000
+        except (KeyError, TypeError, ValueError):
+            try:
+                timestamp = float(sample["timestamp"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if not math.isfinite(timestamp):
+                continue
+            time_unix_nano = int(timestamp * 1_000_000_000)
+
+        if time_unix_nano <= 0:
+            continue
+        for field_name in _PHOTODIODE_FIELDS:
+            try:
+                value = float(sample[field_name])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if math.isfinite(value):
+                points.append(
+                    _PhotodiodeSignalPoint(
+                        field=field_name,
+                        value=value,
+                        time_unix_nano=time_unix_nano,
+                    )
+                )
+    return points
+
+
 class MetricSink(Protocol):
     def record(self, item_type: str, payload: dict[str, Any]) -> None: ...
 
@@ -100,16 +149,34 @@ class _OpenTelemetrySink:
             OTLPMetricExporter,
         )
         from opentelemetry.sdk.metrics import MeterProvider
-        from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
+        from opentelemetry.sdk.metrics.export import (
+            Gauge,
+            Metric,
+            MetricExportResult,
+            MetricsData,
+            NumberDataPoint,
+            PeriodicExportingMetricReader,
+            ResourceMetrics,
+            ScopeMetrics,
+        )
         from opentelemetry.sdk.resources import Resource
+        from opentelemetry.sdk.util.instrumentation import InstrumentationScope
 
         exporter = OTLPMetricExporter(timeout=config.export_timeout_s)
+        # Synchronous OTel gauges use last-value aggregation, which would
+        # collapse a 50-sample photodiode batch to one value before export.
+        # A dedicated exporter sends the already-batched raw data points with
+        # their acquisition timestamps, while keeping network I/O on this
+        # failure-isolated reporter thread.
+        self._photodiode_exporter = OTLPMetricExporter(
+            timeout=config.export_timeout_s
+        )
         reader = PeriodicExportingMetricReader(
             exporter,
             export_interval_millis=int(config.export_interval_s * 1000),
             export_timeout_millis=int(config.export_timeout_s * 1000),
         )
-        resource = Resource.create(
+        self._resource = Resource.create(
             {
                 "service.name": config.service_name,
                 "service.namespace": "altair",
@@ -117,14 +184,27 @@ class _OpenTelemetrySink:
                 "deployment.environment": config.deployment_environment,
             }
         )
-        self._provider = MeterProvider(resource=resource, metric_readers=[reader])
+        self._scope = InstrumentationScope(
+            name="altair.ground_station.telemetry"
+        )
+        self._GaugeData = Gauge
+        self._MetricData = Metric
+        self._MetricExportResult = MetricExportResult
+        self._MetricsData = MetricsData
+        self._NumberDataPoint = NumberDataPoint
+        self._ResourceMetrics = ResourceMetrics
+        self._ScopeMetrics = ScopeMetrics
+
+        self._provider = MeterProvider(
+            resource=self._resource, metric_readers=[reader]
+        )
         meter = self._provider.get_meter("altair.ground_station.telemetry")
 
         # Units are kept as attributes on the generic telemetry instrument so
         # Grafana's OTLP-to-Prometheus conversion preserves the dashboard name.
         self._telemetry_value = meter.create_gauge(
             "altair_telemetry_value",
-            description="Latest numeric telemetry field value.",
+            description="Numeric telemetry field value.",
         )
         self._packet_last_received = meter.create_gauge(
             "altair_telemetry_packet_last_received_seconds",
@@ -193,21 +273,25 @@ class _OpenTelemetrySink:
 
     def _record_packet(self, packet: dict[str, Any]) -> None:
         packet_label = str(packet.get("label", "unknown"))
-        for field in packet.get("fields", []):
-            try:
-                value = float(field["value"])
-            except (KeyError, TypeError, ValueError):
-                continue
-            if not math.isfinite(value):
-                continue
-            self._telemetry_value.set(
-                value,
-                {
-                    "packet": packet_label,
-                    "field": str(field.get("name", "unknown")),
-                    "unit": str(field.get("unit", "")),
-                },
-            )
+        photodiode_points = _photodiode_signal_points(packet)
+        if photodiode_points:
+            self._export_photodiode_points(packet_label, photodiode_points)
+        else:
+            for field in packet.get("fields", []):
+                try:
+                    value = float(field["value"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if not math.isfinite(value):
+                    continue
+                self._telemetry_value.set(
+                    value,
+                    {
+                        "packet": packet_label,
+                        "field": str(field.get("name", "unknown")),
+                        "unit": str(field.get("unit", "")),
+                    },
+                )
 
         self._packets.add(1, {"packet": packet_label})
         try:
@@ -217,6 +301,61 @@ class _OpenTelemetrySink:
         if dropped:
             self._packets_dropped.add(dropped, {"packet": packet_label})
         self._packet_last_received.set(time.time(), {"packet": packet_label})
+
+    def _export_photodiode_points(
+        self,
+        packet_label: str,
+        points: list[_PhotodiodeSignalPoint],
+    ) -> None:
+        points_by_timestamp: dict[int, list[_PhotodiodeSignalPoint]] = {}
+        for point in points:
+            points_by_timestamp.setdefault(point.time_unix_nano, []).append(point)
+
+        # Each timestamp is a separate metric collection. This keeps a single
+        # data point per channel identity in each Gauge while the OTLP request
+        # still batches the entire radio packet into one HTTP operation.
+        resource_metrics = []
+        for time_unix_nano, timestamp_points in points_by_timestamp.items():
+            data_points = [
+                self._NumberDataPoint(
+                    attributes={
+                        "packet": packet_label,
+                        "field": point.field,
+                        "unit": "V",
+                    },
+                    start_time_unix_nano=0,
+                    time_unix_nano=time_unix_nano,
+                    value=point.value,
+                )
+                for point in timestamp_points
+            ]
+            metric = self._MetricData(
+                name="altair_telemetry_value",
+                description="Numeric telemetry field value.",
+                unit="",
+                data=self._GaugeData(data_points=data_points),
+            )
+            resource_metrics.append(
+                self._ResourceMetrics(
+                    resource=self._resource,
+                    scope_metrics=[
+                        self._ScopeMetrics(
+                            scope=self._scope,
+                            metrics=[metric],
+                            schema_url="",
+                        )
+                    ],
+                    schema_url="",
+                )
+            )
+        metrics_data = self._MetricsData(
+            resource_metrics=resource_metrics
+        )
+        result = self._photodiode_exporter.export(metrics_data)
+        if result is not self._MetricExportResult.SUCCESS:
+            raise RuntimeError(
+                f"high-rate photodiode OTLP export failed: {result}"
+            )
 
     def record_reporter_status(self, queue_depth: int, dropped: int) -> None:
         self._queue_depth.set(queue_depth)
@@ -230,6 +369,10 @@ class _OpenTelemetrySink:
             self._provider.shutdown(timeout_millis=1000)
         except TypeError:
             self._provider.shutdown()
+        try:
+            self._photodiode_exporter.shutdown(timeout_millis=1000)
+        except TypeError:
+            self._photodiode_exporter.shutdown()
 
 
 SinkFactory = Callable[[RemoteMetricsConfig], MetricSink]

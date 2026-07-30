@@ -201,7 +201,15 @@ export function useTelemetry() {
 
         setPackets(prev => ({
           ...prev,
-          [label]: { fields, seq, timestamp, wall_ms: msg.wall_ms ?? null, dropped: msg.dropped ?? 0, hz, target_hz: msg.target_hz ?? null },
+          [label]: {
+            fields,
+            seq,
+            timestamp,
+            wall_ms: msg.wall_ms ?? null,
+            dropped: msg.sample_dropped ?? msg.dropped ?? 0,
+            hz,
+            target_hz: msg.target_hz ?? null,
+          },
         }))
 
         setHistory(prev => {
@@ -209,7 +217,14 @@ export function useTelemetry() {
           const updated = { ...labelHist }
           for (const f of fields) {
             const existing = updated[f.name] ?? []
-            const next = [...existing, { t: timestamp, v: f.value }]
+            const batchPoints = Array.isArray(msg.samples)
+              ? msg.samples
+                  .filter(sample => sample[f.name] != null)
+                  .map(sample => ({ t: sample.timestamp, v: sample[f.name] }))
+              : []
+            const next = batchPoints.length
+              ? [...existing, ...batchPoints]
+              : [...existing, { t: timestamp, v: f.value }]
             updated[f.name] = next.length > HISTORY_LEN
               ? next.slice(next.length - HISTORY_LEN)
               : next

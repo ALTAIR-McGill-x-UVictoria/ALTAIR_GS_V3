@@ -416,7 +416,10 @@ class TelemetryLogger:
             return []
 
         label = packet.get("label", "unknown")
-        self._csv_write(label, packet)
+        if label == "PhotodiodeSignal" and packet.get("samples"):
+            self._write_photodiode_samples(packet["samples"])
+        else:
+            self._csv_write(label, packet)
 
         alarms = self._alarm_engine.evaluate(packet)
         for ev in alarms:
@@ -434,6 +437,44 @@ class TelemetryLogger:
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
+
+    def _write_photodiode_samples(
+        self, samples: list[dict[str, Any]]
+    ) -> None:
+        """Write every sample carried by packet 0x0D as its own CSV row."""
+
+        for sample in samples:
+            sample_packet = {
+                "seq": sample.get("sequence", ""),
+                "timestamp": sample.get("timestamp", ""),
+                "fields": [
+                    {
+                        "name": "time_unix_us",
+                        "value": sample.get("time_unix_us"),
+                    },
+                    {
+                        "name": "valid_flags",
+                        "value": sample.get("valid_flags"),
+                    },
+                    {
+                        "name": "sergeant_code",
+                        "value": sample.get("sergeant_code"),
+                    },
+                    {
+                        "name": "soldier_code",
+                        "value": sample.get("soldier_code"),
+                    },
+                    {
+                        "name": "sergeant_voltage_v",
+                        "value": sample.get("sergeant_voltage_v"),
+                    },
+                    {
+                        "name": "soldier_voltage_v",
+                        "value": sample.get("soldier_voltage_v"),
+                    },
+                ],
+            }
+            self._csv_write("PhotodiodeSignal", sample_packet)
 
     def _csv_write(self, label: str, packet: dict[str, Any]) -> None:
         if label not in self._csv_files:

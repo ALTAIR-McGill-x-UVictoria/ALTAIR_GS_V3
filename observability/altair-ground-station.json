@@ -1232,7 +1232,7 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "altair_telemetry_value{packet=\"Photodiode\",field=~\".*tia.*\"}",
+          "expr": "altair_telemetry_value{packet=\"PhotodiodeSignal\",field=~\"(sergeant|soldier)_voltage_v\"}",
           "instant": false,
           "legendFormat": "{{field}}",
           "range": true,

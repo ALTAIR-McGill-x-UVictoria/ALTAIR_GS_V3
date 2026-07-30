@@ -9,6 +9,8 @@ dist-ssr/
 __pycache__/
 *.pyc
 .venv/
+.env
+.env.local
 
 # Runtime binaries (obtain separately — see lib/README.md)
 lib/*.dll

@@ -32,9 +32,14 @@ import tomllib
 
 import serial
 import serial.tools.list_ports
+from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, Response
+
+# Load local configuration before metrics reporters are constructed below.
+# Values already supplied by the shell or service manager take precedence.
+load_dotenv(Path(__file__).resolve().parents[1] / ".env", override=False)
 
 from backend.packets import REGISTRY, HEADER_SIZE, CRC_SIZE, MIN_FRAME, SYNC_BYTE, ACK_PACKET_ID, decode_frame, decode_ack_frame
 from backend.packets import _HEADER, _CRC

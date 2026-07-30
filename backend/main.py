@@ -200,6 +200,7 @@ class SerialReader:
         self._buf  = bytearray()
         self._lr_buf = bytearray()   # accumulates LR-900p frames (SOF=0xEF)
         self._seq_prev: dict[int, int]   = {}
+        self._photodiode_sample_prev: int | None = None
         self.connected = False
         self.port_name = ""
         self._clients: set[WebSocket]    = set()
@@ -263,6 +264,7 @@ class SerialReader:
             self._buf.clear()
             self._lr_buf.clear()
             self._seq_prev.clear()
+            self._photodiode_sample_prev = None
             self._lr_seq = 0
             self._lr_start_t = time.monotonic()
             self._lr_linked = False
@@ -447,6 +449,36 @@ class SerialReader:
                         self._pending_gaps.clear()
                         self._seq_prev.clear()
             self._seq_prev[pkt_id] = seq
+
+            if pkt_id == 0x0D and result.get("samples"):
+                first_sample_seq = int(result["samples"][0]["sequence"])
+                if self._photodiode_sample_prev is not None:
+                    expected_sample_seq = (
+                        self._photodiode_sample_prev + 1
+                    ) & 0xFFFFFFFF
+                    missing_samples = (
+                        first_sample_seq - expected_sample_seq
+                    ) & 0xFFFFFFFF
+                    # A backwards jump is a task/FC restart, not billions of
+                    # missing samples. Forward gaps remain visible in the log/UI.
+                    if 0 < missing_samples < 0x80000000:
+                        result["sample_dropped"] = missing_samples
+                        logger.warning(
+                            "Photodiode sample gap: expected %d got %d "
+                            "(%d sample(s) missing)",
+                            expected_sample_seq,
+                            first_sample_seq,
+                            missing_samples,
+                        )
+                    elif missing_samples >= 0x80000000:
+                        logger.info(
+                            "Photodiode sample sequence reset: %d -> %d",
+                            self._photodiode_sample_prev,
+                            first_sample_seq,
+                        )
+                self._photodiode_sample_prev = int(
+                    result["samples"][-1]["sequence"]
+                )
 
             self._diag_frame_count += 1
             result["wall_ms"] = round(time.time() * 1000)

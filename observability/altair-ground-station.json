@@ -463,6 +463,7 @@
         "y": 4
       },
       "id": 7,
+      "description": "Shows every payload coordinate sample in the selected dashboard time range. MAVLink GPS is preferred, with Local GPS used when MAVLink GPS is unavailable.",
       "options": {
         "basemap": {
           "config": {},
@@ -480,12 +481,13 @@
         "layers": [
           {
             "config": {
-              "showLegend": false,
+              "arrow": 1,
               "style": {
                 "color": {
-                  "fixed": "red"
+                  "fixed": "light-blue"
                 },
-                "opacity": 0.9,
+                "lineWidth": 2,
+                "opacity": 0.85,
                 "rotation": {
                   "fixed": 0,
                   "max": 360,
@@ -493,7 +495,48 @@
                   "mode": "mod"
                 },
                 "size": {
-                  "fixed": 12,
+                  "fixed": 3,
+                  "max": 10,
+                  "min": 1
+                },
+                "symbol": {
+                  "fixed": "img/icons/marker/circle.svg",
+                  "mode": "fixed"
+                },
+                "textConfig": {
+                  "fontSize": 12,
+                  "offsetX": 0,
+                  "offsetY": 0,
+                  "textAlign": "center",
+                  "textBaseline": "middle"
+                }
+              }
+            },
+            "location": {
+              "latitude": "Latitude",
+              "longitude": "Longitude",
+              "mode": "coords"
+            },
+            "name": "Payload track",
+            "tooltip": true,
+            "type": "route"
+          },
+          {
+            "config": {
+              "showLegend": false,
+              "style": {
+                "color": {
+                  "fixed": "red"
+                },
+                "opacity": 0.65,
+                "rotation": {
+                  "fixed": 0,
+                  "max": 360,
+                  "min": -360,
+                  "mode": "mod"
+                },
+                "size": {
+                  "fixed": 5,
                   "max": 15,
                   "min": 2
                 },
@@ -515,7 +558,7 @@
               "longitude": "Longitude",
               "mode": "coords"
             },
-            "name": "Payload",
+            "name": "Coordinate samples",
             "tooltip": true,
             "type": "markers"
           }
@@ -534,22 +577,22 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "altair_telemetry_value{packet=~\"$gps_packet\",field=\"lat\"}",
-          "instant": true,
+          "expr": "sum without (packet, unit) (altair_telemetry_value{packet=\"MavlinkGps\",field=\"lat\"}) or sum without (packet, unit) (altair_telemetry_value{packet=\"LocalGps\",field=\"lat\"})",
+          "instant": false,
           "legendFormat": "Latitude",
-          "range": false,
+          "range": true,
           "refId": "A"
         },
         {
           "editorMode": "code",
-          "expr": "altair_telemetry_value{packet=~\"$gps_packet\",field=\"lon\"}",
-          "instant": true,
+          "expr": "sum without (packet, unit) (altair_telemetry_value{packet=\"MavlinkGps\",field=\"lon\"}) or sum without (packet, unit) (altair_telemetry_value{packet=\"LocalGps\",field=\"lon\"})",
+          "instant": false,
           "legendFormat": "Longitude",
-          "range": false,
+          "range": true,
           "refId": "B"
         }
       ],
-      "title": "Payload Coordinates",
+      "title": "Payload Coordinate Track",
       "transformations": [
         {
           "id": "joinByField",
@@ -1457,35 +1500,7 @@
     "balloon"
   ],
   "templating": {
-    "list": [
-      {
-        "current": {
-          "selected": true,
-          "text": "MavlinkGps",
-          "value": "MavlinkGps"
-        },
-        "hide": 0,
-        "includeAll": false,
-        "label": "GPS source",
-        "multi": false,
-        "name": "gps_packet",
-        "options": [
-          {
-            "selected": true,
-            "text": "MavlinkGps",
-            "value": "MavlinkGps"
-          },
-          {
-            "selected": false,
-            "text": "LocalGps",
-            "value": "LocalGps"
-          }
-        ],
-        "query": "MavlinkGps,LocalGps",
-        "skipUrlSync": false,
-        "type": "custom"
-      }
-    ]
+    "list": []
   },
   "time": {
     "from": "now-30m",
@@ -1511,6 +1526,6 @@
   "timezone": "browser",
   "title": "ALTAIR Ground Station",
   "uid": "altair-ground-station",
-  "version": 1,
+  "version": 2,
   "weekStart": ""
 }

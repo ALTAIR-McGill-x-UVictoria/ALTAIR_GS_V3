@@ -46,6 +46,11 @@ for _p in sorted(_PACKETS_DIR.glob("*.py")):
     if _p.stem != "__init__":
         importlib.import_module(f"telemetry.packets.{_p.stem}")
 
+from telemetry.packets.photodiode_batch import (  # noqa: E402
+    PHOTODIODE_BATCH_PACKET_ID,
+    PhotodiodeBatchPacket,
+)
+
 # ---------------------------------------------------------------------------
 # Build the decoder registry from the flight computer's packet_registry.
 # Each entry needs: LABEL, STRUCT_FMT, FIELDS (for the frontend display).
@@ -116,6 +121,94 @@ HEADER_SIZE = _HEADER.size              # 13
 CRC_SIZE    = _CRC.size                 # 2
 MIN_FRAME   = HEADER_SIZE + CRC_SIZE    # 15
 
+_ADC_VREF_V = 2.5
+_ADC_FULL_SCALE_CODE = float(1 << 23)
+
+
+def _code_to_voltage(code: int) -> float:
+    return (float(code) / _ADC_FULL_SCALE_CODE) * _ADC_VREF_V + _ADC_VREF_V
+
+
+def _decode_photodiode_batch(
+    payload: bytes,
+    frame_seq: int,
+    transmit_timestamp: float,
+) -> dict[str, Any] | None:
+    """Decode packet 0x0D into a batch plus a latest-sample packet view."""
+
+    try:
+        batch = PhotodiodeBatchPacket.unpack_payload(payload)
+    except (TypeError, ValueError):
+        return None
+
+    samples: list[dict[str, Any]] = []
+    for sample in batch.samples:
+        sergeant_valid = bool(sample.valid_flags & 0x01)
+        soldier_valid = bool(sample.valid_flags & 0x02)
+        samples.append(
+            {
+                "sequence": sample.sequence,
+                "timestamp": sample.time_unix_us / 1_000_000.0,
+                "time_unix_us": sample.time_unix_us,
+                "valid_flags": sample.valid_flags,
+                "sergeant_code": sample.sergeant_code,
+                "soldier_code": sample.soldier_code,
+                "sergeant_voltage_v": (
+                    round(_code_to_voltage(sample.sergeant_code), 9)
+                    if sergeant_valid
+                    else None
+                ),
+                "soldier_voltage_v": (
+                    round(_code_to_voltage(sample.soldier_code), 9)
+                    if soldier_valid
+                    else None
+                ),
+            }
+        )
+
+    latest = samples[-1]
+    sample_hz = (
+        round(1_000_000.0 / batch.sample_period_us, 3)
+        if batch.sample_period_us > 0
+        else None
+    )
+    return {
+        "packet_id": PHOTODIODE_BATCH_PACKET_ID,
+        "label": "PhotodiodeSignal",
+        "seq": frame_seq,
+        "timestamp": latest["timestamp"],
+        "transmit_timestamp": round(transmit_timestamp, 4),
+        "target_hz": 2.0,
+        "sample_hz": sample_hz,
+        "sample_period_us": batch.sample_period_us,
+        "first_sample_seq": samples[0]["sequence"],
+        "last_sample_seq": latest["sequence"],
+        "samples": samples,
+        "fields": [
+            {
+                "name": "sergeant_voltage_v",
+                "label": "Sergeant low-gain TIA",
+                "unit": "V",
+                "group": "Photodiode signal",
+                "value": latest["sergeant_voltage_v"],
+            },
+            {
+                "name": "soldier_voltage_v",
+                "label": "Soldier low-gain TIA",
+                "unit": "V",
+                "group": "Photodiode signal",
+                "value": latest["soldier_voltage_v"],
+            },
+            {
+                "name": "valid_flags",
+                "label": "ADC validity flags",
+                "unit": "",
+                "group": "Photodiode signal",
+                "value": latest["valid_flags"],
+            },
+        ],
+    }
+
 # ---------------------------------------------------------------------------
 # Decoder
 # ---------------------------------------------------------------------------
@@ -175,11 +268,14 @@ def decode_frame(raw: bytes) -> dict[str, Any] | None:
     if received_crc != computed_crc:
         return None
 
+    payload = raw[HEADER_SIZE: HEADER_SIZE + length]
+    if pkt_id == PHOTODIODE_BATCH_PACKET_ID:
+        return _decode_photodiode_batch(payload, seq, timestamp)
+
     entry = REGISTRY.get(pkt_id)
     if entry is None:
         return None
 
-    payload = raw[HEADER_SIZE: HEADER_SIZE + length]
     if len(payload) != entry["struct"].size:
         return None
 

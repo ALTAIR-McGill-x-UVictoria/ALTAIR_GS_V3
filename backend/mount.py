@@ -123,7 +123,13 @@ class NexStarController(BaseMountController):
         await self._run(self._do_connect, port)
 
     def _do_connect(self, port: str) -> None:
-        import nexstar as ns
+        try:
+            import nexstar as ns
+        except ImportError as e:
+            raise RuntimeError(
+                "NexStar control requires the `nexstar` package. "
+                "Install with `pip install nexstar`."
+            ) from e
         hc = ns.NexstarHandController(port)
         model = hc.getModel()
         logger.info("NexStar connected on %s — model: %s", port, model)
@@ -236,7 +242,15 @@ class AM5Controller(BaseMountController):
         await self._run(self._do_connect, _progid)
 
     def _do_connect(self, progid: str) -> None:
-        import win32com.client as win32
+        try:
+            import win32com.client as win32
+        except ImportError as e:
+            raise RuntimeError(
+                "AM5 control requires the ASCOM platform + pywin32, which are "
+                "Windows-only. Install with `pip install pywin32` on a Windows "
+                "host, and install the ASCOM Platform + ZWO ASCOM telescope "
+                "driver. See backend/lib/README.md."
+            ) from e
         tel = win32.Dispatch(progid)
         tel.Connected = True
         if not tel.Connected:
@@ -270,26 +284,11 @@ class AM5Controller(BaseMountController):
         ra_h  = self._telescope.RightAscension   # decimal hours
         dec_d = self._telescope.Declination      # degrees
         # Convert to Az/El for UI consistency using tracking math
-        import backend.tracking as _tracking
-        from backend.tracking import _gmst_deg, _julian_date, _DEG2RAD, _RAD2DEG
-        import math
-        import time as t
-        jd  = _julian_date(t.time())
-        lst = (_gmst_deg(jd) + _tracking.GS_LON) % 360.0
-        ha_deg = lst - ra_h * 15.0
-        ha_r   = ha_deg            * _DEG2RAD
-        dec_r  = dec_d             * _DEG2RAD
-        lat_r  = _tracking.GS_LAT * _DEG2RAD
-        sin_el = (math.sin(dec_r) * math.sin(lat_r)
-                  + math.cos(dec_r) * math.cos(lat_r) * math.cos(ha_r))
-        el_r   = math.asin(max(-1.0, min(1.0, sin_el)))
-        cos_az = (math.sin(dec_r) - math.sin(lat_r) * sin_el) / (math.cos(lat_r) * math.cos(el_r) + 1e-12)
-        az_r   = math.acos(max(-1.0, min(1.0, cos_az)))
-        if math.sin(ha_r) > 0:
-            az_r = 2 * math.pi - az_r
+        from backend.tracking import radec_to_azalt
+        az, el = radec_to_azalt(ra_h, dec_d)
         return {
-            "azimuth":   az_r  * _RAD2DEG,
-            "elevation": el_r  * _RAD2DEG,
+            "azimuth":   az,
+            "elevation": el,
             "ra_hours":  ra_h,
             "dec_deg":   dec_d,
         }
@@ -312,6 +311,84 @@ class AM5Controller(BaseMountController):
 
 
 # ---------------------------------------------------------------------------
+# Emulated mount (ALTAIR_DEBUG) — no hardware, no serial/ASCOM link
+# ---------------------------------------------------------------------------
+
+class EmulatedMountController(BaseMountController):
+    """
+    Software-only stand-in for NexStarController / AM5Controller, active when
+    ALTAIR_DEBUG=1. Mimics the interface of whichever real mount_type it is
+    asked to impersonate (Az/El for 'nexstar', RA/Dec for 'am5') so the
+    Telescope tab, tracking loop, and capture pipeline can be exercised
+    end-to-end without a physical mount attached.
+
+    Slews are simulated at SLEW_RATE_DEG_S, capped at MAX_SLEW_S, so the UI
+    still shows a brief in-flight state rather than teleporting instantly.
+    """
+
+    SLEW_RATE_DEG_S = 5.0
+    MAX_SLEW_S = 3.0
+
+    def __init__(self, emulated_type: str = "nexstar") -> None:
+        if emulated_type not in ("nexstar", "am5"):
+            raise ValueError(f"Unknown mount type {emulated_type!r}. Choose 'nexstar' or 'am5'.")
+        super().__init__()
+        self._emulated_type = emulated_type
+        self._az = 180.0
+        self._el = 45.0
+
+    @property
+    def mount_type(self) -> str:
+        return self._emulated_type
+
+    async def connect(self, port: str = "", progid: str = "", **_) -> None:
+        self.connected = True
+        self.port_name = f"EMULATED ({port or progid or 'debug'})"
+        self._last_position = await self.get_position()
+        logger.info("Emulated %s mount connected", self._emulated_type)
+
+    async def disconnect(self) -> None:
+        self.connected = False
+        self.port_name = ""
+        logger.info("Emulated mount disconnected")
+
+    async def get_position(self) -> dict:
+        pos = {"azimuth": self._az, "elevation": self._el}
+        if self._emulated_type == "am5":
+            from backend.tracking import azalt_to_radec
+            ra_h, dec_d = azalt_to_radec(self._az, self._el)
+            pos["ra_hours"] = ra_h
+            pos["dec_deg"]  = dec_d
+        self._last_position = pos
+        return pos
+
+    async def goto(self, azimuth: float | None = None, elevation: float | None = None,
+                    ra_hours: float | None = None, dec_deg: float | None = None, **_) -> None:
+        if not self.connected:
+            logger.warning("Emulated mount goto called while disconnected — ignoring")
+            return
+
+        if self._emulated_type == "am5":
+            if ra_hours is None or dec_deg is None:
+                return
+            from backend.tracking import radec_to_azalt
+            target_az, target_el = radec_to_azalt(ra_hours, dec_deg)
+        else:
+            if azimuth is None or elevation is None:
+                return
+            target_az, target_el = azimuth, elevation
+
+        duration = min(max(abs(target_az - self._az), abs(target_el - self._el)) / self.SLEW_RATE_DEG_S,
+                        self.MAX_SLEW_S)
+        if duration > 0:
+            await asyncio.sleep(duration)
+
+        self._az, self._el = target_az, target_el
+        self._last_position = await self.get_position()
+        logger.info("Emulated %s slewed to Az=%.2f° El=%.2f°", self._emulated_type, target_az, target_el)
+
+
+# ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
 
@@ -320,7 +397,13 @@ def create_mount(mount_type: str) -> BaseMountController:
     Return the appropriate controller for the requested mount type.
 
     mount_type: 'nexstar' | 'am5'
+
+    Under ALTAIR_DEBUG=1, always returns an EmulatedMountController that
+    impersonates the requested type instead of talking to real hardware.
     """
+    import os
+    if os.getenv("ALTAIR_DEBUG", "0") == "1":
+        return EmulatedMountController(mount_type)
     if mount_type == "nexstar":
         return NexStarController()
     if mount_type == "am5":

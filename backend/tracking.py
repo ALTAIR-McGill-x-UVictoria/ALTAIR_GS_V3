@@ -155,6 +155,55 @@ def azalt_to_radec(
     return ra_hours, dec_r * _RAD2DEG
 
 
+def radec_to_azalt(
+    ra_hours: float,
+    dec_deg: float,
+    observer_lat: float | None = None,
+    observer_lon: float | None = None,
+    unix_utc: float | None = None,
+) -> tuple[float, float]:
+    """
+    Convert equatorial RA/Dec to topocentric Az/El. Inverse of azalt_to_radec().
+
+    Parameters
+    ----------
+    ra_hours     : RA, decimal hours [0, 24)
+    dec_deg      : Dec, degrees [-90, 90]
+    observer_lat : observer geodetic latitude, degrees (defaults to GS_LAT)
+    observer_lon : observer geodetic longitude, degrees E (defaults to GS_LON)
+    unix_utc     : UTC time as Unix timestamp; defaults to now
+
+    Returns
+    -------
+    (azimuth_deg, elevation_deg)
+    """
+    import backend.tracking as _self
+    if observer_lat is None:
+        observer_lat = _self.GS_LAT
+    if observer_lon is None:
+        observer_lon = _self.GS_LON
+    if unix_utc is None:
+        unix_utc = _time.time()
+
+    jd  = _julian_date(unix_utc)
+    lst = (_gmst_deg(jd) + observer_lon) % 360.0
+    ha_deg = lst - ra_hours * 15.0
+    ha_r   = ha_deg * _DEG2RAD
+    dec_r  = dec_deg * _DEG2RAD
+    lat_r  = observer_lat * _DEG2RAD
+
+    sin_el = (math.sin(dec_r) * math.sin(lat_r)
+              + math.cos(dec_r) * math.cos(lat_r) * math.cos(ha_r))
+    el_r = math.asin(max(-1.0, min(1.0, sin_el)))
+
+    cos_az = (math.sin(dec_r) - math.sin(lat_r) * sin_el) / (math.cos(lat_r) * math.cos(el_r) + 1e-12)
+    az_r = math.acos(max(-1.0, min(1.0, cos_az)))
+    if math.sin(ha_r) > 0:
+        az_r = 2 * math.pi - az_r
+
+    return az_r * _RAD2DEG, el_r * _RAD2DEG
+
+
 def calculate_tracking_params(
     payload_lat: float,
     payload_lon: float,

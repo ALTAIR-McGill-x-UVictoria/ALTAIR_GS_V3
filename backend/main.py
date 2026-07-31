@@ -45,7 +45,7 @@ from backend.packets import REGISTRY, HEADER_SIZE, CRC_SIZE, MIN_FRAME, SYNC_BYT
 from backend.packets import _HEADER, _CRC
 from backend.tracking import calculate_tracking_params
 from backend.mount import BaseMountController, create_mount
-from backend.camera import CameraController
+from backend.camera import CameraController, EmulatedCameraController
 from backend.logging_manager import TelemetryLogger
 from backend.alarms import ALARM_RULES
 from backend.emulator import PacketEmulator
@@ -793,7 +793,9 @@ _latest_events:  list[dict]      = []   # last 200 events
 # ---------------------------------------------------------------------------
 
 mount_controller: BaseMountController | None = None
-camera_controller = CameraController()
+camera_controller = (
+    EmulatedCameraController() if os.getenv("ALTAIR_DEBUG", "0") == "1" else CameraController()
+)
 
 # Latest GPS data from telemetry — updated by _broadcast, read by tracking poll
 _latest_gps: dict | None = None

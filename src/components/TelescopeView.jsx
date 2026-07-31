@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react'
 import { useTelescope } from '../hooks/useTelescope'
+import { useSerial } from '../hooks/useSerial'
 
 const C = {
   accent:  '#00e5ff',
@@ -101,7 +102,9 @@ export default function TelescopeView() {
     actions,
   } = useTelescope()
 
-  const [mountPort,    setMountPort]   = useState('COM10')
+  const { ports: serialPorts, refreshPorts } = useSerial()
+
+  const [mountPort,    setMountPort]   = useState('')
   const [mountType,    setMountType]   = useState('nexstar')
   const [gain,         setGain]        = useState(150)
   const [exposureMs,   setExposureMs]  = useState(1000)
@@ -115,10 +118,23 @@ export default function TelescopeView() {
   const [images,       setImages]      = useState([])
   const [activeIndex,  setActiveIndex] = useState(0)
   const [sidebarOpen,  setSidebarOpen] = useState(true)
+  const [mountError,   setMountError]  = useState(null)
+  const [cameraError,  setCameraError] = useState(null)
 
-  const run = async (fn) => {
+  const run = async (fn, setError = null) => {
     setBusy(true)
-    try { await fn() } finally { setBusy(false) }
+    if (setError) setError(null)
+    try {
+      const res = await fn()
+      if (setError && res && res.ok === false) {
+        setError(res.error || 'Request failed')
+      }
+      return res
+    } catch (e) {
+      if (setError) setError(e.message || 'Request failed')
+    } finally {
+      setBusy(false)
+    }
   }
 
   async function fetchImages(selectFilename = null) {
@@ -138,6 +154,10 @@ export default function TelescopeView() {
     const id = setInterval(fetchImages, 5000)
     return () => clearInterval(id)
   }, []) // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    refreshPorts()
+  }, [refreshPorts])
 
   const mountConnected  = mountStatus?.connected  ?? false
   const activeMountType = mountStatus?.mount_type ?? mountType
@@ -185,19 +205,26 @@ export default function TelescopeView() {
               <option value="am5">ZWO AM5</option>
             </select>
             {mountType === 'nexstar' && (
-              <input
+              <select
                 style={styles.input}
                 value={mountPort}
                 onChange={e => setMountPort(e.target.value)}
-                placeholder="COM port"
+                onFocus={refreshPorts}
                 disabled={mountConnected}
-              />
+              >
+                <option value="">— select port —</option>
+                {serialPorts.map(p => (
+                  <option key={p.device} value={p.device}>
+                    {p.device}{p.is_lr900p ? ' ★ LR-900p' : ''} — {p.description}
+                  </option>
+                ))}
+              </select>
             )}
             {mountConnected
               ? <button style={styles.btnDanger} disabled={busy}
-                  onClick={() => run(actions.disconnectMount)}>Disconnect</button>
+                  onClick={() => run(actions.disconnectMount, setMountError)}>Disconnect</button>
               : <button style={styles.btn} disabled={busy}
-                  onClick={() => run(() => actions.connectMount(mountType, mountPort))}>Connect</button>
+                  onClick={() => run(() => actions.connectMount(mountType, mountPort), setMountError)}>Connect</button>
             }
           </div>
 
@@ -214,7 +241,7 @@ export default function TelescopeView() {
                   onClick={() => run(() => actions.gotoMount({
                     ra_hours: parseFloat(manualRa)  || 0,
                     dec_deg:  parseFloat(manualDec) || 0,
-                  }))}>GoTo</button>
+                  }), setMountError)}>GoTo</button>
               </div>
             ) : (
               <div style={{ ...styles.inputRow, marginTop: 8 }}>
@@ -228,10 +255,14 @@ export default function TelescopeView() {
                   onClick={() => run(() => actions.gotoMount({
                     azimuth:   parseFloat(manualAz) || 0,
                     elevation: parseFloat(manualEl) || 0,
-                  }))}>GoTo</button>
+                  }), setMountError)}>GoTo</button>
               </div>
             )
           }
+
+          {mountError && (
+            <div style={{ marginTop: 6, fontSize: 11, color: C.red }}>{mountError}</div>
+          )}
 
           {mountStatus?.position && (
             <div style={{ marginTop: 6 }}>
@@ -258,7 +289,7 @@ export default function TelescopeView() {
             <button
               style={trackingEnabled ? styles.btnDanger : styles.btnGreen}
               disabled={!mountConnected || busy}
-              onClick={() => run(() => actions.setTracking(!trackingEnabled))}
+              onClick={() => run(() => actions.setTracking(!trackingEnabled), setMountError)}
             >
               {trackingEnabled ? 'Stop Tracking' : 'Start Tracking'}
             </button>
@@ -306,11 +337,15 @@ export default function TelescopeView() {
           <div style={{ ...styles.inputRow, marginTop: 8 }}>
             {cameraConnected
               ? <button style={styles.btnDanger} disabled={busy}
-                  onClick={() => run(actions.disconnectCamera)}>Disconnect</button>
+                  onClick={() => run(actions.disconnectCamera, setCameraError)}>Disconnect</button>
               : <button style={styles.btn} disabled={busy}
-                  onClick={() => run(actions.connectCamera)}>Connect</button>
+                  onClick={() => run(actions.connectCamera, setCameraError)}>Connect</button>
             }
           </div>
+
+          {cameraError && (
+            <div style={{ marginTop: 6, fontSize: 11, color: C.red }}>{cameraError}</div>
+          )}
 
           {cameraConnected && (
             <>
@@ -322,7 +357,7 @@ export default function TelescopeView() {
                 <input type="number" style={{ ...styles.input, width: 80 }}
                   value={exposureMs} onChange={e => setExposureMs(Number(e.target.value))} />
                 <button style={styles.btn} disabled={busy}
-                  onClick={() => run(() => actions.setCameraSettings({ gain, exposure_ms: exposureMs }))}>
+                  onClick={() => run(() => actions.setCameraSettings({ gain, exposure_ms: exposureMs }), setCameraError)}>
                   Apply
                 </button>
               </div>
@@ -339,7 +374,8 @@ export default function TelescopeView() {
                       await fetchImages(filename)
                       setSidebarOpen(true)
                     }
-                  })}>
+                    return res
+                  }, setCameraError)}>
                   Capture
                 </button>
               </div>

@@ -24,13 +24,33 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import platform
 import time as _time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 logger = logging.getLogger("gs.camera")
 
-_DEFAULT_DLL = Path(__file__).parent.parent / "lib" / "ASICamera2.dll"
+# ZWO ships the ASI SDK as a per-platform shared library. The filename (not
+# just the extension) differs by OS — see backend/lib/README.md for where to
+# download each one. Override with ALTAIR_ASI_LIB_PATH if yours lives elsewhere.
+_LIB_NAMES = {
+    "Windows": "ASICamera2.dll",
+    "Linux":   "libASICamera2.so",
+    "Darwin":  "libASICamera2.dylib",
+}
+
+
+def _default_lib_path() -> Path:
+    override = os.getenv("ALTAIR_ASI_LIB_PATH")
+    if override:
+        return Path(override)
+    name = _LIB_NAMES.get(platform.system(), _LIB_NAMES["Linux"])
+    return Path(__file__).parent.parent / "lib" / name
+
+
+_DEFAULT_DLL = _default_lib_path()
 
 # zwoasi control IDs that we want to read back after capture.
 # Queried dynamically — any control not present on a given sensor is skipped.
@@ -97,9 +117,18 @@ class CameraController:
         await loop.run_in_executor(self._executor, self._do_connect)
 
     def _do_connect(self) -> None:
-        import zwoasi
+        try:
+            import zwoasi
+        except ImportError as e:
+            raise RuntimeError(
+                "ZWO camera control requires the `zwoasi` package. "
+                "Install with `pip install zwoasi`."
+            ) from e
         if not self._dll_path.exists():
-            raise FileNotFoundError(f"ASICamera2.dll not found at {self._dll_path}")
+            raise FileNotFoundError(
+                f"ASI SDK library not found at {self._dll_path}. "
+                "See backend/lib/README.md for where to download it."
+            )
         zwoasi.init(str(self._dll_path))
 
         num = zwoasi.get_num_cameras()
@@ -249,8 +278,14 @@ class CameraController:
         return str(output_path)
 
     def _inject_exif(self, path: Path, meta: dict, sensor: dict) -> None:
-        import piexif
-        from PIL import Image
+        try:
+            import piexif
+            from PIL import Image
+        except ImportError as e:
+            raise RuntimeError(
+                "EXIF injection requires the `piexif` and `Pillow` packages. "
+                "Install with `pip install piexif Pillow`."
+            ) from e
 
         capture_utc = meta.get("capture_utc", _time.time())
         dt_str = _time.strftime("%Y:%m:%d %H:%M:%S", _time.gmtime(capture_utc))
@@ -382,3 +417,67 @@ class CameraController:
             "gain":         self._gain,
             "exposure_ms":  self._exposure_ms,
         }
+
+
+# ---------------------------------------------------------------------------
+# Emulated camera (ALTAIR_DEBUG) — no hardware, no ASI SDK
+# ---------------------------------------------------------------------------
+
+class EmulatedCameraController(CameraController):
+    """
+    Software-only stand-in for CameraController, active when ALTAIR_DEBUG=1.
+
+    Synthesizes a noise frame instead of talking to a ZWO ASI camera and the
+    ASICamera2 SDK, but reuses the real EXIF-injection pipeline so captures
+    still carry pointing/GPS/sensor metadata for end-to-end testing of the
+    Telescope tab and gallery without hardware attached.
+    """
+
+    _SENSOR_CONTROLS = {
+        "Pixel Size um":  3.75,
+        "Max Width px":   1920,
+        "Max Height px":  1080,
+        "Bit Depth":      16,
+        "Is Color":       False,
+        "Has Cooler":     False,
+        "Has ST4 Port":   False,
+        "Temperature":    24.5,
+    }
+
+    async def connect(self) -> None:
+        self._camera_name = "Emulated ASI Camera"
+        self._camera = "emulated"   # sentinel — truthy, never dereferenced as a real handle
+        self.connected = True
+        logger.info("Emulated camera connected: %s", self._camera_name)
+
+    async def disconnect(self) -> None:
+        self._camera = None
+        self.connected = False
+        logger.info("Emulated camera disconnected")
+
+    async def set_gain(self, gain: int) -> None:
+        self._gain = gain
+
+    async def set_exposure_ms(self, ms: int) -> None:
+        self._exposure_ms = ms
+
+    def _do_get_all_controls(self) -> dict:
+        return {
+            "Gain":     self._gain,
+            "Exposure": self._exposure_ms * 1000,
+            **self._SENSOR_CONTROLS,
+        }
+
+    def _do_capture_and_tag(self, output_path: Path, metadata: dict) -> str:
+        from PIL import Image
+        img = Image.effect_noise((1920, 1080), 40).convert("RGB")
+        img.save(output_path)
+        logger.info("Emulated: synthesized frame -> %s", output_path)
+
+        sensor_controls = self._do_get_all_controls()
+        try:
+            self._inject_exif(output_path, metadata, sensor_controls)
+        except Exception as e:
+            logger.warning("Emulated: EXIF injection failed for %s: %s", output_path.name, e)
+
+        return str(output_path)

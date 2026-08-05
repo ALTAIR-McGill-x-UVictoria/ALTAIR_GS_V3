@@ -1,7 +1,7 @@
 """
 Telescope mount controllers.
 
-Two concrete implementations behind a common async interface:
+Three concrete implementations behind a common async interface:
 
   NexStarController  — Celestron NexStar (Alt/Az) via the `nexstar` library.
                         Commanded with azimuth / elevation degrees.
@@ -10,7 +10,13 @@ Two concrete implementations behind a common async interface:
                         Commanded with RA (decimal hours) / Dec (degrees).
                         Requires the ZWO ASCOM driver installed on Windows.
 
-Both run all blocking hardware calls in a single-threaded ThreadPoolExecutor
+  IndiMountController — ZWO AM3/AM5 (or any INDI telescope) via the INDI
+                        protocol (backend/indi_client.py), e.g. a local
+                        `indiserver` running `indi_lx200am5`. Linux-friendly
+                        alternative to AM5Controller — no ASCOM/Windows.
+                        Commanded with RA (decimal hours) / Dec (degrees).
+
+All run blocking hardware calls in a single-threaded ThreadPoolExecutor
 so they never stall the FastAPI event loop.
 
 Smart positioning (NexStar only):
@@ -66,7 +72,7 @@ class BaseMountController(ABC):
     @property
     @abstractmethod
     def mount_type(self) -> str:
-        """Return a short identifier: 'nexstar' or 'am5'."""
+        """Return a short identifier: 'nexstar', 'am5', or 'indi'."""
 
     @abstractmethod
     async def connect(self, port: str = "") -> None: ...
@@ -311,6 +317,146 @@ class AM5Controller(BaseMountController):
 
 
 # ---------------------------------------------------------------------------
+# ZWO AM3/AM5 via INDI (direct — indi_lx200am5, no ASCOM/Windows required)
+# ---------------------------------------------------------------------------
+
+class IndiMountController(BaseMountController):
+    """
+    A mount driven over the INDI protocol instead of ASCOM — in practice a
+    ZWO AM3/AM5 connected over USB to a local `indiserver` running the
+    `indi_lx200am5` driver (part of the `indi-full`/`indi-bin` packages,
+    libindi >= 1.9.4), so goto/tracking works on Linux without the
+    Windows-only ASCOM driver AM5Controller depends on.
+
+    Commanded with RA (decimal hours) / Dec (degrees), same as AM5Controller
+    — INDI mounts are driven through the standard EQUATORIAL_EOD_COORD
+    property. get_position() converts to Az/El for UI consistency using the
+    same tracking math as AM5Controller.
+
+    connect() reuses the BaseMountController `port` kwarg to carry the INDI
+    server's host/IP instead of a serial port — pass "localhost" (indiserver
+    running on this machine) or "192.168.1.50:7624" for a remote one. INDI
+    port defaults to 7624 if omitted.
+
+    NOTE: written against documented INDI standard properties. The AM5's
+    indi_lx200am5 driver was written against the LX200 command set before
+    any developer had real AM5/AM3 hardware to test against, and is reported
+    as not fully mature — validate goto/tracking/guide behavior against real
+    hardware before relying on it. See backend/indi_client.py's module
+    docstring and backend/lib/README.md.
+    """
+
+    _ON_COORD_SET_SLEW = "SLEW"
+
+    # ZWO AM3/AM5's own USB-serial identity (confirmed against real hardware:
+    # enumerates as "ZWO Device / ZWO CDC Device"), used to auto-detect its
+    # serial port so it can be handed to indi_lx200am5 via DEVICE_PORT before
+    # connecting — the driver's own default (typically /dev/ttyUSB0) is not
+    # reliably the mount and, on this ground station, is actually the radio
+    # modem, which caused CONNECTION to never report connected.
+    _AM5_VID = 0x03C3
+    _AM5_PID = 0x4001
+
+    @property
+    def mount_type(self) -> str:
+        return "indi"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._indi = None
+        self._device = None
+
+    async def connect(self, port: str = "", **_) -> None:
+        await self._run(self._do_connect, port)
+
+    @classmethod
+    def _find_mount_port(cls) -> str | None:
+        """Only meaningful when indiserver runs on this same machine — a
+        remote INDI host's serial devices aren't visible to us locally."""
+        import serial.tools.list_ports
+        for p in serial.tools.list_ports.comports():
+            if p.vid == cls._AM5_VID and p.pid == cls._AM5_PID:
+                return p.device
+        return None
+
+    def _do_connect(self, host_spec: str) -> None:
+        if not host_spec:
+            raise RuntimeError("INDI server host required (e.g. localhost or 192.168.1.50:7624)")
+        from backend.indi_client import IndiConnection, DEFAULT_INDI_PORT
+        if ":" in host_spec:
+            host, port_s = host_spec.split(":", 1)
+            indi_port = int(port_s)
+        else:
+            host, indi_port = host_spec, DEFAULT_INDI_PORT
+
+        indi = IndiConnection(host, indi_port)
+        indi.connect()
+        device = indi.find_telescope()
+
+        mount_port = self._find_mount_port() if host in ("localhost", "127.0.0.1") else None
+        if mount_port:
+            # The AM5 driver defaults to CONNECTION_MODE=CONNECTION_TCP (its
+            # onboard WiFi AP, 192.168.4.1:4030) and only defines DEVICE_PORT
+            # once switched to CONNECTION_SERIAL — confirmed against the live
+            # driver's property dump, which has no DEVICE_PORT until this
+            # switch happens.
+            indi.send_switch(device, "CONNECTION_MODE", "CONNECTION_SERIAL")
+            indi.wait_property(device, "DEVICE_PORT", timeout=5.0)
+            indi.send_text(device, "DEVICE_PORT", {"PORT": mount_port})
+            time.sleep(0.5)   # let the driver pick up the new port before CONNECT
+
+        indi.connect_device(device)
+
+        self._indi = indi
+        self._device = device
+        self.connected = True
+        self.port_name = host_spec
+        logger.info("INDI mount connected at %s (serial %s)", host_spec, mount_port or "driver default")
+
+    async def disconnect(self) -> None:
+        await self._run(self._do_disconnect)
+
+    def _do_disconnect(self) -> None:
+        if self._indi is not None:
+            if self._device is not None:
+                self._indi.disconnect_device(self._device)
+            self._indi.disconnect()
+            self._indi = None
+            self._device = None
+        self.connected = False
+        self.port_name = ""
+        logger.info("INDI mount disconnected")
+
+    async def get_position(self) -> dict:
+        pos = await self._run(self._do_get_position)
+        self._last_position = pos
+        return pos
+
+    def _do_get_position(self) -> dict:
+        coords = self._indi.get_number(self._device, "EQUATORIAL_EOD_COORD")
+        ra_h  = coords.get("RA", 0.0)
+        dec_d = coords.get("DEC", 0.0)
+        from backend.tracking import radec_to_azalt
+        az, el = radec_to_azalt(ra_h, dec_d)
+        return {"azimuth": az, "elevation": el, "ra_hours": ra_h, "dec_deg": dec_d}
+
+    async def goto(self, ra_hours: float = 0.0, dec_deg: float = 0.0, **_) -> None:
+        if not self.connected:
+            logger.warning("INDI mount goto called while disconnected — ignoring")
+            return
+        await self._run(self._do_goto, ra_hours, dec_deg)
+        logger.info("INDI mount slewed to RA=%.4fh Dec=%.4f°", ra_hours, dec_deg)
+
+    def _do_goto(self, ra_hours: float, dec_deg: float) -> None:
+        try:
+            self._indi.send_switch(self._device, "ON_COORD_SET", self._ON_COORD_SET_SLEW)
+        except Exception:
+            pass  # some drivers default to SLEW already / don't expose this switch
+        self._indi.send_number_and_wait(self._device, "EQUATORIAL_EOD_COORD",
+                                         {"RA": ra_hours, "DEC": dec_deg}, timeout=120.0)
+
+
+# ---------------------------------------------------------------------------
 # Emulated mount (ALTAIR_DEBUG) — no hardware, no serial/ASCOM link
 # ---------------------------------------------------------------------------
 
@@ -329,9 +475,12 @@ class EmulatedMountController(BaseMountController):
     SLEW_RATE_DEG_S = 5.0
     MAX_SLEW_S = 3.0
 
+    # Mount types commanded in RA/Dec rather than Az/El
+    _RADEC_TYPES = ("am5", "indi")
+
     def __init__(self, emulated_type: str = "nexstar") -> None:
-        if emulated_type not in ("nexstar", "am5"):
-            raise ValueError(f"Unknown mount type {emulated_type!r}. Choose 'nexstar' or 'am5'.")
+        if emulated_type not in ("nexstar",) + self._RADEC_TYPES:
+            raise ValueError(f"Unknown mount type {emulated_type!r}. Choose 'nexstar', 'am5', or 'indi'.")
         super().__init__()
         self._emulated_type = emulated_type
         self._az = 180.0
@@ -354,7 +503,7 @@ class EmulatedMountController(BaseMountController):
 
     async def get_position(self) -> dict:
         pos = {"azimuth": self._az, "elevation": self._el}
-        if self._emulated_type == "am5":
+        if self._emulated_type in self._RADEC_TYPES:
             from backend.tracking import azalt_to_radec
             ra_h, dec_d = azalt_to_radec(self._az, self._el)
             pos["ra_hours"] = ra_h
@@ -368,7 +517,7 @@ class EmulatedMountController(BaseMountController):
             logger.warning("Emulated mount goto called while disconnected — ignoring")
             return
 
-        if self._emulated_type == "am5":
+        if self._emulated_type in self._RADEC_TYPES:
             if ra_hours is None or dec_deg is None:
                 return
             from backend.tracking import radec_to_azalt
@@ -396,7 +545,7 @@ def create_mount(mount_type: str) -> BaseMountController:
     """
     Return the appropriate controller for the requested mount type.
 
-    mount_type: 'nexstar' | 'am5'
+    mount_type: 'nexstar' | 'am5' | 'indi'
 
     Under ALTAIR_DEBUG=1, always returns an EmulatedMountController that
     impersonates the requested type instead of talking to real hardware.
@@ -408,4 +557,6 @@ def create_mount(mount_type: str) -> BaseMountController:
         return NexStarController()
     if mount_type == "am5":
         return AM5Controller()
-    raise ValueError(f"Unknown mount type {mount_type!r}. Choose 'nexstar' or 'am5'.")
+    if mount_type == "indi":
+        return IndiMountController()
+    raise ValueError(f"Unknown mount type {mount_type!r}. Choose 'nexstar', 'am5', or 'indi'.")

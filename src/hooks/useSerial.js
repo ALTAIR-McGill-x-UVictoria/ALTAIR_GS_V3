@@ -1,4 +1,5 @@
 import { useState, useCallback } from 'react'
+import { apiFetch } from '../api'
 
 /**
  * Thin wrapper around the backend REST API for port management.
@@ -21,7 +22,7 @@ export function useSerial() {
     setLoading(true)
     setError(null)
     try {
-      const res = await fetch('/api/connect', {
+      const res = await apiFetch('/api/connect', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ port, baud }),
@@ -36,7 +37,7 @@ export function useSerial() {
   }, [])
 
   const disconnectPort = useCallback(async () => {
-    await fetch('/api/disconnect', { method: 'POST' })
+    await apiFetch('/api/disconnect', { method: 'POST' })
   }, [])
 
   return { ports, loading, error, refreshPorts, connectPort, disconnectPort }

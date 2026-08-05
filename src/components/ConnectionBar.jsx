@@ -1,18 +1,20 @@
 import { useEffect, useState } from 'react'
 import { useSerial } from '../hooks/useSerial'
+import { apiFetch, getAdminToken, setAdminToken } from '../api'
 
 // Square hardware indicator — visually distinct from the round packet dots
 function HwIndicator({ label, state, detail }) {
-  // state: 'connected' | 'partial' | 'disconnected'
+  // state: 'connected' | 'receiving' | 'partial' | 'disconnected'
   const COLOR = {
     connected:    '#22c55e',
+    receiving:    '#38bdf8',
     partial:      '#fbbf24',
     disconnected: '#374151',
   }
   const color = COLOR[state] ?? COLOR.disconnected
   return (
     <span style={hw.badge} title={detail ?? label}>
-      <span style={{ ...hw.square, background: color, boxShadow: state === 'connected' ? `0 0 5px ${color}66` : 'none' }} />
+      <span style={{ ...hw.square, background: color, boxShadow: (state === 'connected' || state === 'receiving') ? `0 0 5px ${color}66` : 'none' }} />
       <span style={{ color: state === 'disconnected' ? 'var(--muted)' : 'var(--text)', fontSize: 11 }}>{label}</span>
     </span>
   )
@@ -43,20 +45,54 @@ const FRESHNESS_STYLE = {
   waiting: { color: 'var(--muted)', label: '○' },
 }
 
-export default function ConnectionBar({ status, wsReady, freshness = {}, gsGps, gsGpsStatus, mountStatus, cameraStatus }) {
+export default function ConnectionBar({ status, tunnelStatus = {}, wsReady, freshness = {}, gsGps, gsGpsStatus, mountStatus, cameraStatus }) {
   const { ports, loading, error, refreshPorts, connectPort, disconnectPort } = useSerial()
   const [selectedPort, setSelectedPort] = useState('')
   const [selectedBaud, setSelectedBaud] = useState(57600)
+  const [chronyStatus, setChronyStatus] = useState(null)
+  const [unlocked, setUnlocked] = useState(() => !!getAdminToken())
+  const [tokenInput, setTokenInput] = useState('')
 
   // Refresh port list on mount and pre-select the LR-900p if found
   useEffect(() => {
     refreshPorts().then(() => {})
   }, [])
 
+  // Poll chrony sync status — changes slowly (chrony's own poll interval is
+  // typically 1+ minutes once synced), so a lightweight interval is enough.
+  useEffect(() => {
+    let cancelled = false
+    async function poll() {
+      try {
+        const res = await fetch('/api/system/chrony')
+        const data = await res.json()
+        if (!cancelled) setChronyStatus(data)
+      } catch {
+        if (!cancelled) setChronyStatus(null)
+      }
+    }
+    poll()
+    const id = setInterval(poll, 10000)
+    return () => { cancelled = true; clearInterval(id) }
+  }, [])
+
   useEffect(() => {
     const lr = ports.find(p => p.is_lr900p)
     if (lr && !selectedPort) setSelectedPort(lr.device)
   }, [ports])
+
+  function handleUnlock(e) {
+    e.preventDefault()
+    if (!tokenInput.trim()) return
+    setAdminToken(tokenInput.trim())
+    setUnlocked(true)
+    setTokenInput('')
+  }
+
+  function handleLock() {
+    setAdminToken('')
+    setUnlocked(false)
+  }
 
   const dotColor = status.emulating
     ? '#a78bfa'
@@ -76,6 +112,11 @@ export default function ConnectionBar({ status, wsReady, freshness = {}, gsGps, 
         <span style={{ color: dotColor }}>{dotLabel}</span>
         {status.emulating && (
           <span style={styles.emulatorBadge}>EMULATOR</span>
+        )}
+        {status.telemetry_source === 'tunnel' && (
+          <span style={styles.tunnelBadge} title={`Radio quiet — live via tunnel${tunnelStatus.host ? ` (${tunnelStatus.host})` : ''}`}>
+            TUNNEL ACTIVE
+          </span>
         )}
       </div>
 
@@ -124,11 +165,31 @@ export default function ConnectionBar({ status, wsReady, freshness = {}, gsGps, 
 
         <button
           style={{ ...styles.btn, background: '#1e2d3d', color: 'var(--warn)', border: '1px solid var(--warn)' }}
-          onClick={() => fetch('/api/system/restart', { method: 'POST' })}
+          onClick={() => apiFetch('/api/system/restart', { method: 'POST' })}
           title="Restart backend process (uvicorn reload)"
         >
           Restart Backend
         </button>
+      </div>
+
+      <div style={styles.lockBox}>
+        {unlocked ? (
+          <>
+            <span style={{ color: 'var(--ok)', fontSize: 11 }}>🔓 Controls unlocked</span>
+            <button style={{ ...styles.btn, background: 'var(--border)' }} onClick={handleLock}>Lock</button>
+          </>
+        ) : (
+          <form style={{ display: 'flex', gap: 6 }} onSubmit={handleUnlock}>
+            <input
+              type="password"
+              style={styles.select}
+              placeholder="Operator token"
+              value={tokenInput}
+              onChange={e => setTokenInput(e.target.value)}
+            />
+            <button type="submit" style={{ ...styles.btn, background: 'var(--accent2)' }}>Unlock</button>
+          </form>
+        )}
       </div>
 
       <div style={styles.packetStatus}>
@@ -158,18 +219,38 @@ export default function ConnectionBar({ status, wsReady, freshness = {}, gsGps, 
           }
         />
 
-        {/* GS GPS: partial = port open but no fix yet, connected = has live fix */}
+        {/* Tunnel: only shown when the backend has ALTAIR_TUNNEL_HOST configured.
+            partial = configured but not currently connected, connected = link up
+            (does not by itself mean it's the active telemetry source — see the
+            TUNNEL ACTIVE badge above for that). */}
+        {tunnelStatus.enabled && (
+          <HwIndicator
+            label="Tunnel"
+            state={tunnelStatus.connected ? 'connected' : 'partial'}
+            detail={
+              tunnelStatus.connected
+                ? `Tunnel — connected to ${tunnelStatus.host}:${tunnelStatus.port}`
+                : `Tunnel — configured (${tunnelStatus.host}:${tunnelStatus.port}), not currently connected`
+            }
+          />
+        )}
+
+        {/* GS GPS (XIAO ESP32-C3 UART passthrough):
+            disconnected = not found, partial = port open but silent (wiring/power issue),
+            receiving = valid NMEA streaming but no fix yet, connected = has live fix */}
         <HwIndicator
           label="GS GPS"
           state={
             gsGpsStatus.has_fix   ? 'connected' :
+            gsGpsStatus.receiving ? 'receiving' :
             gsGpsStatus.connected ? 'partial'   :
             'disconnected'
           }
           detail={
             gsGpsStatus.has_fix   ? `GS GPS — fix (${gsGps?.sats ?? '?'} sats, HDOP ${gsGps?.hdop?.toFixed(1) ?? '?'}) on ${gsGpsStatus.port}` :
-            gsGpsStatus.connected ? `GS GPS — port open on ${gsGpsStatus.port}, waiting for fix` :
-            'GS GPS — dongle not found'
+            gsGpsStatus.receiving ? `GS GPS — wired, receiving UART/NMEA data on ${gsGpsStatus.port}, waiting for fix` :
+            gsGpsStatus.connected ? `GS GPS — port open on ${gsGpsStatus.port}, no data received yet (check wiring)` :
+            'GS GPS — passthrough not found'
           }
         />
 
@@ -192,6 +273,29 @@ export default function ConnectionBar({ status, wsReady, freshness = {}, gsGps, 
             cameraStatus?.connected
               ? `Camera — ${cameraStatus.camera_name ?? 'connected'}`
               : 'Camera — not connected'
+          }
+        />
+
+        {/* Chrony: disconnected = chronyd not reachable, partial = running but
+            not synced, connected = system clock synchronized (any source —
+            GPS vs NTP pool distinguished in the tooltip, not the dot color) */}
+        <HwIndicator
+          label="Chrony"
+          state={
+            !chronyStatus?.available ? 'disconnected' :
+            chronyStatus.synced      ? 'connected'    :
+            'partial'
+          }
+          detail={
+            !chronyStatus?.available
+              ? 'Chrony — not running / unreachable'
+              : chronyStatus.synced
+                ? `Chrony — synced via ${chronyStatus.using_gps ? 'GPS' : chronyStatus.ref_name} `
+                  + `(stratum ${chronyStatus.stratum}, offset ${(chronyStatus.system_offset_s * 1000).toFixed(1)}ms)`
+                  + (chronyStatus.gps_present && !chronyStatus.using_gps
+                      ? chronyStatus.gps_reachable ? ' — GPS available, not yet selected' : ' — GPS present, no fix yet'
+                      : '')
+                : 'Chrony — running, not yet synchronized'
           }
         />
       </div>
@@ -255,6 +359,11 @@ const styles = {
     fontSize: 12,
     cursor: 'pointer',
   },
+  lockBox: {
+    display: 'flex',
+    gap: 6,
+    alignItems: 'center',
+  },
   packetStatus: {
     display: 'flex',
     gap: 12,
@@ -292,6 +401,17 @@ const styles = {
     background:   '#4c1d95',
     color:        '#a78bfa',
     border:       '1px solid #7c3aed',
+    borderRadius: 3,
+    fontSize:     9,
+    fontWeight:   700,
+    padding:      '1px 6px',
+    letterSpacing: 1,
+    fontFamily:   'var(--font-mono)',
+  },
+  tunnelBadge: {
+    background:   '#1e2d3d',
+    color:        '#38bdf8',
+    border:       '1px solid #0ea5e9',
     borderRadius: 3,
     fontSize:     9,
     fontWeight:   700,

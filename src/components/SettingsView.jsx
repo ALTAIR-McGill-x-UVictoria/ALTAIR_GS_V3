@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef, useMemo } from 'react'
+import { apiFetch } from '../api'
 
 const CMD_UPDATE_SETTING = 0xC3
 const CMD_RADIO_CONFIG   = 0xC5
@@ -99,7 +100,7 @@ function RadioConfigPanel({ lastAck, currentStage = -1 }) {
 
   const [draftRate,    setDraftRate]    = useState(1)
   const [draftPower,   setDraftPower]   = useState(2)
-  const [draftChannel, setDraftChannel] = useState(0)
+  const [draftChannel, setDraftChannel] = useState('0')
 
   const [pending,    setPending]    = useState(false)
   const [ackResult,  setAckResult]  = useState(null)  // { status, gs_switched } | null
@@ -119,11 +120,11 @@ function RadioConfigPanel({ lastAck, currentStage = -1 }) {
         setLive(data.live)
         setDraftRate(data.live.data_rate)
         setDraftPower(data.live.tx_power)
-        setDraftChannel(data.live.channel)
+        setDraftChannel(String(data.live.channel))
       } else if (data.defaults) {
         setDraftRate(data.defaults.data_rate)
         setDraftPower(data.defaults.tx_power)
-        setDraftChannel(data.defaults.channel)
+        setDraftChannel(String(data.defaults.channel))
       }
     } catch {}
   }
@@ -151,10 +152,10 @@ function RadioConfigPanel({ lastAck, currentStage = -1 }) {
     // 8 s timeout guard in case no ACK arrives
     ackTimerRef.current = setTimeout(() => setPending(false), 8000)
     try {
-      const res  = await fetch('/api/radio/config', {
+      const res  = await apiFetch('/api/radio/config', {
         method:  'POST',
         headers: { 'Content-Type': 'application/json' },
-        body:    JSON.stringify({ data_rate: draftRate, tx_power: draftPower, channel: draftChannel }),
+        body:    JSON.stringify({ data_rate: draftRate, tx_power: draftPower, channel: Number(draftChannel) || 0 }),
       })
       const data = await res.json()
       if (!data.ok) {
@@ -270,7 +271,8 @@ function RadioConfigPanel({ lastAck, currentStage = -1 }) {
             min={0} max={63} step={1}
             disabled={locked || pending}
             value={draftChannel}
-            onChange={e => setDraftChannel(Math.max(0, Math.min(63, Number(e.target.value))))}
+            onChange={e => setDraftChannel(e.target.value.replace(/^0+(?=\d)/, ''))}
+            onBlur={() => setDraftChannel(String(Math.max(0, Math.min(63, Number(draftChannel) || 0))))}
             style={{ ...SV.input, width: 70 }}
           />
         </div>
@@ -360,7 +362,7 @@ export default function SettingsView({ packets, lastAck, overrideChecks = false,
     ackTimeoutRef.current = setTimeout(() => setPendingFieldId(null), 5000)
 
     try {
-      await fetch('/api/fc/command/update_setting', {
+      await apiFetch('/api/fc/command/update_setting', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ field_id: fieldId, value }),

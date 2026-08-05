@@ -21,6 +21,7 @@ import json
 import logging
 import math
 import os
+import secrets
 import sys
 import time
 from contextlib import asynccontextmanager
@@ -33,9 +34,9 @@ import tomllib
 import serial
 import serial.tools.list_ports
 from dotenv import load_dotenv
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 # Load local configuration before metrics reporters are constructed below.
 # Values already supplied by the shell or service manager take precedence.
@@ -45,12 +46,13 @@ from backend.packets import REGISTRY, HEADER_SIZE, CRC_SIZE, MIN_FRAME, SYNC_BYT
 from backend.packets import _HEADER, _CRC
 from backend.tracking import calculate_tracking_params
 from backend.mount import BaseMountController, create_mount
-from backend.camera import CameraController, EmulatedCameraController
+from backend.camera import CameraController, EmulatedCameraController, create_camera
 from backend.logging_manager import TelemetryLogger
 from backend.alarms import ALARM_RULES
 from backend.emulator import PacketEmulator
 from backend.events import EVENT_DEFS, FLIGHT_STAGE_NAMES, BOOLEAN_EVENT_FIELDS
 from backend.gps_reader import GsGpsReader
+from backend.chrony_status import get_chrony_status
 from backend.metrics import PROMETHEUS_CONTENT_TYPE, TelemetryMetrics
 from backend.remote_metrics import RemoteMetricsReporter
 
@@ -505,7 +507,7 @@ class SerialReader:
             if "target_hz" in result and result["target_hz"] is not None:
                 result["target_hz"] = round(result["target_hz"] * self._current_rate_scale, 3)
 
-            await self._broadcast({"type": "packet", **result})
+            await _ingest_telemetry("radio", result)
 
     def _lr_read_response(self, subblock: int, timeout: float) -> bytes | None:
         """
@@ -773,7 +775,176 @@ class SerialReader:
         self._clients -= dead
 
 
+# ---------------------------------------------------------------------------
+# Tunnel reader — optional TCP client that mirrors the FC's radio byte stream
+# over the network (e.g. a ZeroTier tunnel straight to the flight computer's
+# Pi), used as an automatic failover when RF is unavailable but the FC has
+# internet. See Altairfc_V2/altairfc/telemetry/tee_server.py for the FC side.
+# ---------------------------------------------------------------------------
+
+# How long the radio can go quiet before tunnel packets are allowed to take
+# over the live display/logging. Comfortably above normal packet spacing but
+# well under the frontend's own 2s "stale" / 5s "lost" thresholds so failover
+# is invisible in practice.
+_TUNNEL_FAILOVER_TIMEOUT_S = 3.0
+
+_last_radio_packet_t: float  = 0.0
+_last_tunnel_packet_t: float = 0.0
+_active_telemetry_source: str = "radio"   # "radio" | "tunnel" — which source is currently live
+
+
+async def _ingest_telemetry(source: str, result: dict) -> None:
+    """
+    Arbitrates between the radio (SerialReader) and the tunnel (TunnelReader)
+    so only one source's packets are logged/broadcast at a time, even when
+    both are connected simultaneously. Radio is preferred; tunnel only takes
+    over once radio has gone quiet for _TUNNEL_FAILOVER_TIMEOUT_S, and hands
+    back automatically as soon as radio packets resume.
+    """
+    global _last_radio_packet_t, _last_tunnel_packet_t, _active_telemetry_source
+    now = time.monotonic()
+    if source == "radio":
+        _last_radio_packet_t = now
+    else:
+        _last_tunnel_packet_t = now
+
+    radio_fresh = (now - _last_radio_packet_t) < _TUNNEL_FAILOVER_TIMEOUT_S
+    desired_source = "radio" if radio_fresh else "tunnel"
+
+    if desired_source != _active_telemetry_source:
+        _active_telemetry_source = desired_source
+        logger.info("Telemetry source switched to %s", desired_source)
+        await serial_reader._broadcast({"type": "status", "telemetry_source": desired_source})
+
+    if source != _active_telemetry_source:
+        # Heard from the inactive source — keep its clock warm (for failback
+        # detection) but don't log/display it, to avoid double-counting the
+        # same telemetry when both links are up at once.
+        return
+
+    await serial_reader._broadcast({"type": "packet", "telemetry_source": source, **result})
+
+
+class TunnelReader:
+    """
+    Connects to a TeeServer running on the flight computer (typically reached
+    over a ZeroTier tunnel) and decodes the same 0xAA-framed telemetry the
+    radio carries. Runs continuously alongside SerialReader with its own
+    reconnect/backoff loop, so it's already warmed up and ready the instant
+    radio goes quiet.
+    """
+
+    _MAX_PAYLOAD = 512
+
+    def __init__(self) -> None:
+        self._host = ""
+        self._port = 0
+        self._task: asyncio.Task | None = None
+        self._buf = bytearray()
+        self._seq_prev: dict[int, int] = {}
+        self.connected = False
+        self.enabled = False
+
+    async def start(self, host: str, port: int) -> None:
+        self._host = host
+        self._port = port
+        self.enabled = True
+        self._task = asyncio.create_task(self._connect_loop())
+        logger.info("Tunnel reader: will connect to %s:%d", host, port)
+
+    async def stop(self) -> None:
+        self.enabled = False
+        if self._task:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+            self._task = None
+        self.connected = False
+
+    async def _set_connected(self, connected: bool) -> None:
+        if connected == self.connected:
+            return
+        self.connected = connected
+        await serial_reader._broadcast({
+            "type": "tunnel_status", "connected": connected,
+            "host": self._host, "port": self._port,
+        })
+
+    async def _connect_loop(self) -> None:
+        delay = 1.0
+        while True:
+            try:
+                reader, writer = await asyncio.open_connection(self._host, self._port)
+                logger.info("Tunnel reader: connected to %s:%d", self._host, self._port)
+                await self._set_connected(True)
+                delay = 1.0
+                self._buf.clear()
+                try:
+                    await self._read_loop(reader)
+                finally:
+                    writer.close()
+            except (OSError, ConnectionError) as e:
+                logger.info("Tunnel reader: %s:%d unavailable (%s) — retrying in %.0fs",
+                            self._host, self._port, e, delay)
+            await self._set_connected(False)
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 30.0)
+
+    async def _read_loop(self, reader: asyncio.StreamReader) -> None:
+        while True:
+            chunk = await reader.read(4096)
+            if not chunk:
+                return   # peer closed the connection
+            self._buf.extend(chunk)
+            await self._process_buffer()
+
+    async def _process_buffer(self) -> None:
+        while len(self._buf) >= MIN_FRAME:
+            sync_pos = self._buf.find(SYNC_BYTE)
+            if sync_pos == -1:
+                self._buf.clear()
+                return
+            if sync_pos > 0:
+                del self._buf[:sync_pos]
+            if len(self._buf) < HEADER_SIZE:
+                return
+
+            _, pkt_id_peek, _, _, length = _HEADER.unpack_from(self._buf, 0)
+            if length > self._MAX_PAYLOAD:
+                del self._buf[0]
+                continue
+
+            frame_size = HEADER_SIZE + length + CRC_SIZE
+            if len(self._buf) < frame_size:
+                return
+
+            frame = bytes(self._buf[:frame_size])
+            del self._buf[:frame_size]
+
+            if pkt_id_peek == ACK_PACKET_ID:
+                continue   # command ACKs are meaningless over a one-way tee
+
+            result = decode_frame(frame)
+            if result is None:
+                continue
+
+            pkt_id = result["packet_id"]
+            seq    = result["seq"]
+            prev   = self._seq_prev.get(pkt_id)
+            if prev is not None:
+                expected = (prev + 1) & 0xFF
+                if seq != expected:
+                    result["dropped"] = (seq - expected) & 0xFF
+            self._seq_prev[pkt_id] = seq
+
+            result["wall_ms"] = round(time.time() * 1000)
+            await _ingest_telemetry("tunnel", result)
+
+
 serial_reader   = SerialReader()
+tunnel_reader   = TunnelReader()
 telem_logger    = TelemetryLogger()
 metrics_exporter = TelemetryMetrics()
 remote_metrics = RemoteMetricsReporter()
@@ -793,9 +964,7 @@ _latest_events:  list[dict]      = []   # last 200 events
 # ---------------------------------------------------------------------------
 
 mount_controller: BaseMountController | None = None
-camera_controller = (
-    EmulatedCameraController() if os.getenv("ALTAIR_DEBUG", "0") == "1" else CameraController()
-)
+camera_controller = create_camera("zwo")
 
 # Latest GPS data from telemetry — updated by _broadcast, read by tracking poll
 _latest_gps: dict | None = None
@@ -809,6 +978,46 @@ _telescope_clients: set[WebSocket] = set()
 _tracking_task: asyncio.Task | None = None
 _gs_gps_task: asyncio.Task | None = None
 _tracking_enabled = False
+
+# ---------------------------------------------------------------------------
+# Automatic camera exposure triggers
+# ---------------------------------------------------------------------------
+# The flight computer lights the beacon LEDs during seconds :25-:30 and
+# :55-:60 of every UTC minute. A camera exposure must never be in progress
+# (or about to overlap) during those windows, or the beacon flash will bloom
+# the frame. Everything else in the minute (0-25, 30-55 — 50 of every 60
+# seconds) is fair game for continuous back-to-back auto-capture.
+_BEACON_WINDOWS_S = ((25.0, 30.0), (55.0, 60.0))
+# Extra buffer added past the raw exposure time to account for sensor
+# readout / disk write before the frame is fully clear of the sensor.
+_AUTO_CAPTURE_MARGIN_S = 0.5
+_AUTO_CAPTURE_POLL_S   = 0.2   # how often to recheck while waiting for a safe window
+
+_auto_capture_task: asyncio.Task | None = None
+_auto_capture_enabled = False
+
+
+def _next_safe_capture_time(now: float, duration_s: float) -> float:
+    """
+    Return the earliest unix time >= now at which a capture of length
+    duration_s (already including margin) can start without the interval
+    [start, start + duration_s) overlapping a beacon LED window.
+
+    Checks the previous, current, and next minute's windows so captures near
+    a minute boundary are handled correctly regardless of how long
+    duration_s is (as long as it's well under a minute, which any realistic
+    camera exposure is).
+    """
+    minute_start = now - (now % 60.0)
+    candidates = [
+        (minute_start + off + win_start, minute_start + off + win_end)
+        for off in (-60.0, 0.0, 60.0)
+        for win_start, win_end in _BEACON_WINDOWS_S
+    ]
+    for win_start, win_end in sorted(candidates):
+        if now < win_end and now + duration_s > win_start:
+            return win_end
+    return now
 
 # ---------------------------------------------------------------------------
 # Radio config defaults — loaded from FC settings.toml at startup
@@ -850,10 +1059,11 @@ _fc_radio_ack_event: asyncio.Event | None = None
 async def _on_gs_fix(fix: dict) -> None:
     await serial_reader._broadcast({"type": "gs_gps", **fix})
 
-async def _on_gs_status(connected: bool, has_fix: bool, port: str) -> None:
+async def _on_gs_status(connected: bool, has_fix: bool, port: str, receiving: bool) -> None:
     await serial_reader._broadcast({
         "type":      "gs_gps_status",
         "connected": connected,
+        "receiving": receiving,
         "has_fix":   has_fix,
         "port":      port,
     })
@@ -871,7 +1081,14 @@ _capture_dir  = _REPO_ROOT / "captures"   # default; overridable at runtime
 _jpeg_cache: dict[str, tuple[float, bytes, bytes]] = {}
 
 _THUMB_SIZE = (400, 400)   # max thumbnail dimensions
-_TIFF_EXTS  = {".tif", ".tiff"}
+# .tif/.tiff kept so older captures made before the FITS switch still show
+# up in the gallery — new captures are always .fits (see
+# _normalize_capture_filename / CameraController._write_fits).
+_FITS_EXTS  = {".fits", ".fit", ".fts"}
+_IMAGE_EXTS = _FITS_EXTS | {".tif", ".tiff"}
+# Extensions post_camera_capture / _do_auto_capture will replace with .fits
+# when normalizing a user-supplied or auto-generated filename.
+_KNOWN_IMAGE_EXTS = _IMAGE_EXTS | {".jpg", ".jpeg", ".png"}
 
 
 def _list_images() -> list[dict]:
@@ -879,7 +1096,7 @@ def _list_images() -> list[dict]:
     results = []
     try:
         for entry in _capture_dir.iterdir():
-            if entry.suffix.lower() in _TIFF_EXTS and entry.is_file():
+            if entry.suffix.lower() in _IMAGE_EXTS and entry.is_file():
                 st = entry.stat()
                 results.append({
                     "filename":  entry.name,
@@ -894,6 +1111,35 @@ def _list_images() -> list[dict]:
     return results
 
 
+def _fits_to_pil(path: Path):
+    """Load a FITS primary HDU and normalize it to a displayable PIL image."""
+    from astropy.io import fits
+    from PIL import Image
+    import numpy as np
+
+    with fits.open(path) as hdul:
+        data = hdul[0].data
+    if data is None:
+        raise ValueError("FITS file has no image data in the primary HDU")
+
+    if data.ndim == 3:
+        # Our color cube layout is (3, H, W) — CameraController._write_fits —
+        # PIL wants channels-last (H, W, 3).
+        data = np.moveaxis(data, 0, -1)
+
+    if data.dtype == np.uint8:
+        arr = data
+    else:
+        # Global min-max stretch to 8-bit — matches the normalization
+        # previously applied to 16-bit mono TIFFs, now also covers any
+        # non-uint8 FITS data (e.g. a mono sensor's native 16-bit capture).
+        arr = data.astype(np.float32)
+        lo, hi = arr.min(), arr.max()
+        arr = ((arr - lo) / (hi - lo + 1e-9) * 255).astype(np.uint8)
+
+    return Image.fromarray(arr, mode="RGB" if arr.ndim == 3 else "L")
+
+
 def _get_jpegs(filename: str) -> tuple[bytes, bytes] | None:
     """Return (thumb_jpeg, full_jpeg) for filename, using cache when mtime unchanged."""
     path = _capture_dir / filename
@@ -905,16 +1151,19 @@ def _get_jpegs(filename: str) -> tuple[bytes, bytes] | None:
         return cached[1], cached[2]
 
     try:
-        from PIL import Image
-        img = Image.open(path)
-        # Normalise 16-bit to 8-bit for JPEG encoding
-        if img.mode == "I;16" or img.mode == "I":
-            import numpy as np
-            arr = np.array(img, dtype=np.float32)
-            arr = ((arr - arr.min()) / (arr.max() - arr.min() + 1e-9) * 255).astype(np.uint8)
-            img = Image.fromarray(arr)
-        elif img.mode not in ("RGB", "L"):
-            img = img.convert("RGB")
+        if path.suffix.lower() in _FITS_EXTS:
+            img = _fits_to_pil(path)
+        else:
+            from PIL import Image
+            img = Image.open(path)
+            # Normalise 16-bit to 8-bit for JPEG encoding (legacy TIFF captures)
+            if img.mode == "I;16" or img.mode == "I":
+                import numpy as np
+                arr = np.array(img, dtype=np.float32)
+                arr = ((arr - arr.min()) / (arr.max() - arr.min() + 1e-9) * 255).astype(np.uint8)
+                img = Image.fromarray(arr)
+            elif img.mode not in ("RGB", "L"):
+                img = img.convert("RGB")
 
         # Full-size JPEG
         buf_full = io.BytesIO()
@@ -933,6 +1182,36 @@ def _get_jpegs(filename: str) -> tuple[bytes, bytes] | None:
     except Exception as e:
         logger.warning("Gallery: failed to convert %s: %s", filename, e)
         return None
+
+
+def _normalize_capture_filename(filename: str) -> str:
+    """
+    Force a .fits extension. Replaces a recognized image extension (old
+    TIFF, or someone typing .fits themselves) but appends .fits rather than
+    replacing an unrecognized suffix, so a name like "test.v2" doesn't get
+    mangled into "test.fits" — Path.with_suffix would otherwise treat ".v2"
+    as the extension to replace.
+    """
+    p = Path(filename)
+    if p.suffix == "" or p.suffix.lower() in _KNOWN_IMAGE_EXTS:
+        return p.with_suffix(".fits").name
+    return f"{p.name}.fits"
+
+
+def _unique_capture_path(filename: str) -> Path:
+    """
+    Return a path inside _capture_dir for `filename` that doesn't already
+    exist, appending _1, _2, ... before the extension as needed — so
+    repeat captures using the same requested (or default auto-generated)
+    name never silently overwrite an earlier one.
+    """
+    p = Path(filename)
+    candidate = _capture_dir / filename
+    n = 1
+    while candidate.exists():
+        candidate = _capture_dir / f"{p.stem}_{n}{p.suffix}"
+        n += 1
+    return candidate
 
 
 async def _broadcast_telescope(msg: dict) -> None:
@@ -970,7 +1249,7 @@ async def _tracking_poll_loop(interval_s: float = 1.0) -> None:
             await _broadcast_telescope(msg)
 
             if _tracking_enabled and mount_controller is not None and mount_controller.connected:
-                if mount_controller.mount_type == "am5":
+                if mount_controller.mount_type in ("am5", "indi"):
                     await mount_controller.goto(
                         ra_hours=params["ra_hours"],
                         dec_deg=params["dec_deg"],
@@ -1040,7 +1319,7 @@ async def _sync_system_clock() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _tracking_task, _gs_gps_task, _emulator, _emulating, _latest_packets, _latest_alarms, _latest_events
+    global _tracking_task, _gs_gps_task, _auto_capture_task, _emulator, _emulating, _latest_packets, _latest_alarms, _latest_events
 
     await _sync_system_clock()
 
@@ -1088,6 +1367,15 @@ async def lifespan(app: FastAPI):
             except Exception:
                 pass
 
+    # Optional tunnel to the flight computer's TeeServer (see TunnelReader
+    # above) — e.g. a ZeroTier IP, for telemetry when RF is unavailable but
+    # the FC has internet. Off unless ALTAIR_TUNNEL_HOST is set; runs
+    # alongside the radio link at all times so failover is instant.
+    tunnel_host = os.getenv("ALTAIR_TUNNEL_HOST", "").strip()
+    if tunnel_host:
+        tunnel_port = int(os.getenv("ALTAIR_TUNNEL_PORT", "5760"))
+        await tunnel_reader.start(tunnel_host, tunnel_port)
+
     # Start GS GPS reader (non-blocking; logs a warning if dongle absent)
     await gs_gps_reader.start()
 
@@ -1096,6 +1384,10 @@ async def lifespan(app: FastAPI):
 
     # Periodically beacon GS position to FC for optical pointing
     _gs_gps_task = asyncio.create_task(_gs_gps_beacon_loop())
+
+    # Automatic camera exposure triggers (no-op until enabled via
+    # POST /api/telescope/camera/auto_capture)
+    _auto_capture_task = asyncio.create_task(_camera_auto_capture_loop())
     yield
 
     await gs_gps_reader.stop()
@@ -1106,6 +1398,13 @@ async def lifespan(app: FastAPI):
             await _tracking_task
         except asyncio.CancelledError:
             pass
+
+    if _auto_capture_task:
+        _auto_capture_task.cancel()
+        try:
+            await _auto_capture_task
+        except asyncio.CancelledError:
+            pass
     if _gs_gps_task:
         _gs_gps_task.cancel()
         try:
@@ -1114,6 +1413,7 @@ async def lifespan(app: FastAPI):
             pass
     if _emulator:
         await _emulator.stop()
+    await tunnel_reader.stop()
     await serial_reader.disconnect()
     if mount_controller is not None and mount_controller.connected:
         await mount_controller.disconnect()
@@ -1131,6 +1431,35 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ---------------------------------------------------------------------------
+# Operator authentication — gates every mutating request (hardware control,
+# radio commands, system restart) behind a shared token while leaving GET
+# routes and both WebSockets (telemetry/telescope status, broadcast-only,
+# never act on client-sent messages — see the /ws and /api/ws/telescope
+# handlers) open for read-only viewing. This matters because this backend
+# is reachable from the public internet via a Cloudflare Tunnel with no
+# other auth layer in front of it — see /etc/cloudflared/config.yml.
+_ADMIN_TOKEN = os.environ.get("ALTAIR_ADMIN_TOKEN", "").strip()
+_SAFE_HTTP_METHODS = {"GET", "HEAD", "OPTIONS"}
+
+if not _ADMIN_TOKEN:
+    logger.warning(
+        "ALTAIR_ADMIN_TOKEN is not set — hardware-control endpoints (arm, "
+        "telescope, camera, radio config, system restart) are UNAUTHENTICATED "
+        "and open to anyone who can reach this server. Set ALTAIR_ADMIN_TOKEN "
+        "in .env before exposing this backend beyond a trusted local network."
+    )
+
+
+@app.middleware("http")
+async def _require_admin_token(request: Request, call_next):
+    if _ADMIN_TOKEN and request.method not in _SAFE_HTTP_METHODS:
+        auth = request.headers.get("authorization", "")
+        token = auth[7:].strip() if auth.startswith("Bearer ") else ""
+        if not secrets.compare_digest(token, _ADMIN_TOKEN):
+            return JSONResponse({"detail": "Operator token required"}, status_code=401)
+    return await call_next(request)
 
 
 # ---------------------------------------------------------------------------
@@ -1164,15 +1493,15 @@ def get_remote_metrics_status():
 
 @app.get("/api/gs/gps")
 def get_gs_gps():
-    """Current ground station GPS fix from the u-blox 7 dongle."""
+    """Current ground station GPS fix from the u-blox GPS dongle."""
     return gs_gps_reader.status_dict()
 
 
 @app.get("/api/gs/gps/scan")
 def get_gs_gps_scan():
-    """List all COM ports visible to the backend, for debugging dongle detection."""
+    """List all COM ports visible to the backend, for debugging GPS passthrough detection."""
     import serial.tools.list_ports as lp
-    from backend.gps_reader import _UBLOX7_VID, _UBLOX7_PIDS
+    from backend.gps_reader import _GPS_VID, _GPS_PIDS
     ports = []
     for p in lp.comports():
         ports.append({
@@ -1180,7 +1509,7 @@ def get_gs_gps_scan():
             "description": p.description,
             "vid":         hex(p.vid) if p.vid else None,
             "pid":         hex(p.pid) if p.pid else None,
-            "is_ublox7":   p.vid == _UBLOX7_VID and p.pid in _UBLOX7_PIDS,
+            "is_gps_passthrough": p.vid == _GPS_VID and p.pid in _GPS_PIDS,
         })
     return {"ports": ports}
 
@@ -1221,6 +1550,13 @@ async def post_system_restart():
     logger.info("Restart requested via API — touching main.py to trigger reload")
     Path(__file__).touch()
     return {"restarting": True}
+
+
+@app.get("/api/system/chrony")
+async def get_system_chrony():
+    """Chrony (NTP) sync status — see backend/chrony_status.py."""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, get_chrony_status)
 
 
 @app.get("/api/state/snapshot")
@@ -1483,11 +1819,21 @@ async def websocket_endpoint(ws: WebSocket):
         "type": "status",
         "connected": serial_reader.connected,
         "port": serial_reader.port_name,
+        "telemetry_source": _active_telemetry_source,
     }))
+    # Send current tunnel status so a badge is accurate on page load, if enabled
+    if tunnel_reader.enabled:
+        await ws.send_text(json.dumps({
+            "type": "tunnel_status",
+            "connected": tunnel_reader.connected,
+            "host": tunnel_reader._host,
+            "port": tunnel_reader._port,
+        }))
     # Send current GS GPS status so the badge is accurate on page load
     await ws.send_text(json.dumps({
         "type":      "gs_gps_status",
         "connected": gs_gps_reader.connected,
+        "receiving": gs_gps_reader.receiving,
         "has_fix":   gs_gps_reader.fix is not None,
         "port":      gs_gps_reader.port_name,
     }))
@@ -1523,6 +1869,7 @@ async def telescope_ws_endpoint(ws: WebSocket):
         "mount":  mount_controller.status_dict() if mount_controller else None,
         "camera": camera_controller.status_dict(),
         "tracking_enabled": _tracking_enabled,
+        "auto_capture_enabled": _auto_capture_enabled,
     }))
     try:
         while True:
@@ -1544,6 +1891,7 @@ def get_telescope_status():
         "mount":            mount_controller.status_dict() if mount_controller else None,
         "camera":           camera_controller.status_dict(),
         "tracking_enabled": _tracking_enabled,
+        "auto_capture_enabled": _auto_capture_enabled,
         "latest_gps":       _latest_gps,
     }
 
@@ -1595,7 +1943,7 @@ async def post_mount_disconnect():
 async def post_mount_goto(body: dict):
     if mount_controller is None or not mount_controller.connected:
         return {"ok": False, "error": "Mount not connected"}
-    if mount_controller.mount_type == "am5":
+    if mount_controller.mount_type in ("am5", "indi"):
         ra  = float(body.get("ra_hours", 0))
         dec = float(body.get("dec_deg",  0))
         asyncio.create_task(mount_controller.goto(ra_hours=ra, dec_deg=dec))
@@ -1647,14 +1995,8 @@ async def post_camera_settings(body: dict):
     return {"ok": True, "camera": camera_controller.status_dict()}
 
 
-@app.post("/api/telescope/camera/capture")
-async def post_camera_capture(body: dict):
-    # Build output path inside _capture_dir; caller may override filename only
-    filename = body.get("filename") or f"frame_{int(time.time())}.tif"
-    output_path = _capture_dir / filename
-    _capture_dir.mkdir(parents=True, exist_ok=True)
-
-    # Assemble capture metadata from all available live sources
+async def _build_capture_metadata() -> dict:
+    """Assemble capture metadata from all available live sources."""
     capture_meta: dict = {"capture_utc": time.time()}
 
     gps = _latest_gps
@@ -1678,18 +2020,88 @@ async def post_camera_capture(body: dict):
         capture_meta["gs_alt"]     = tracking.get("gs_alt")
 
     if mount_controller is not None:
-        capture_meta["mount_type"] = mount_controller.mount_type
-        capture_meta["mount_port"] = mount_controller.port_name
+        capture_meta["mount_type"]       = mount_controller.mount_type
+        capture_meta["mount_port"]       = mount_controller.port_name
+        capture_meta["mount_connected"]  = mount_controller.connected
+        capture_meta["tracking_enabled"] = _tracking_enabled
+        if mount_controller.connected:
+            # Live-query the mount's own reported pointing — distinct from
+            # the tracking-computed target above, which is derived from the
+            # payload's GPS fix rather than read back from the mount itself.
+            try:
+                pos = await mount_controller.get_position()
+                capture_meta["mount_azimuth"]   = pos.get("azimuth")
+                capture_meta["mount_elevation"] = pos.get("elevation")
+                capture_meta["mount_ra_hours"]  = pos.get("ra_hours")
+                capture_meta["mount_dec_deg"]   = pos.get("dec_deg")
+            except Exception as e:
+                logger.warning("Capture metadata: mount position read failed: %s", e)
 
-    # Remove None values — EXIF injection skips missing keys anyway,
+    # Remove None values — FITS header injection skips missing keys anyway,
     # but this keeps the description block clean
-    capture_meta = {k: v for k, v in capture_meta.items() if v is not None}
+    return {k: v for k, v in capture_meta.items() if v is not None}
+
+
+@app.post("/api/telescope/camera/capture")
+async def post_camera_capture(body: dict):
+    # Build output path inside _capture_dir; caller may override filename.
+    # Always saved as .fits, and never overwrites an existing file — a
+    # repeated name gets _1, _2, ... appended automatically.
+    requested = body.get("filename") or f"frame_{int(time.time())}"
+    _capture_dir.mkdir(parents=True, exist_ok=True)
+    output_path = _unique_capture_path(_normalize_capture_filename(requested))
 
     try:
-        saved = await camera_controller.capture(output_path, metadata=capture_meta)
+        saved = await camera_controller.capture(output_path, metadata=await _build_capture_metadata())
         return {"ok": True, "path": saved}
     except Exception as e:
         return {"ok": False, "error": str(e)}
+
+
+@app.post("/api/telescope/camera/auto_capture")
+async def post_camera_auto_capture(body: dict):
+    global _auto_capture_enabled
+    _auto_capture_enabled = bool(body.get("enabled", False))
+    logger.info("Camera auto-capture %s", "enabled" if _auto_capture_enabled else "disabled")
+    await _broadcast_telescope({"type": "telescope_status",
+                                 "auto_capture_enabled": _auto_capture_enabled})
+    return {"ok": True, "auto_capture_enabled": _auto_capture_enabled}
+
+
+async def _camera_auto_capture_loop() -> None:
+    """
+    Continuously trigger camera exposures whenever it's safe to do so,
+    pausing around the beacon LED windows (see _BEACON_WINDOWS_S) so an
+    exposure never overlaps a beacon flash.
+    """
+    while True:
+        if not _auto_capture_enabled or camera_controller is None or not camera_controller.connected:
+            await asyncio.sleep(_AUTO_CAPTURE_POLL_S if _auto_capture_enabled else 1.0)
+            continue
+
+        exposure_s = camera_controller.status_dict().get("exposure_ms", 0) / 1000.0
+        duration_s = exposure_s + _AUTO_CAPTURE_MARGIN_S
+
+        now = time.time()
+        safe_at = _next_safe_capture_time(now, duration_s)
+        if safe_at > now:
+            await asyncio.sleep(min(safe_at - now, _AUTO_CAPTURE_POLL_S * 5))
+            continue
+
+        try:
+            await _do_auto_capture()
+        except Exception as e:
+            logger.warning("Auto-capture failed: %s", e)
+            await asyncio.sleep(1.0)   # back off so a persistent error doesn't spin the loop
+
+
+async def _do_auto_capture() -> None:
+    filename = _normalize_capture_filename(f"auto_{time.time():.3f}".replace(".", "_"))
+    _capture_dir.mkdir(parents=True, exist_ok=True)
+    output_path = _unique_capture_path(filename)
+    saved = await camera_controller.capture(output_path, metadata=await _build_capture_metadata())
+    logger.info("Auto-capture saved %s", saved)
+    await _broadcast_telescope({"type": "auto_capture", "path": saved})
 
 
 # ---------------------------------------------------------------------------
@@ -1778,6 +2190,80 @@ def get_gallery_full(filename: str):
     return Response(content=result[1], media_type="image/jpeg")
 
 
+@app.get("/api/gallery/rawpixels/{filename}")
+def get_gallery_rawpixels(filename: str):
+    """
+    Full-resolution, un-recompressed pixel data for the gallery page's
+    cursor-driven column/row profile analysis (saturation, hot pixels).
+    The JPEG previews from /thumb and /full are lossy and always 8-bit —
+    fine for browsing, but not for judging whether a pixel is actually at
+    the sensor's clip level or spotting a single hot pixel. This endpoint
+    instead returns the real decoded array (native bit depth, e.g. uint16
+    for a mono FITS capture) as a raw binary body, with width/height/
+    channel count/dtype in response headers so the browser can reconstruct
+    a typed array without any parsing overhead.
+
+    Not cached — each request re-reads and re-decodes the file, same cost
+    profile as /thumb and /full (which also read+decode from scratch on a
+    cache miss); a many-megapixel raw buffer per open image isn't worth
+    holding in server memory just to save one decode.
+    """
+    path = _capture_dir / filename
+    if not path.exists():
+        return Response(status_code=404)
+
+    try:
+        import numpy as np
+
+        if path.suffix.lower() in _FITS_EXTS:
+            from astropy.io import fits
+            with fits.open(path) as hdul:
+                data = hdul[0].data
+            if data is None:
+                return Response(status_code=422)
+            if data.ndim == 3:
+                # Our FITS color cube layout is (3, H, W) — see
+                # CameraController._write_fits — browser side wants
+                # row-major, channel-interleaved (H, W, 3).
+                data = np.moveaxis(data, 0, -1)
+        else:
+            from PIL import Image
+            img = Image.open(path)
+            data = np.array(img)
+
+        if data.ndim == 2:
+            channels = 1
+        elif data.ndim == 3:
+            channels = data.shape[2]
+        else:
+            return Response(status_code=422)
+
+        height, width = data.shape[0], data.shape[1]
+
+        if data.dtype == np.uint8:
+            dtype_name = "uint8"
+            data = np.ascontiguousarray(data)
+        else:
+            # Covers uint16 (the common case — mono FITS) and anything else
+            # (int16, float, ...) by clipping into uint16 range. Real sensor
+            # data here is always non-negative counts, so clipping at 0 on
+            # the low end never discards anything genuine.
+            dtype_name = "uint16"
+            data = np.ascontiguousarray(np.clip(data, 0, 65535).astype("<u2"))
+
+        headers = {
+            "X-Image-Width":    str(width),
+            "X-Image-Height":   str(height),
+            "X-Image-Channels": str(channels),
+            "X-Image-Dtype":    dtype_name,
+            "Cache-Control":    "no-store",
+        }
+        return Response(content=data.tobytes(), media_type="application/octet-stream", headers=headers)
+    except Exception as e:
+        logger.warning("Gallery: failed to extract raw pixels from %s: %s", filename, e)
+        return Response(status_code=500)
+
+
 # ---------------------------------------------------------------------------
 # Gallery HTML page
 # ---------------------------------------------------------------------------
@@ -1831,9 +2317,12 @@ _GALLERY_HTML = """<!DOCTYPE html>
   .spacer { flex: 1; }
   #count-label { color: var(--muted); font-size: 11px; white-space: nowrap; }
 
-  /* ── Main split layout ── */
+  /* ── Main split layout: left column (viewer+list) | right sidebar (analysis) ── */
   #main {
-    flex: 1; display: flex; flex-direction: column; overflow: hidden;
+    flex: 1; display: flex; flex-direction: row; overflow: hidden;
+  }
+  #left-col {
+    flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; overflow: hidden;
   }
 
   /* ── Top: image viewer (60% height) ── */
@@ -1853,6 +2342,13 @@ _GALLERY_HTML = """<!DOCTYPE html>
     background: rgba(0,0,0,0.65); padding: 5px 12px;
     display: flex; justify-content: space-between; align-items: center;
     font-size: 11px;
+    /* Purely informational overlay with no clickable contents — without
+       this, it silently eats hover/click events over the bottom strip of
+       the picture underneath it (confirmed via document.elementFromPoint:
+       the pixel inspector was completely dead there, evt.target was this
+       div instead of #viewer-img, so mapEventToImagePixel's target check
+       correctly, but unhelpfully, rejected every event in that band). */
+    pointer-events: none;
   }
   #viewer-caption span:first-child { color: var(--accent); }
   #viewer-caption span:last-child  { color: var(--muted); }
@@ -1885,6 +2381,30 @@ _GALLERY_HTML = """<!DOCTYPE html>
   .td-size  { color: var(--muted);  font-size: 11px; white-space: nowrap; text-align: right; }
 
   #empty-row td { color: var(--muted); padding: 30px; text-align: center; cursor: default; }
+
+  /* \u2500\u2500 Pixel inspector sidebar \u2500\u2500 */
+  #analysis {
+    flex: 0 0 380px; max-width: 380px; display: flex; flex-direction: column;
+    border-left: 1px solid var(--border); background: var(--surface); overflow-y: auto;
+  }
+  #analysis .section { padding: 10px 12px; border-bottom: 1px solid var(--border); }
+  #analysis .section-title {
+    font-size: 10px; letter-spacing: 1px; text-transform: uppercase; color: var(--muted);
+    margin-bottom: 6px; display: flex; justify-content: space-between; align-items: center;
+  }
+  #analysis .section-title button { font-size: 10px; padding: 2px 8px; }
+  #pin-btn.pinned { background: rgba(0,255,136,0.12); border-color: var(--green); color: var(--green); }
+  .readout-row { display: flex; justify-content: space-between; font-size: 11px; padding: 2px 0; }
+  .readout-label { color: var(--muted); }
+  .readout-value { color: var(--text); font-family: var(--font); }
+  .readout-value.sat { color: #ff4444; font-weight: bold; }
+  .chan-r { color: #ff5555; } .chan-g { color: #55ff55; } .chan-b { color: #6699ff; } .chan-mono { color: #ddd; }
+  canvas.profile-canvas {
+    width: 100%; height: 130px; display: block; background: var(--bg);
+    border: 1px solid var(--border); border-radius: 3px; cursor: default;
+  }
+  #viewer { cursor: crosshair; }
+  #crosshair-overlay { position: absolute; inset: 0; pointer-events: none; }
 </style>
 </head>
 <body>
@@ -1900,40 +2420,103 @@ _GALLERY_HTML = """<!DOCTYPE html>
 </header>
 
 <div id="main">
-  <!-- Top: viewer -->
-  <div id="viewer">
-    <div id="viewer-placeholder">Select an image from the list below.</div>
-    <img id="viewer-img" src="" alt="" style="display:none">
-    <div id="viewer-caption" style="display:none">
-      <span id="cap-name"></span>
-      <span id="cap-info"></span>
+  <div id="left-col">
+    <!-- Top: viewer -->
+    <div id="viewer">
+      <div id="viewer-placeholder">Select an image from the list below.</div>
+      <img id="viewer-img" src="" alt="" style="display:none">
+      <canvas id="crosshair-overlay"></canvas>
+      <div id="viewer-caption" style="display:none">
+        <span id="cap-name"></span>
+        <span id="cap-info"></span>
+      </div>
+    </div>
+
+    <!-- Bottom: list -->
+    <div id="list-pane">
+      <table>
+        <thead>
+          <tr>
+            <th class="td-thumb"></th>
+            <th>Filename</th>
+            <th>Time</th>
+            <th style="text-align:right">Size</th>
+          </tr>
+        </thead>
+        <tbody id="list-body">
+          <tr id="empty-row"><td colspan="4">No images captured yet.</td></tr>
+        </tbody>
+      </table>
     </div>
   </div>
 
-  <!-- Bottom: list -->
-  <div id="list-pane">
-    <table>
-      <thead>
-        <tr>
-          <th class="td-thumb"></th>
-          <th>Filename</th>
-          <th>Time</th>
-          <th style="text-align:right">Size</th>
-        </tr>
-      </thead>
-      <tbody id="list-body">
-        <tr id="empty-row"><td colspan="4">No images captured yet.</td></tr>
-      </tbody>
-    </table>
+  <!-- Right: pixel inspector -->
+  <div id="analysis">
+    <div class="section" id="debug-section" style="font-size:10px; line-height:1.7; font-family:var(--font); background:#1a0f00; border-bottom:2px solid var(--warn, #ffaa00);">
+      <div class="section-title" style="color:#ffaa00;">Debug (temporary \u2014 screenshot this box)</div>
+      <div id="debug-readout" style="color:#ffcc66; white-space:pre-wrap;">hover to populate</div>
+    </div>
+    <div class="section">
+      <div class="section-title">
+        <span>Pixel Inspector</span>
+        <button id="pin-btn">Pin</button>
+      </div>
+      <div id="px-status" style="color:var(--muted);font-size:11px;">Select an image to inspect pixels.</div>
+      <div id="px-readout" style="display:none">
+        <div class="readout-row"><span class="readout-label">X, Y</span><span class="readout-value" id="px-xy">-</span></div>
+        <div id="px-values"></div>
+        <div class="readout-row"><span class="readout-label">Row max</span><span class="readout-value" id="px-rowmax">-</span></div>
+        <div class="readout-row"><span class="readout-label">Col max</span><span class="readout-value" id="px-colmax">-</span></div>
+      </div>
+    </div>
+    <div class="section">
+      <div class="section-title">Row profile (intensity vs X)</div>
+      <canvas id="row-profile" class="profile-canvas"></canvas>
+    </div>
+    <div class="section">
+      <div class="section-title">Column profile (intensity vs Y)</div>
+      <canvas id="col-profile" class="profile-canvas"></canvas>
+    </div>
+    <div class="section" style="color:var(--muted);font-size:10px;line-height:1.6;">
+      Hover the image to inspect. Click (or Pin) to freeze a location \u2014
+      pinned position is kept when switching images, so you can page through
+      captures to check whether the same pixel is hot in every frame. Dashed
+      red line = sensor's recorded value ceiling (255 / 65535).
+    </div>
   </div>
 </div>
 
 <script>
 const REFRESH_MS = 5000
 let knownFiles = new Set()
+let imagesByFilename = new Map()
 let newCount = 0
 let activeFile = null
 const baseTitle = 'ALTAIR V2 \u2014 Image Gallery'
+
+function escapeHtml(str) {
+  return String(str).replace(/[&<>"']/g, c => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+  }[c]))
+}
+
+// \u2500\u2500 Pixel inspector state \u2500\u2500
+let rawPixels = null       // {width, height, channels, dtype, maxValue, data: TypedArray}
+let pixelsRequestId = 0
+let pinned = false
+let pinnedPos = null       // {x, y} in native image pixel coords
+let lastHoverPos = null
+let rafPending = false
+let pendingEvt = null
+
+const CHANNEL_META = {
+  1: [{ label: 'Value', color: '#dddddd', cls: 'chan-mono' }],
+  3: [
+    { label: 'R', color: '#ff5555', cls: 'chan-r' },
+    { label: 'G', color: '#55ff55', cls: 'chan-g' },
+    { label: 'B', color: '#6699ff', cls: 'chan-b' },
+  ],
+}
 
 function fmt(mtime) {
   return new Date(mtime * 1000).toLocaleTimeString()
@@ -1952,12 +2535,403 @@ function selectImage(img) {
   document.getElementById('cap-info').textContent = fmt(img.mtime) + '  \u2022  ' + img.size_kb + ' KB'
   // Update active row highlight
   document.querySelectorAll('#list-body tr').forEach(r => r.classList.remove('active'))
-  const row = document.getElementById('row-' + CSS.escape(img.filename))
+  const row = Array.from(document.getElementById('list-body').children)
+    .find(tr => tr.dataset.filename === img.filename)
   if (row) {
     row.classList.add('active')
     row.scrollIntoView({block: 'nearest'})
   }
+  fetchRawPixels(img.filename)
 }
+
+// ------------------------------------------------------------------
+// Pixel inspector \u2014 full-resolution column/row profiles at the cursor
+// ------------------------------------------------------------------
+
+async function fetchRawPixels(filename) {
+  rawPixels = null
+  document.getElementById('px-status').textContent = 'Loading pixel data\u2026'
+  document.getElementById('px-status').style.display = 'block'
+  document.getElementById('px-readout').style.display = 'none'
+  clearProfileCanvases()
+  drawCrosshairOverlay(null, null)
+
+  const myRequest = ++pixelsRequestId
+  try {
+    const res = await fetch('/api/gallery/rawpixels/' + encodeURIComponent(filename))
+    if (myRequest !== pixelsRequestId) return
+    if (!res.ok) throw new Error('HTTP ' + res.status)
+    const width    = parseInt(res.headers.get('X-Image-Width'), 10)
+    const height   = parseInt(res.headers.get('X-Image-Height'), 10)
+    const channels = parseInt(res.headers.get('X-Image-Channels'), 10)
+    const dtype    = res.headers.get('X-Image-Dtype')
+    const buf = await res.arrayBuffer()
+    if (myRequest !== pixelsRequestId) return
+    const data = dtype === 'uint16' ? new Uint16Array(buf) : new Uint8Array(buf)
+    const maxValue = dtype === 'uint16' ? 65535 : 255
+    rawPixels = { width, height, channels, dtype, maxValue, data }
+
+    if (pinned && pinnedPos) {
+      pinnedPos = { x: Math.min(pinnedPos.x, width - 1), y: Math.min(pinnedPos.y, height - 1) }
+      updateCrosshairAndProfiles(pinnedPos.x, pinnedPos.y)
+    } else {
+      document.getElementById('px-status').textContent = 'Hover over the image to inspect a pixel.'
+    }
+  } catch (e) {
+    if (myRequest !== pixelsRequestId) return
+    console.warn('Raw pixel fetch failed:', e)
+    document.getElementById('px-status').textContent = 'Pixel data unavailable for this file.'
+  }
+}
+
+function computeDisplayBox() {
+  const imgEl = document.getElementById('viewer-img')
+  // offsetLeft/offsetTop/clientWidth/clientHeight instead of
+  // getBoundingClientRect(): these are computed by the layout engine
+  // relative to the nearest positioned ancestor (#viewer, which has
+  // position:relative — exactly the canvas's own positioning parent) and,
+  // critically, are the SAME numbers the browser uses internally to derive
+  // MouseEvent.offsetX/offsetY (see mapEventToImagePixel). Manually
+  // diffing two independently-queried getBoundingClientRect() calls
+  // (viewport-relative) is a second, redundant computation that can drift
+  // from what offsetX/offsetY report under fractional OS display scaling
+  // — reported as a persistent, position-dependent crosshair/cursor
+  // mismatch at 125% desktop scaling that survived an earlier fix aimed
+  // at a (real, but different) load-timing race. Routing both the mouse
+  // mapping and the crosshair draw through this single consistent
+  // coordinate source eliminates that whole class of drift by construction.
+  const dispW = imgEl.clientWidth
+  const dispH = imgEl.clientHeight
+  return {
+    scaleX: dispW / rawPixels.width,
+    scaleY: dispH / rawPixels.height,
+    dispW,
+    dispH,
+    viewerOffX: imgEl.offsetLeft,
+    viewerOffY: imgEl.offsetTop,
+  }
+}
+
+function renderDebugPanel(info) {
+  const el = document.getElementById('debug-readout')
+  if (!el) return
+  const lines = []
+  for (const [k, v] of Object.entries(info)) {
+    lines.push(`${k}: ${JSON.stringify(v)}`)
+  }
+  el.textContent = lines.join('\\n')
+}
+
+function mapEventToImagePixel(evt) {
+  const imgEl = document.getElementById('viewer-img')
+  const debugInfo = {
+    devicePixelRatio: window.devicePixelRatio,
+    'evt.clientX,clientY': [evt.clientX, evt.clientY],
+    'evt.offsetX,offsetY': [evt.offsetX, evt.offsetY],
+    'evt.target': evt.target && (evt.target.id || evt.target.tagName),
+    hasRawPixels: !!rawPixels,
+    rawPixelsWH: rawPixels ? [rawPixels.width, rawPixels.height] : null,
+    'img.complete/naturalW/naturalH': [imgEl.complete, imgEl.naturalWidth, imgEl.naturalHeight],
+    'img.offsetLeft/Top': [imgEl.offsetLeft, imgEl.offsetTop],
+    'img.clientWidth/Height': [imgEl.clientWidth, imgEl.clientHeight],
+    'img.getBoundingClientRect()': (() => {
+      const r = imgEl.getBoundingClientRect()
+      return [r.left, r.top, r.width, r.height]
+    })(),
+  }
+
+  if (!rawPixels) { debugInfo.result = 'null (no rawPixels)'; renderDebugPanel(debugInfo); return null }
+  const imgElForGuard = imgEl
+  // Guards a real, confirmed failure mode: selectImage() sets viewImg.src
+  // and kicks off fetchRawPixels() as two independent, unsynchronized
+  // operations. On a large capture (e.g. a real 3840x2160 frame, vs. the
+  // much smaller/faster emulator test images) the JPEG can still be
+  // mid-decode when rawPixels already resolved and the user starts
+  // hovering — an unloaded <img> reports 0 for its layout box, which would
+  // collapse scaleX/scaleY toward 0 and clamp every position to
+  // (width-1, height-1), i.e. pinned to the bottom-right corner.
+  if (!imgElForGuard.complete || imgElForGuard.naturalWidth === 0) {
+    debugInfo.result = 'null (image not loaded)'; renderDebugPanel(debugInfo); return null
+  }
+  if (evt.target !== imgEl) {
+    debugInfo.result = 'null (evt.target is not the image)'; renderDebugPanel(debugInfo); return null
+  }
+  const box = computeDisplayBox()
+  debugInfo.box = box
+  if (box.dispW === 0 || box.dispH === 0) {
+    debugInfo.result = 'null (dispW/dispH is 0)'; renderDebugPanel(debugInfo); return null
+  }
+  // offsetX/offsetY are relative to evt.target's padding edge, computed by
+  // the browser itself — the same coordinate source computeDisplayBox()
+  // uses, so the two can never disagree.
+  const lx = evt.offsetX
+  const ly = evt.offsetY
+  if (lx < 0 || ly < 0 || lx >= box.dispW || ly >= box.dispH) {
+    debugInfo.result = 'null (outside dispW/dispH bounds)'; renderDebugPanel(debugInfo); return null
+  }
+  const x = Math.min(Math.max(Math.floor(lx / box.scaleX), 0), rawPixels.width - 1)
+  const y = Math.min(Math.max(Math.floor(ly / box.scaleY), 0), rawPixels.height - 1)
+  debugInfo.result = [x, y]
+  renderDebugPanel(debugInfo)
+  return { x, y }
+}
+
+function updateCrosshairAndProfiles(x, y) {
+  lastHoverPos = { x, y }
+  drawCrosshairOverlay(x, y)
+  renderReadoutAndProfiles(x, y)
+}
+
+function drawCrosshairOverlay(x, y) {
+  const canvas = document.getElementById('crosshair-overlay')
+  const viewerEl = document.getElementById('viewer')
+  // clientWidth/clientHeight rather than getBoundingClientRect() — same
+  // coordinate source as computeDisplayBox(), see the comment there.
+  const cssW = viewerEl.clientWidth
+  const cssH = viewerEl.clientHeight
+  const dpr = window.devicePixelRatio || 1
+  const w = Math.max(1, Math.round(cssW * dpr))
+  const h = Math.max(1, Math.round(cssH * dpr))
+  if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h }
+  const ctx = canvas.getContext('2d')
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+  ctx.clearRect(0, 0, cssW, cssH)
+  if (x == null || y == null || !rawPixels) return
+
+  const box = computeDisplayBox()
+  const cx = box.viewerOffX + (x + 0.5) * box.scaleX
+  const cy = box.viewerOffY + (y + 0.5) * box.scaleY
+  ctx.strokeStyle = pinned ? 'rgba(0,255,136,0.9)' : 'rgba(0,229,255,0.85)'
+  ctx.lineWidth = 1
+  ctx.beginPath()
+  ctx.moveTo(box.viewerOffX, cy); ctx.lineTo(box.viewerOffX + box.dispW, cy)
+  ctx.moveTo(cx, box.viewerOffY); ctx.lineTo(cx, box.viewerOffY + box.dispH)
+  ctx.stroke()
+  ctx.beginPath()
+  ctx.arc(cx, cy, 3, 0, Math.PI * 2)
+  ctx.stroke()
+}
+
+function pixelValuesAt(x, y) {
+  const { data, width, channels } = rawPixels
+  const idx = (y * width + x) * channels
+  const vals = []
+  for (let c = 0; c < channels; c++) vals.push(data[idx + c])
+  return vals
+}
+
+function rowValues(y, channel) {
+  const { data, width, channels } = rawPixels
+  const out = new data.constructor(width)
+  const base = y * width * channels + channel
+  for (let x = 0; x < width; x++) out[x] = data[base + x * channels]
+  return out
+}
+
+function colValues(x, channel) {
+  const { data, width, height, channels } = rawPixels
+  const out = new data.constructor(height)
+  const stride = width * channels
+  const base = x * channels + channel
+  for (let y = 0; y < height; y++) out[y] = data[base + y * stride]
+  return out
+}
+
+function argmax(arr) {
+  let mi = 0, mv = -Infinity
+  for (let i = 0; i < arr.length; i++) { if (arr[i] > mv) { mv = arr[i]; mi = i } }
+  return { index: mi, value: mv }
+}
+
+function renderReadoutAndProfiles(x, y) {
+  if (!rawPixels) return
+  const { channels, maxValue } = rawPixels
+  const meta = CHANNEL_META[channels] || CHANNEL_META[1]
+  const vals = pixelValuesAt(x, y)
+
+  document.getElementById('px-status').style.display = 'none'
+  document.getElementById('px-readout').style.display = 'block'
+  document.getElementById('px-xy').textContent = x + ', ' + y
+
+  const valuesHtml = meta.map((m, i) => {
+    const v = vals[i]
+    const sat = v >= maxValue
+    return '<div class="readout-row"><span class="readout-label ' + m.cls + '">' + m.label + '</span>' +
+           '<span class="readout-value' + (sat ? ' sat' : '') + '">' + v + (sat ? ' (CLIP)' : '') + '</span></div>'
+  }).join('')
+  document.getElementById('px-values').innerHTML = valuesHtml
+
+  const rowSeries = meta.map((m, i) => ({ color: m.color, values: rowValues(y, i) }))
+  const colSeries = meta.map((m, i) => ({ color: m.color, values: colValues(x, i) }))
+
+  drawProfileCanvas(document.getElementById('row-profile'), rowSeries, maxValue)
+  drawProfileCanvas(document.getElementById('col-profile'), colSeries, maxValue)
+
+  const rowBest = rowSeries.map(s => argmax(s.values)).reduce((a, b) => (b.value > a.value ? b : a))
+  const colBest = colSeries.map(s => argmax(s.values)).reduce((a, b) => (b.value > a.value ? b : a))
+  document.getElementById('px-rowmax').textContent = rowBest.value + ' at x=' + rowBest.index
+  document.getElementById('px-colmax').textContent = colBest.value + ' at y=' + colBest.index
+}
+
+function drawProfileCanvas(canvas, series, maxValue) {
+  const dpr = window.devicePixelRatio || 1
+  const rect = canvas.getBoundingClientRect()
+  const w = Math.max(1, Math.round(rect.width * dpr))
+  const h = Math.max(1, Math.round(rect.height * dpr))
+  if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h }
+  const ctx = canvas.getContext('2d')
+  ctx.setTransform(1, 0, 0, 1, 0, 0)
+  ctx.fillStyle = '#0d1117'
+  ctx.fillRect(0, 0, w, h)
+
+  const padTop = 3 * dpr, padBottom = 3 * dpr
+  const valueToY = v => padTop + (1 - v / maxValue) * (h - padTop - padBottom)
+
+  // Saturation / clip-level reference line
+  ctx.strokeStyle = 'rgba(255,80,80,0.5)'
+  ctx.setLineDash([4 * dpr, 3 * dpr])
+  ctx.lineWidth = 1
+  ctx.beginPath()
+  const satY = valueToY(maxValue)
+  ctx.moveTo(0, satY); ctx.lineTo(w, satY)
+  ctx.stroke()
+  ctx.setLineDash([])
+
+  // Each series drawn as a min/max envelope per output column \u2014 this
+  // guarantees a single-sample spike (a hot pixel) still shows up as a
+  // visible vertical stroke even when many source samples are compressed
+  // into one output column, instead of being silently averaged away by
+  // naive decimation.
+  series.forEach(({ color, values }) => {
+    const N = values.length
+    ctx.strokeStyle = color
+    ctx.lineWidth = 1
+    ctx.beginPath()
+    for (let px = 0; px < w; px++) {
+      const start = Math.floor(px / w * N)
+      const end = Math.max(start + 1, Math.floor((px + 1) / w * N))
+      let mn = Infinity, mx = -Infinity
+      for (let i = start; i < end && i < N; i++) {
+        const v = values[i]
+        if (v < mn) mn = v
+        if (v > mx) mx = v
+      }
+      if (mn === Infinity) continue
+      ctx.moveTo(px + 0.5, valueToY(mn))
+      ctx.lineTo(px + 0.5, valueToY(mx))
+    }
+    ctx.stroke()
+  })
+}
+
+function clearProfileCanvases() {
+  ;['row-profile', 'col-profile'].forEach(id => {
+    const c = document.getElementById(id)
+    const dpr = window.devicePixelRatio || 1
+    const rect = c.getBoundingClientRect()
+    const w = Math.max(1, Math.round(rect.width * dpr))
+    const h = Math.max(1, Math.round(rect.height * dpr))
+    if (c.width !== w || c.height !== h) { c.width = w; c.height = h }
+    const ctx = c.getContext('2d')
+    ctx.setTransform(1, 0, 0, 1, 0, 0)
+    ctx.fillStyle = '#0d1117'
+    ctx.fillRect(0, 0, c.width, c.height)
+  })
+}
+
+function togglePin(pos) {
+  if (pinned) {
+    pinned = false
+    pinnedPos = null
+    document.getElementById('pin-btn').classList.remove('pinned')
+    document.getElementById('pin-btn').textContent = 'Pin'
+    if (rawPixels && lastHoverPos) {
+      updateCrosshairAndProfiles(lastHoverPos.x, lastHoverPos.y)
+    } else {
+      drawCrosshairOverlay(null, null)
+    }
+    return
+  }
+  const target = pos || lastHoverPos
+  if (!target || !rawPixels) return
+  pinned = true
+  pinnedPos = target
+  document.getElementById('pin-btn').classList.add('pinned')
+  document.getElementById('pin-btn').textContent = 'Pinned (click image to release)'
+  updateCrosshairAndProfiles(target.x, target.y)
+}
+
+const viewerEl = document.getElementById('viewer')
+const viewerImgEl = document.getElementById('viewer-img')
+
+// If the mouse stops moving (or is pinned) right as a large image is still
+// mid-decode, mapEventToImagePixel's readiness guard means no mousemove
+// event lands *after* it becomes ready to naturally refresh the crosshair.
+// Re-render explicitly once the image is actually decoded and laid out.
+viewerImgEl.addEventListener('load', () => {
+  if (!rawPixels) return
+  if (pinned && pinnedPos) {
+    updateCrosshairAndProfiles(pinnedPos.x, pinnedPos.y)
+  } else if (lastHoverPos) {
+    updateCrosshairAndProfiles(lastHoverPos.x, lastHoverPos.y)
+  }
+})
+
+// Listeners are on the <img> itself, not the outer #viewer box — this
+// guarantees evt.target === viewerImgEl (needed for offsetX/offsetY to be
+// relative to the picture, see mapEventToImagePixel) and means "moved off
+// the picture" (into the black letterbox bars, or off #viewer entirely)
+// is exactly what fires mouseleave, with no extra bounds checking needed.
+viewerImgEl.addEventListener('mousemove', evt => {
+  if (pinned || !rawPixels) return
+  pendingEvt = evt
+  if (!rafPending) {
+    rafPending = true
+    requestAnimationFrame(() => {
+      rafPending = false
+      const p = mapEventToImagePixel(pendingEvt)
+      if (p) updateCrosshairAndProfiles(p.x, p.y)
+    })
+  }
+})
+
+viewerImgEl.addEventListener('mouseleave', () => {
+  if (pinned) return
+  drawCrosshairOverlay(null, null)
+  document.getElementById('px-status').textContent =
+    rawPixels ? 'Hover over the image to inspect a pixel.' : 'Select an image to inspect pixels.'
+  document.getElementById('px-status').style.display = 'block'
+  document.getElementById('px-readout').style.display = 'none'
+})
+
+viewerImgEl.addEventListener('click', evt => {
+  if (pinned) { togglePin(); return }
+  const p = mapEventToImagePixel(evt)
+  if (p) togglePin(p)
+})
+
+document.getElementById('pin-btn').addEventListener('click', evt => {
+  evt.stopPropagation()
+  togglePin()
+})
+
+// Delegated so it survives tbody.innerHTML being replaced on every refresh
+document.getElementById('list-body').addEventListener('click', evt => {
+  const row = evt.target.closest('tr[data-filename]')
+  if (!row) return
+  const img = imagesByFilename.get(row.dataset.filename)
+  if (img) selectImage(img)
+})
+
+let resizeTimer = null
+window.addEventListener('resize', () => {
+  clearTimeout(resizeTimer)
+  resizeTimer = setTimeout(() => {
+    if (!rawPixels) return
+    if (pinned && pinnedPos) updateCrosshairAndProfiles(pinnedPos.x, pinnedPos.y)
+    else drawCrosshairOverlay(null, null)
+  }, 150)
+})
 
 async function loadImages() {
   const dot = document.getElementById('refresh-dot')
@@ -1984,16 +2958,26 @@ async function loadImages() {
       if (document.hidden) updateTitle()
     }
     knownFiles = incoming
+    imagesByFilename = new Map(images.map(i => [i.filename, i]))
 
-    tbody.innerHTML = images.map(img => `
-      <tr id="row-${img.filename}"
-          class="${fresh.has(img.filename) ? 'new-row' : ''}${activeFile === img.filename ? ' active' : ''}"
-          onclick="selectImage(${JSON.stringify(img)})">
-        <td class="td-thumb"><img src="${img.url}" loading="lazy" alt=""></td>
-        <td class="td-name">${img.filename}</td>
+    // Rows are built via data-filename + a delegated click listener (below)
+    // rather than an inline onclick="selectImage(...)" with the image JSON
+    // embedded straight into the HTML — a filename is guaranteed to contain
+    // double quotes once JSON-stringified, which terminates the "-quoted
+    // onclick attribute at the first one, silently truncating the handler
+    // and breaking every row click. escapeHtml() on top guards against a
+    // filename itself containing HTML-special characters.
+    tbody.innerHTML = images.map(img => {
+      const safeName = escapeHtml(img.filename)
+      const cls = (fresh.has(img.filename) ? 'new-row' : '') + (activeFile === img.filename ? ' active' : '')
+      return `
+      <tr data-filename="${safeName}" class="${cls}">
+        <td class="td-thumb"><img src="${escapeHtml(img.url)}" loading="lazy" alt=""></td>
+        <td class="td-name">${safeName}</td>
         <td class="td-time">${fmt(img.mtime)}</td>
         <td class="td-size">${img.size_kb} KB</td>
-      </tr>`).join('')
+      </tr>`
+    }).join('')
 
     // Auto-select newest if nothing selected yet
     if (!activeFile && images.length > 0) selectImage(images[0])
@@ -2055,7 +3039,28 @@ setInterval(loadImages, REFRESH_MS)
 
 @app.get("/gallery", response_class=HTMLResponse)
 def get_gallery():
-    return HTMLResponse(content=_GALLERY_HTML)
+    # No Cache-Control previously meant the browser's default heuristic
+    # caching could serve a stale copy of this page across edits during
+    # active debugging (plain reload/back-forward doesn't always
+    # revalidate) — force a fresh fetch every time so a server-side fix is
+    # never invisible behind a cached HTML response.
+    return HTMLResponse(content=_GALLERY_HTML, headers={"Cache-Control": "no-store"})
+
+
+# ---------------------------------------------------------------------------
+# Production frontend — serves the Vite build (`npm run build` → dist/) at
+# "/" so the whole app is reachable on a single origin/port. This matters for
+# exposing the GS through something like a Cloudflare Tunnel: one hostname
+# pointed at this port gets the UI, /api, and /ws with no CORS or separate
+# dev-server-exposure concerns. Mounted last so it never shadows an API
+# route above, and only mounted at all if dist/ actually exists — the normal
+# `npm run dev` + Vite-proxy workflow (see vite.config.js) is unaffected.
+# ---------------------------------------------------------------------------
+_frontend_dist = Path(__file__).resolve().parents[1] / "dist"
+if _frontend_dist.is_dir():
+    from fastapi.staticfiles import StaticFiles
+    app.mount("/", StaticFiles(directory=_frontend_dist, html=True), name="frontend")
+    logger.info("Serving frontend build from %s", _frontend_dist)
 
 
 # ---------------------------------------------------------------------------

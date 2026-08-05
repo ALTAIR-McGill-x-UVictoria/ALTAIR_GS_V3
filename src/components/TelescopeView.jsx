@@ -42,6 +42,14 @@ function Section({ title, children }) {
   )
 }
 
+// Strips a leading zero as the user types past it (e.g. "0" + "5" -> "05"
+// should read as "5"), without forcing an empty field back to "0" the way
+// `Number(e.target.value) || 0` would — that round-trip is what causes a
+// number <input>'s displayed text to get stuck with a leading zero.
+function stripLeadingZero(v) {
+  return v.replace(/^0+(?=\d)/, '')
+}
+
 function Row({ label, value, unit }) {
   return (
     <div style={styles.row}>
@@ -99,6 +107,7 @@ export default function TelescopeView() {
     mountStatus,
     cameraStatus,
     trackingEnabled,
+    autoCaptureEnabled,
     actions,
   } = useTelescope()
 
@@ -106,8 +115,8 @@ export default function TelescopeView() {
 
   const [mountPort,    setMountPort]   = useState('')
   const [mountType,    setMountType]   = useState('nexstar')
-  const [gain,         setGain]        = useState(150)
-  const [exposureMs,   setExposureMs]  = useState(1000)
+  const [gain,         setGain]        = useState('150')
+  const [exposureMs,   setExposureMs]  = useState('1000')
   const [manualAz,     setManualAz]    = useState('')
   const [manualEl,     setManualEl]    = useState('')
   const [manualRa,     setManualRa]    = useState('')
@@ -202,7 +211,8 @@ export default function TelescopeView() {
               disabled={mountConnected}
             >
               <option value="nexstar">NexStar</option>
-              <option value="am5">ZWO AM5</option>
+              <option value="am5">ZWO AM5 (ASCOM)</option>
+              <option value="indi">AM3/AM5 (INDI)</option>
             </select>
             {mountType === 'nexstar' && (
               <select
@@ -220,6 +230,12 @@ export default function TelescopeView() {
                 ))}
               </select>
             )}
+            {mountType === 'indi' && (
+              <input style={styles.input} value={mountPort}
+                onChange={e => setMountPort(e.target.value)}
+                placeholder="INDI host (e.g. localhost or 192.168.1.50:7624)"
+                disabled={mountConnected} />
+            )}
             {mountConnected
               ? <button style={styles.btnDanger} disabled={busy}
                   onClick={() => run(actions.disconnectMount, setMountError)}>Disconnect</button>
@@ -228,7 +244,7 @@ export default function TelescopeView() {
             }
           </div>
 
-          {activeMountType === 'am5'
+          {(activeMountType === 'am5' || activeMountType === 'indi')
             ? (
               <div style={{ ...styles.inputRow, marginTop: 8 }}>
                 <input style={{ ...styles.input, width: 90 }} value={manualRa}
@@ -331,7 +347,9 @@ export default function TelescopeView() {
           <div style={styles.rowFlex}>
             <StatusDot ok={cameraConnected} />
             <span style={{ color: C.text, fontSize: 12 }}>
-              {cameraConnected ? `${cameraStatus.camera_name || 'Camera'} connected` : 'Disconnected'}
+              {cameraConnected
+                ? `${cameraStatus.camera_name || 'Camera'} connected`
+                : 'Disconnected'}
             </span>
           </div>
           <div style={{ ...styles.inputRow, marginTop: 8 }}>
@@ -352,19 +370,22 @@ export default function TelescopeView() {
               <div style={{ ...styles.inputRow, marginTop: 8 }}>
                 <label style={styles.label}>Gain</label>
                 <input type="number" style={{ ...styles.input, width: 80 }}
-                  value={gain} onChange={e => setGain(Number(e.target.value))} />
+                  value={gain} onChange={e => setGain(stripLeadingZero(e.target.value))} />
                 <label style={styles.label}>Exp (ms)</label>
                 <input type="number" style={{ ...styles.input, width: 80 }}
-                  value={exposureMs} onChange={e => setExposureMs(Number(e.target.value))} />
+                  value={exposureMs} onChange={e => setExposureMs(stripLeadingZero(e.target.value))} />
                 <button style={styles.btn} disabled={busy}
-                  onClick={() => run(() => actions.setCameraSettings({ gain, exposure_ms: exposureMs }), setCameraError)}>
+                  onClick={() => run(() => actions.setCameraSettings({
+                    gain: Number(gain) || 0,
+                    exposure_ms: Number(exposureMs) || 0,
+                  }), setCameraError)}>
                   Apply
                 </button>
               </div>
               <div style={{ ...styles.inputRow, marginTop: 8 }}>
                 <input style={styles.input} value={capturePath}
                   onChange={e => setCapturePath(e.target.value)}
-                  placeholder="filename (auto if blank)" />
+                  placeholder="filename (auto if blank, saved as .fits)" />
                 <button style={styles.btnGreen} disabled={busy}
                   onClick={() => run(async () => {
                     const res = await actions.captureFrame(capturePath)
@@ -384,6 +405,29 @@ export default function TelescopeView() {
                   Saved: {lastCapture}
                 </div>
               )}
+              <div style={{ marginTop: 4, fontSize: 10, color: C.muted }}>
+                Reusing a name never overwrites — a repeat gets _1, _2, ... appended.
+              </div>
+
+              <div style={{ ...styles.rowFlex, marginTop: 12, paddingTop: 10, borderTop: `1px solid ${C.border}` }}>
+                <StatusDot ok={autoCaptureEnabled} />
+                <span style={{ color: C.text, fontSize: 12 }}>
+                  {autoCaptureEnabled ? 'Auto-capture active' : 'Auto-capture off'}
+                </span>
+              </div>
+              <div style={{ ...styles.inputRow, marginTop: 8 }}>
+                <button
+                  style={autoCaptureEnabled ? styles.btnDanger : styles.btnGreen}
+                  disabled={busy}
+                  onClick={() => run(() => actions.setAutoCapture(!autoCaptureEnabled), setCameraError)}
+                >
+                  {autoCaptureEnabled ? 'Stop Auto-Capture' : 'Start Auto-Capture'}
+                </button>
+              </div>
+              <div style={{ marginTop: 4, fontSize: 10, color: C.muted }}>
+                Continuously captures at the current gain/exposure. Automatically
+                pauses around :25-:30 and :55-:60 of every minute (beacon LEDs).
+              </div>
             </>
           )}
         </Section>

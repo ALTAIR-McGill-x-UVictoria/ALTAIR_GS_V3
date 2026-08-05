@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef, useMemo } from 'react'
+import { apiFetch } from '../api'
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -309,7 +310,7 @@ export default function AlarmSidebar({ alarms, onDismissAll, onDismissOne, event
                   }}
                   onClick={async () => {
                     logCommandSent(CMD_ARM)
-                    await fetch('/api/fc/command/arm', { method: 'POST' })
+                    await apiFetch('/api/fc/command/arm', { method: 'POST' })
                   }}
                 >ARM</button>
                 <button
@@ -324,7 +325,7 @@ export default function AlarmSidebar({ alarms, onDismissAll, onDismissOne, event
                   }}
                   onClick={async () => {
                     logCommandSent(CMD_LAUNCH_OK)
-                    await fetch('/api/fc/command/launch_ok', { method: 'POST' })
+                    await apiFetch('/api/fc/command/launch_ok', { method: 'POST' })
                   }}
                 >LAUNCH OK</button>
                 <button
@@ -337,7 +338,7 @@ export default function AlarmSidebar({ alarms, onDismissAll, onDismissOne, event
                   }}
                   onClick={async () => {
                     logCommandSent(CMD_PING)
-                    await fetch('/api/fc/command/ping', { method: 'POST' })
+                    await apiFetch('/api/fc/command/ping', { method: 'POST' })
                   }}
                 >PING</button>
               </div>

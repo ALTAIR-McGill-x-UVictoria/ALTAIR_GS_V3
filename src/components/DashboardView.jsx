@@ -1,4 +1,5 @@
 import { useMemo, useEffect, useRef, useState } from 'react'
+import { apiFetch } from '../api'
 import {
   fv, findPacket, formatUptime, formatDuration, formatEta,
   C, S, ArtificialHorizon, Compass, ArcGauge, VerticalTape,
@@ -389,7 +390,7 @@ export default function DashboardView({ packets, events = [], stageNames = {}, l
                     }}
                     onClick={async () => {
                       logCommandSent(CMD_ARM)
-                      const r = await fetch('/api/fc/command/arm', { method:'POST' })
+                      const r = await apiFetch('/api/fc/command/arm', { method:'POST' })
                       const j = await r.json()
                       if (!j.ok) console.error('ARM failed:', j.error)
                     }}
@@ -407,7 +408,7 @@ export default function DashboardView({ packets, events = [], stageNames = {}, l
                     }}
                     onClick={async () => {
                       logCommandSent(CMD_LAUNCH_OK)
-                      const r = await fetch('/api/fc/command/launch_ok', { method:'POST' })
+                      const r = await apiFetch('/api/fc/command/launch_ok', { method:'POST' })
                       const j = await r.json()
                       if (!j.ok) console.error('LAUNCH_OK failed:', j.error)
                     }}
@@ -422,7 +423,7 @@ export default function DashboardView({ packets, events = [], stageNames = {}, l
                     }}
                     onClick={async () => {
                       logCommandSent(CMD_PING)
-                      const r = await fetch('/api/fc/command/ping', { method:'POST' })
+                      const r = await apiFetch('/api/fc/command/ping', { method:'POST' })
                       const j = await r.json()
                       if (!j.ok) console.error('PING failed:', j.error)
                     }}

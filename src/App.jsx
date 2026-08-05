@@ -77,7 +77,7 @@ function resolveGpsHistory(history, packets) {
 }
 
 export default function App() {
-  const { status, packets, history, freshness, wsReady, alarms, alarmRules, events, stageNames, lastAck, gsGps, gsGpsStatus } = useTelemetry()
+  const { status, tunnelStatus, packets, history, freshness, wsReady, alarms, alarmRules, events, stageNames, lastAck, gsGps, gsGpsStatus } = useTelemetry()
   const { tracking, mountStatus, cameraStatus } = useTelescope()
   const [activeTab, setActiveTab] = useState('Flight')
   const [dismissed, setDismissed] = useState(new Set())
@@ -106,6 +106,7 @@ export default function App() {
     <div style={styles.root}>
       <ConnectionBar
         status={status}
+        tunnelStatus={tunnelStatus}
         wsReady={wsReady}
         freshness={freshness}
         gsGps={gsGps}

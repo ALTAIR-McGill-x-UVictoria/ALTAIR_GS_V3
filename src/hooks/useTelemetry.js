@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, useCallback } from 'react'
 
-const WS_URL = 'ws://localhost:5173/ws'
+const WS_URL = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`
 const HISTORY_LEN = 200   // data points kept per field for sparklines
 
 // Staleness multipliers: warn after 3 expected periods, lost after 6.
@@ -15,7 +15,8 @@ const STALE_LOST_MS_MIN  = 5000
  * Central telemetry hook.
  *
  * Returns:
- *   status     — { connected: bool, port: string }
+ *   status       — { connected: bool, port: string, telemetry_source: 'radio' | 'tunnel' }
+ *   tunnelStatus — { enabled: bool, connected: bool, host: string, port: number }
  *   packets    — { [label]: { fields: [{name, label, unit, value}], seq, timestamp } }
  *   history    — { [label]: { [fieldName]: [{ t, v }, ...] } }
  *   freshness  — { [label]: 'ok' | 'stale' | 'lost' | 'waiting' }
@@ -26,7 +27,8 @@ export function useTelemetry() {
   const reconnectTimer = useRef(null)
 
   const [wsReady,     setWsReady]     = useState(false)
-  const [status,      setStatus]      = useState({ connected: false, port: '' })
+  const [status,      setStatus]      = useState({ connected: false, port: '', telemetry_source: 'radio' })
+  const [tunnelStatus, setTunnelStatus] = useState({ enabled: false, connected: false, host: '', port: 0 })
   const [packets,     setPackets]     = useState({})
   const [history,     setHistory]     = useState({})
   const [alarms,      setAlarms]      = useState([])
@@ -35,7 +37,7 @@ export function useTelemetry() {
   const [stageNames,  setStageNames]  = useState({})   // {0: "Pre-flight", ...}
   const [lastAck,     setLastAck]     = useState(null) // {cmd_id, cmd_seq, status, wall_ms}
   const [gsGps,       setGsGps]       = useState(null) // {lat, lon, alt, utc_unix, sats, hdop, fix_quality}
-  const [gsGpsStatus, setGsGpsStatus] = useState({ connected: false, has_fix: false, port: '' })
+  const [gsGpsStatus, setGsGpsStatus] = useState({ connected: false, receiving: false, has_fix: false, port: '' })
   const lastSeen     = useRef({})
   const arrivalTimes = useRef({})
   const targetHzRef  = useRef({})   // { [label]: target_hz } — updated on each packet
@@ -99,7 +101,19 @@ export function useTelemetry() {
       }
 
       if (msg.type === 'status') {
-        setStatus({ connected: msg.connected, port: msg.port, emulating: msg.emulating ?? false })
+        // Merge rather than replace — some status messages (e.g. a telemetry
+        // source failover) only carry the field that changed.
+        setStatus(prev => ({
+          connected:        msg.connected ?? prev.connected,
+          port:             msg.port ?? prev.port,
+          emulating:        msg.emulating ?? prev.emulating ?? false,
+          telemetry_source: msg.telemetry_source ?? prev.telemetry_source ?? 'radio',
+        }))
+        return
+      }
+
+      if (msg.type === 'tunnel_status') {
+        setTunnelStatus({ enabled: true, connected: msg.connected, host: msg.host, port: msg.port })
         return
       }
 
@@ -130,7 +144,7 @@ export function useTelemetry() {
       }
 
       if (msg.type === 'gs_gps_status') {
-        setGsGpsStatus({ connected: msg.connected, has_fix: msg.has_fix, port: msg.port })
+        setGsGpsStatus({ connected: msg.connected, receiving: msg.receiving, has_fix: msg.has_fix, port: msg.port })
         return
       }
 
@@ -273,5 +287,5 @@ export function useTelemetry() {
     return () => clearInterval(id)
   }, [])
 
-  return { status, packets, history, freshness, wsReady, alarms, alarmRules, events, stageNames, lastAck, gsGps, gsGpsStatus }
+  return { status, tunnelStatus, packets, history, freshness, wsReady, alarms, alarmRules, events, stageNames, lastAck, gsGps, gsGpsStatus }
 }

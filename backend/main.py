@@ -966,6 +966,16 @@ _latest_events:  list[dict]      = []   # last 200 events
 mount_controller: BaseMountController | None = None
 camera_controller = create_camera("zwo")
 
+# Held for the full duration of every camera exposure (see post_camera_capture
+# / _do_auto_capture below). Any mount motion — the tracking loop's periodic
+# goto() as well as manual slews from the Telescope tab — must not happen
+# while this is held, or the mount moves mid-exposure and blurs/trails the
+# frame. This matters on every mount type, but especially the Windows AM5
+# path: ASCOM's SlewToCoordinates() physically drives the mount, and the
+# 1s-interval tracking loop would otherwise happily re-command it in the
+# middle of a multi-second exposure.
+_capture_lock = asyncio.Lock()
+
 # Latest GPS data from telemetry — updated by _broadcast, read by tracking poll
 _latest_gps: dict | None = None
 
@@ -1249,7 +1259,12 @@ async def _tracking_poll_loop(interval_s: float = 1.0) -> None:
             await _broadcast_telescope(msg)
 
             if _tracking_enabled and mount_controller is not None and mount_controller.connected:
-                if mount_controller.mount_type in ("am5", "indi"):
+                if _capture_lock.locked():
+                    # A capture is mid-exposure right now — skip commanding the
+                    # mount this cycle rather than moving it under the sensor.
+                    # We pick back up on the next 1s poll once the lock frees.
+                    logger.debug("Tracking poll: capture in progress, skipping mount command")
+                elif mount_controller.mount_type in ("am5", "indi"):
                     await mount_controller.goto(
                         ra_hours=params["ra_hours"],
                         dec_deg=params["dec_deg"],
@@ -1939,6 +1954,17 @@ async def post_mount_disconnect():
     return {"ok": True}
 
 
+async def _goto_after_capture(**kwargs) -> None:
+    """
+    Run mount_controller.goto(**kwargs), waiting first for any in-progress
+    capture to finish — see _capture_lock's docstring. A manual slew request
+    still gets honored, just deferred until the sensor is clear instead of
+    moving the mount mid-exposure.
+    """
+    async with _capture_lock:
+        await mount_controller.goto(**kwargs)
+
+
 @app.post("/api/telescope/mount/goto")
 async def post_mount_goto(body: dict):
     if mount_controller is None or not mount_controller.connected:
@@ -1946,12 +1972,12 @@ async def post_mount_goto(body: dict):
     if mount_controller.mount_type in ("am5", "indi"):
         ra  = float(body.get("ra_hours", 0))
         dec = float(body.get("dec_deg",  0))
-        asyncio.create_task(mount_controller.goto(ra_hours=ra, dec_deg=dec))
+        asyncio.create_task(_goto_after_capture(ra_hours=ra, dec_deg=dec))
         return {"ok": True, "ra_hours": ra, "dec_deg": dec}
     else:
         az = float(body.get("azimuth",   0))
         el = float(body.get("elevation", 0))
-        asyncio.create_task(mount_controller.goto(azimuth=az, elevation=el))
+        asyncio.create_task(_goto_after_capture(azimuth=az, elevation=el))
         return {"ok": True, "azimuth": az, "elevation": el}
 
 
@@ -2052,7 +2078,8 @@ async def post_camera_capture(body: dict):
     output_path = _unique_capture_path(_normalize_capture_filename(requested))
 
     try:
-        saved = await camera_controller.capture(output_path, metadata=await _build_capture_metadata())
+        async with _capture_lock:
+            saved = await camera_controller.capture(output_path, metadata=await _build_capture_metadata())
         return {"ok": True, "path": saved}
     except Exception as e:
         return {"ok": False, "error": str(e)}
@@ -2099,7 +2126,8 @@ async def _do_auto_capture() -> None:
     filename = _normalize_capture_filename(f"auto_{time.time():.3f}".replace(".", "_"))
     _capture_dir.mkdir(parents=True, exist_ok=True)
     output_path = _unique_capture_path(filename)
-    saved = await camera_controller.capture(output_path, metadata=await _build_capture_metadata())
+    async with _capture_lock:
+        saved = await camera_controller.capture(output_path, metadata=await _build_capture_metadata())
     logger.info("Auto-capture saved %s", saved)
     await _broadcast_telescope({"type": "auto_capture", "path": saved})
 

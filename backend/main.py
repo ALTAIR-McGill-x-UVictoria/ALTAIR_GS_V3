@@ -964,7 +964,8 @@ _latest_events:  list[dict]      = []   # last 200 events
 # ---------------------------------------------------------------------------
 
 mount_controller: BaseMountController | None = None
-camera_controller = create_camera("zwo")
+# "zwo" (default, ASI585MC) or "canon" (Rebel T3i test — see backend/camera_canon.py).
+camera_controller = create_camera(os.getenv("ALTAIR_CAMERA_TYPE", "zwo"))
 
 # Held for the full duration of every camera exposure (see post_camera_capture
 # / _do_auto_capture below). Any mount motion — the tracking loop's periodic

@@ -587,4 +587,9 @@ def create_camera(camera_type: str = "zwo") -> CameraController:
         return EmulatedCameraController()
     if camera_type == "zwo":
         return CameraController()
-    raise ValueError(f"Unknown camera type {camera_type!r}. Choose 'zwo'.")
+    if camera_type == "canon":
+        # Imported lazily so the `gphoto2` package is only required when
+        # this camera type is actually selected — see backend/camera_canon.py.
+        from backend.camera_canon import CanonCameraController
+        return CanonCameraController()
+    raise ValueError(f"Unknown camera type {camera_type!r}. Choose 'zwo' or 'canon'.")

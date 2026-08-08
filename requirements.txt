@@ -23,3 +23,10 @@ pywin32>=306; sys_platform == "win32"
 # speaks INDI's XML wire protocol directly with the standard library, no
 # extra pip package needed — but it requires a local `indiserver` running
 # `indi_lx200am5` (system package, e.g. `indi-full` on Debian/Ubuntu).
+
+# Canon EOS Rebel T3i test path (backend/camera_canon.py), selected via
+# ALTAIR_CAMERA_TYPE=canon — an alternative to the ZWO ASI585MC being
+# evaluated for its larger APS-C sensor. Requires libgphoto2 installed
+# system-wide first (e.g. `apt install libgphoto2-dev` on Linux); this
+# package only provides the Python bindings. See backend/lib/README.md.
+gphoto2>=2.5.0; sys_platform != "win32"

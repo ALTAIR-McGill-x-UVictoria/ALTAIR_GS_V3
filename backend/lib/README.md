@@ -160,11 +160,70 @@ indi_getprop -h <indiserver-host> -p 7624
 If a property name doesn't match what `IndiMountController` expects, adjust
 `EQUATORIAL_EOD_COORD`/`ON_COORD_SET` in `backend/mount.py`.
 
+## 5. Canon EOS Rebel T3i via libgphoto2 (test alternative to the ZWO camera)
+
+`backend/camera_canon.py` (`CanonCameraController`) is a test path for
+using a Canon Rebel T3i/600D DSLR as the telescope sensor instead of the
+ASI585MC, mainly to compare the T3i's much larger APS-C sensor against the
+ASI585MC's small-format one. It talks to the camera over USB via
+[libgphoto2](http://www.gphoto.org/) — the standard tethered-DSLR-control
+library on Linux/macOS/Windows — through the `gphoto2` PyPI package (Python
+bindings around libgphoto2, **not** related to the `zwoasi` package used for
+the ASI camera).
+
+**Install:**
+
+```bash
+# Linux (Debian/Ubuntu)
+sudo apt install libgphoto2-dev
+pip install gphoto2
+
+# macOS
+brew install libgphoto2
+pip install gphoto2
+```
+
+There is no first-class Windows build of libgphoto2; using the T3i path on
+Windows is unsupported today (the ZWO/ASI path remains the Windows option).
+
+**Select it:** set `ALTAIR_CAMERA_TYPE=canon` before starting the backend
+(default is `zwo`):
+
+```bash
+ALTAIR_CAMERA_TYPE=canon python -m backend.main
+```
+
+**Known Linux gotcha — gvfs auto-mount steals the USB connection.** Most
+Linux desktops auto-mount a connected camera as a media device the moment
+it's plugged in, which holds the USB connection libgphoto2 needs exclusive
+access to. If `connect()` fails with a "could not claim the USB device" /
+"Unknown model" style error, kill the auto-mount service first:
+
+```bash
+killall gvfsd-gphoto2 gvfs-gphoto2-volume-monitor
+```
+
+(or disable it persistently — search your desktop environment's docs for
+"disable gvfs gphoto2 automount"). Also make sure the camera's own
+Communication/USB setting is **PTP** ("PC Connection" on the T3i), not Mass
+Storage — libgphoto2 needs PTP mode.
+
+**What's implemented / not:** capture forces JPEG output (no CR2/RAW
+decode dependency), ISO and shutter speed are snapped to the nearest value
+the camera actually offers (`gain`/`exposure_ms` in the shared
+`CameraController` API map to ISO / shutter speed respectively — see the
+module docstring in `camera_canon.py`), and exposures are capped at the
+camera's slowest fixed shutter speed (usually 30s) — **bulb mode for
+longer exposures is not implemented.** Captured frames still go through the
+same FITS-writing pipeline as the ASI camera, so the gallery, raw-pixel
+export, and metadata headers all work identically either way.
+
 ## Quick reference: what needs installing where
 
 | Component        | pip package                  | External binary/driver                             | Platform |
 |-------------------|-------------------------------|------------------------------------------------------|----------|
 | ZWO camera        | `zwoasi`, `astropy`, `Pillow` | ASI SDK shared library (this dir, or `apt install libasicamera2` on Linux) | any      |
+| Canon T3i (test)  | `gphoto2`                     | `libgphoto2-dev` (system package)                    | Linux/macOS |
 | NexStar mount     | `nexstar`                     | USB-serial driver for your cable, if needed          | any      |
 | AM5 mount (ASCOM) | `pywin32`                     | ASCOM Platform + ZWO ASCOM driver                    | Windows  |
 | AM3/AM5 mount (INDI) | none (stdlib `socket`)     | `indi-full`/`indi-bin` (`indi_lx200am5`) + `indiserver` | Linux    |

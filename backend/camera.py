@@ -369,6 +369,13 @@ class CameraController:
         hdr["CREATOR"]  = "ALTAIR V2 Ground Station"
         if arr.ndim == 3:
             hdr["CTYPE3"] = ("RGB", "Axis 3 = color plane (R, G, B)")
+        # BAYERPAT is the de-facto standard card for "this 2-D frame is an
+        # un-demosaiced colour mosaic" — Siril, ASTAP, PixInsight et al. read
+        # it to debayer on load. Written whenever the capture path reported a
+        # pattern (currently the Canon RAW path; see camera_canon.py).
+        bayer = sensor.get("Bayer Pattern")
+        if bayer and arr.ndim == 2:
+            hdr["BAYERPAT"] = (str(bayer), "Bayer colour filter array pattern")
 
         self._apply_metadata_headers(hdr, meta, sensor)
 

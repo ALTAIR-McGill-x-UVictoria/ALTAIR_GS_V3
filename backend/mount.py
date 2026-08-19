@@ -96,6 +96,24 @@ class BaseMountController(ABC):
         The AM5 implementation converts from RA/Dec → Az/El internally.
         """
 
+    async def sync(self, ra_hours: float, dec_deg: float) -> None:
+        """
+        Tell the mount "you are actually pointed here" (ASCOM SyncToCoordinates)
+        without physically moving it — used by the plate-solve "Apply
+        Correction" button (POST /api/telescope/solve/apply in main.py) to
+        fix the mount's internal alignment model from a solved RA/Dec.
+
+        Deliberately NOT part of every mount's interface: only AM5Controller
+        overrides this. NexStar's controller here exposes no sync primitive,
+        and INDI sync semantics vary enough by driver that it wasn't judged
+        safe to wire up without per-driver verification. The base
+        implementation raises so callers get an explicit, actionable error
+        instead of a silent no-op.
+        """
+        raise NotImplementedError(
+            f"{self.mount_type} does not support sync via this backend."
+        )
+
     def status_dict(self) -> dict:
         return {
             "connected":  self.connected,
@@ -217,8 +235,16 @@ class AM5Controller(BaseMountController):
       - ZWO ASCOM telescope driver installed
       - pywin32 package  (`pip install pywin32`)
 
-    The ASCOM driver ProgID defaults to "ASCOM.ZWO.Telescope".
-    Pass a different progid to connect() for other ASCOM telescope drivers.
+    The ASCOM driver ProgID defaults to "ASCOM.ASIMount.Telescope" — current
+    ZWO ASCOM driver releases (confirmed on driver v6.5.36 against ASCOM
+    Platform 7 Update 2) register the AM5 under that ProgID, not
+    "ASCOM.ZWO.Telescope" as older docs/builds suggested; the latter isn't
+    registered at all by this driver version and Dispatch() on it fails with
+    "Invalid class string" (HRESULT 0x80040154, REGDB_E_CLASSNOTREG). Pass a
+    different progid to connect() for other ASCOM telescope drivers, or to
+    match a differently-versioned ZWO driver — check the actual registered
+    ProgID with ASCOM's own Profile object if in doubt:
+        (New-Object -ComObject ASCOM.Utilities.Profile).RegisteredDevices("Telescope")
 
     goto() accepts ra_hours and dec_deg (equatorial J2000 coordinates).
     get_position() returns {"azimuth", "elevation"} by converting the
@@ -226,7 +252,7 @@ class AM5Controller(BaseMountController):
     as tracking.py, so the UI compass rose stays consistent.
     """
 
-    _DEFAULT_PROGID = "ASCOM.ZWO.Telescope"
+    _DEFAULT_PROGID = "ASCOM.ASIMount.Telescope"
 
     @property
     def mount_type(self) -> str:
@@ -314,6 +340,27 @@ class AM5Controller(BaseMountController):
     def _do_wait_slew(self) -> None:
         while self._telescope.Slewing:
             time.sleep(0.2)
+
+    async def sync(self, ra_hours: float, dec_deg: float) -> None:
+        """
+        ASCOM SyncToCoordinates — tells the driver's alignment model "you are
+        actually pointed at this RA/Dec" without physically slewing. Used by
+        the plate-solve Apply Correction button to fix pointing from a
+        solved image rather than blind dead-reckoning.
+        """
+        if not self.connected:
+            raise RuntimeError("AM5 sync called while disconnected")
+        await self._run(self._do_sync, ra_hours, dec_deg)
+        logger.info("AM5 synced to RA=%.4fh Dec=%.4f° (no slew)", ra_hours, dec_deg)
+
+    def _do_sync(self, ra_hours: float, dec_deg: float) -> None:
+        if not getattr(self._telescope, "CanSync", True):
+            raise RuntimeError(
+                "This ASCOM driver reports CanSync=False — it does not "
+                "support sync. Check the driver's capabilities in its "
+                "setup dialog."
+            )
+        self._telescope.SyncToCoordinates(ra_hours, dec_deg)
 
 
 # ---------------------------------------------------------------------------

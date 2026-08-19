@@ -104,10 +104,20 @@ ASCOM platform via `pywin32`, which only exists on Windows
 1. **ASCOM Platform** — from **ascom-standards.org**. This installs the
    COM infrastructure `win32com.client.Dispatch(...)` relies on.
 2. **ZWO's ASCOM telescope driver for the AM5** — from **zwoastro.com**
-   (Software Downloads → AM5 / ASCOM driver). This registers the
-   `ASCOM.ZWO.Telescope` ProgID that `AM5Controller` connects to by default.
-   Pass a different `progid` to `POST /api/telescope/mount/connect` if
-   you're using a different ASCOM-compatible driver.
+   (Software Downloads → AM5 / ASCOM driver). Current driver releases
+   (confirmed on v6.5.36 against ASCOM Platform 7 Update 2) register this as
+   the `ASCOM.ASIMount.Telescope` ProgID, which is what `AM5Controller`
+   connects to by default — older docs/builds referenced
+   `ASCOM.ZWO.Telescope`, which is not registered by current driver versions
+   and fails `Dispatch()` with "Invalid class string" (HRESULT 0x80040154,
+   REGDB_E_CLASSNOTREG). Pass a different `progid` to
+   `POST /api/telescope/mount/connect` if you're using a different
+   ASCOM-compatible driver, or if a future/older ZWO driver version
+   registers under yet another name — check what's actually registered with
+   ASCOM's own Profile object from a PowerShell prompt:
+   ```powershell
+   (New-Object -ComObject ASCOM.Utilities.Profile).RegisteredDevices("Telescope")
+   ```
 
 There is no Linux/macOS path for AM5 control today — ASCOM (as used here) is
 Windows-only. If you need cross-platform AM5 control, that would mean
@@ -243,6 +253,20 @@ for the camera — a USB mode other than PTP, a loose cable, or another app
 (including a second digiCamControl instance) already holding the USB
 connection are the usual causes.
 
+**Avoid a OneDrive-synced session folder.** digiCamControl's default
+session/output folder is under the user profile (e.g.
+`OneDrive\Music\Pictures\digiCamControl\Session1\`), which on a machine
+with OneDrive active gets swept into sync the instant each CR2 lands.
+Confirmed on real hardware: this intermittently causes
+`PermissionError: [Errno 13] Permission denied` when this backend reads the
+just-captured file, because OneDrive (or digiCamControl itself finishing
+its own write) still holds the handle open a few hundred ms after
+`lastcaptured` reports the filename — `_capture_frame` retries that read
+for up to ~3s to absorb the race, but it's still wasted retries/latency
+against a folder that has no reason to be synced at all. Point
+digiCamControl's session folder (Settings → Session) at a plain local path
+outside OneDrive/Dropbox/etc. to avoid this entirely.
+
 ### What's implemented / not (both backends)
 
 **RAW capture.** Both backends force the camera into RAW (CR2) mode at
@@ -271,6 +295,39 @@ ISO / shutter speed respectively — see the module docstring in
 `camera_canon.py`). Captured frames go through the same FITS-writing
 pipeline as the ASI camera, so metadata headers work identically
 regardless of camera or platform.
+
+**Fixed bug (Windows/digiCamControl backend) — whole/decimal-second shutter
+speeds silently failing to apply.** Earlier testing on a real T3i found
+that shutter speeds of 1 second or slower appeared unsettable via remote
+control: digiCamControl's `?slc=set&param1=shutterspeed&param2=...`
+reported success ("OK") but the camera stayed on its previous, faster
+speed. Further isolation (comparing digiCamControl's own UI, which worked
+fine for the same values, against the HTTP path) found the real pattern
+wasn't about speed magnitude at all — it was about the *string format*:
+every value containing `/` (fractional speeds like `1/500`, `1/30`) set
+correctly through `?slc=set&param1=shutterspeed&...`, while every value
+without a `/` (whole or decimal seconds like `1`, `1.3`, `5`, `10`) was
+silently dropped by that same code path, regardless of duration. This is a
+bug in digiCamControl's dedicated `shutterspeed` case in `Set()`
+(`CameraControl.Core/Scripting/CommandLineProcessor.cs` in dukus's
+GitHub repo), not a camera/EDSDK limitation — confirmed by using
+digiCamControl's *generic* reflection-based property path instead,
+`?slc=set&param1=camera.shutterspeed&param2=...`, which sets every value
+correctly on the identical underlying property, whole/decimal seconds
+included. `_set_shutterspeed` in `camera_canon.py` now always goes through
+`camera.shutterspeed` for writes (reads/lists still use the plain
+`shutterspeed` name, which was never affected). **Practical effect: there
+is no longer a remote-control shutter-speed limitation on this path** —
+every fixed speed the camera offers is reliably settable. Only "Bulb"
+remains unsupported, since it has no fixed duration and needs separate
+timed-release logic this module doesn't implement (see "Not implemented"
+above).
+
+`_do_set_exposure` in both backends still reads the shutter speed back
+after writing it as cheap defense-in-depth (logging a warning and
+correcting `self._exposure_ms` to the real value if a write somehow didn't
+take), even though the fix above means this should no longer fire in
+practice.
 
 **digiCamControl caveat (Windows).** Because its HTTP interface serves a
 decoded preview rather than the original raw bytes, the Windows backend

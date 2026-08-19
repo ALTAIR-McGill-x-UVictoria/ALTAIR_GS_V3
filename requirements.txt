@@ -31,10 +31,18 @@ pywin32>=306; sys_platform == "win32"
 
 # Canon EOS Rebel T3i test path (backend/camera_canon.py), selected via
 # ALTAIR_CAMERA_TYPE=canon — an alternative to the ZWO ASI585MC being
-# evaluated for its larger APS-C sensor. Requires libgphoto2 installed
-# system-wide first (e.g. `apt install libgphoto2-dev` on Linux); this
-# package only provides the Python bindings. See backend/lib/README.md.
-# Captures are CR2 RAW (forced at connect time), decoded with rawpy (wraps
-# libraw) to the native-bit-depth Bayer mosaic instead of an 8-bit JPEG.
+# evaluated for its larger APS-C sensor. Two backends, picked automatically
+# by platform.system():
+#   - Linux/macOS: libgphoto2 installed system-wide first (e.g. `apt install
+#     libgphoto2-dev`); the package below only provides the Python bindings.
+#   - Windows: no extra pip package for camera control — drives
+#     digiCamControl (http://digicamcontrol.com/) over its local HTTP
+#     remote-control server using stdlib `urllib` only. digiCamControl
+#     itself must be installed and running. See backend/lib/README.md.
 gphoto2>=2.5.0; sys_platform != "win32"
-rawpy>=2.3.0; sys_platform != "win32"
+
+# CR2 RAW decoding for the Canon path (both platforms). Captures are shot
+# RAW and stored as the un-demosaiced 16-bit Bayer mosaic so they're usable
+# for plate solving; rawpy (LibRaw bindings) does the CR2 -> array decode.
+# Ships prebuilt wheels for Windows/Linux/macOS.
+rawpy>=0.22.0

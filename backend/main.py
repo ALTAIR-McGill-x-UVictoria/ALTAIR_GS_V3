@@ -1182,7 +1182,7 @@ def _fits_to_pil(path: Path):
         # Color-sensor captures are saved as the raw undemosaiced mosaic
         # (see camera.py's module docstring) — debayer here, for preview
         # display only, so the gallery still shows a color photo.
-        data = _debayer(data, bayer_pattern)
+        data = _debayer(data, str(bayer_pattern).strip())
 
     if data.dtype == np.uint8:
         arr = data

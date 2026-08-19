@@ -52,10 +52,14 @@ Unit mapping, since a DSLR has no "gain" or millisecond-exposure control:
 
 Captures are shot RAW (CR2) — image format is forced at connect time — and
 stored as the *un-demosaiced* 16-bit Bayer mosaic: a 2-D (H, W) uint16
-array handed to the same _write_fits() the ASI controller uses. This is
-what plate solvers want (single channel, full bit depth, no interpolation);
-debayering to RGB would interpolate away real detail and triple the size
-for no astrometric benefit. Decoding needs `rawpy` (LibRaw bindings).
+array handed to the same _write_fits() the ASI controller uses (with
+self._bayer_pattern set first so the FITS gets a BAYERPAT header, matching
+how camera.py's CameraController now always requests ASI_IMG_RAW16 for the
+ASI camera — see that module's docstring for why undemosaiced is preferred
+over a demosaiced-but-bit-depth-reduced image). This is what plate solvers
+want (single channel, full bit depth, no interpolation); debayering to RGB
+would interpolate away real detail and triple the size for no astrometric
+benefit. Decoding needs `rawpy` (LibRaw bindings).
 
 The Bayer pattern travels in the FITS header as the standard BAYERPAT card,
 so external tools (Siril, ASTAP, PixInsight) debayer correctly on load, and
@@ -188,12 +192,14 @@ def _build_camera_choices(iso_choices: list[str], shutter_choices: list[str], ap
     }
 
 
-def _decode_raw_to_mono_bayer(raw_bytes: bytes) -> tuple["object", str]:
+def _decode_raw_to_mono_bayer(raw_bytes: bytes) -> tuple["object", str, int]:
     """
     Decode Canon CR2 bytes to the un-demosaiced sensor mosaic.
 
-    Returns (arr, bayer_pattern) where arr is a 2-D (H, W) uint16 array of the
-    raw Bayer data and bayer_pattern is e.g. "RGGB" describing its layout.
+    Returns (arr, bayer_pattern, bit_depth) where arr is a 2-D (H, W) uint16
+    array of the raw Bayer data, bayer_pattern is e.g. "RGGB" describing its
+    layout, and bit_depth is the sensor's native ADC depth (e.g. 14 on the
+    T3i/600D) derived from rawpy's white_level, not the uint16 container size.
 
     Deliberately does NOT demosaic. Plate solvers want single-channel data,
     and debayering to RGB both interpolates away real detail and triples the
@@ -230,7 +236,9 @@ def _decode_raw_to_mono_bayer(raw_bytes: bytes) -> tuple["object", str]:
         except Exception:
             pattern = ""
 
-    return arr, pattern
+        bit_depth = int(raw.white_level).bit_length()
+
+    return arr, pattern, bit_depth
 
 
 class _GphotoBackend:
@@ -576,9 +584,10 @@ class _GphotoBackend:
 
     def _capture_frame(self):
         """
-        Capture a RAW frame and return (arr, bayer_pattern) — a 2-D (H, W)
-        uint16 Bayer mosaic and its pattern string. See
-        _decode_raw_to_mono_bayer for why this stays un-demosaiced.
+        Capture a RAW frame and return (arr, bayer_pattern, bit_depth) — a
+        2-D (H, W) uint16 Bayer mosaic, its pattern string, and the sensor's
+        native ADC bit depth. See _decode_raw_to_mono_bayer for why this
+        stays un-demosaiced.
         """
         import gphoto2 as gp
 
@@ -1018,8 +1027,9 @@ class _DigiCamControlBackend:
 
     def _capture_frame(self):
         """
-        Trigger a RAW capture and return (arr, bayer_pattern) — a 2-D (H, W)
-        uint16 Bayer mosaic and its pattern string.
+        Trigger a RAW capture and return (arr, bayer_pattern, bit_depth) — a
+        2-D (H, W) uint16 Bayer mosaic, its pattern string, and the sensor's
+        native ADC bit depth.
 
         Unlike the gphoto2 backend (which pulls bytes straight off the camera
         over USB), digiCamControl downloads the file to its own session folder
@@ -1157,6 +1167,7 @@ class CanonCameraController(CameraController):
     def __init__(self) -> None:
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="camera-canon")
         self._is_color  = True   # every Canon EOS body has a Bayer color sensor
+        self._bayer_pattern: str | None = None   # set per-capture, see _do_capture_and_tag
 
         system = platform.system()
         if system == "Windows":
@@ -1286,13 +1297,14 @@ class CanonCameraController(CameraController):
     # ------------------------------------------------------------------
 
     def _do_capture_and_tag(self, output_path: Path, metadata: dict) -> str:
-        arr, bayer_pattern = self._backend._capture_frame()
+        arr, bayer_pattern, bit_depth = self._backend._capture_frame()
         sensor_controls = self._backend._do_get_all_controls()
-        if bayer_pattern:
-            # Consumed by the gallery preview path (_fits_to_pil in main.py)
-            # to debayer for display. The stored pixels stay un-demosaiced so
-            # plate solvers get the real mosaic — see
-            # _decode_raw_to_mono_bayer.
-            sensor_controls["Bayer Pattern"] = bayer_pattern
+        sensor_controls["Bit Depth"] = bit_depth
+        # Consumed by CameraController._write_fits (camera.py) to tag the
+        # FITS BAYERPAT header, and by the gallery preview path
+        # (_fits_to_pil in main.py) to debayer for display. The stored
+        # pixels stay un-demosaiced so plate solvers get the real mosaic —
+        # see _decode_raw_to_mono_bayer.
+        self._bayer_pattern = bayer_pattern
         self._write_fits(output_path, arr, metadata, sensor_controls)
         return str(output_path)

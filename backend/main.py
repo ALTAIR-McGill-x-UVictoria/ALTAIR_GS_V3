@@ -1133,44 +1133,44 @@ def _list_images() -> list[dict]:
     return results
 
 
-def _debayer_half_res(data, pattern: str):
+def _debayer(mosaic, pattern: str):
     """
-    Convert a raw Bayer mosaic to RGB for *preview* purposes only.
-
-    Uses 2x2 binning rather than a real demosaic: each RGGB quad becomes one
-    RGB pixel (the two greens averaged). That halves resolution but needs no
-    interpolation library, produces no colour-fringing artifacts, and is
-    plenty for a gallery thumbnail. The stored FITS keeps the full-resolution
-    mosaic untouched for plate solving — see camera_canon.py.
+    Debayer a single-channel (H, W) raw mosaic (as written by
+    CameraController._write_fits for color sensors, tagged with a BAYERPAT
+    header) into an (H, W, 3) RGB array for preview purposes only — the
+    saved FITS itself stays the untouched max-bit-depth mosaic; this is
+    strictly a display-time conversion for the gallery thumbnail/full image.
+    Uses OpenCV's bilinear demosaic (same global white balance across
+    channels — good enough for a preview, not meant for science use).
+    Returns the original mosaic unchanged if opencv-python isn't installed
+    or the pattern is unrecognized, so the gallery still renders something
+    (a grey mosaic) rather than failing to load the image at all.
     """
     import numpy as np
+    try:
+        import cv2
+    except ImportError:
+        logger.warning("Gallery: opencv not installed, cannot debayer %r preview — "
+                        "showing raw mosaic instead (pip install opencv-python-headless)", pattern)
+        return mosaic
 
-    pattern = (pattern or "RGGB").upper()
-    if len(pattern) != 4 or set(pattern) - set("RGB"):
-        pattern = "RGGB"
-
-    h, w = data.shape
-    # Trim to an even size so the 2x2 quads tile exactly.
-    data = data[: h - (h % 2), : w - (w % 2)]
-
-    # Quadrant offsets within each 2x2 cell, in pattern order.
-    quads = {
-        pattern[0]: data[0::2, 0::2],
-        pattern[1]: data[0::2, 1::2],
-        pattern[2]: data[1::2, 0::2],
-        pattern[3]: data[1::2, 1::2],
+    # cv2's COLOR_BAYER_XX2RGB codes name the pattern of the *second* row's
+    # first two pixels, which is the opposite convention from the FITS
+    # BAYERPAT keyword (which names the top-left/first-row pair) — e.g. FITS
+    # "RGGB" is cv2's BG code. This mapping already accounts for that swap.
+    code_map = {
+        "RGGB": cv2.COLOR_BayerBG2RGB,
+        "BGGR": cv2.COLOR_BayerRG2RGB,
+        "GRBG": cv2.COLOR_BayerGB2RGB,
+        "GBRG": cv2.COLOR_BayerGR2RGB,
     }
-    # Two green sites per cell — average them. Building the list by scanning
-    # the pattern keeps this correct for any of RGGB/BGGR/GRBG/GBRG.
-    greens = [data[i // 2 :: 2, i % 2 :: 2] for i, c in enumerate(pattern) if c == "G"]
-    g = (
-        np.mean(greens, axis=0)
-        if greens
-        else np.zeros_like(data[0::2, 0::2], dtype=np.float32)
-    )
-    r = quads.get("R", g)
-    b = quads.get("B", g)
-    return np.stack([r, g, b], axis=-1)
+    code = code_map.get((pattern or "").upper())
+    if code is None:
+        logger.warning("Gallery: unrecognized BAYERPAT %r, showing raw mosaic instead", pattern)
+        return mosaic
+
+    src = mosaic if mosaic.dtype in (np.uint8, np.uint16) else mosaic.astype(np.uint16)
+    return cv2.cvtColor(src, code)
 
 
 def _fits_to_pil(path: Path):
@@ -1181,7 +1181,7 @@ def _fits_to_pil(path: Path):
 
     with fits.open(path) as hdul:
         data = hdul[0].data
-        hdr = hdul[0].header
+        bayer_pattern = hdul[0].header.get("BAYERPAT")
     if data is None:
         raise ValueError("FITS file has no image data in the primary HDU")
 
@@ -1189,11 +1189,11 @@ def _fits_to_pil(path: Path):
         # Our color cube layout is (3, H, W) — CameraController._write_fits —
         # PIL wants channels-last (H, W, 3).
         data = np.moveaxis(data, 0, -1)
-    elif data.ndim == 2 and hdr.get("BAYERPAT"):
-        # Un-demosaiced colour mosaic (Canon RAW path). Displayed raw it looks
-        # like a flat grey speckle field regardless of the real scene colour,
-        # so debayer for preview only.
-        data = _debayer_half_res(data, str(hdr["BAYERPAT"]).strip())
+    elif data.ndim == 2 and bayer_pattern:
+        # Color-sensor captures are saved as the raw undemosaiced mosaic
+        # (see camera.py's module docstring) — debayer here, for preview
+        # display only, so the gallery still shows a color photo.
+        data = _debayer(data, str(bayer_pattern).strip())
 
     if data.dtype == np.uint8:
         arr = data

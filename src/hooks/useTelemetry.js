@@ -238,7 +238,9 @@ export function useTelemetry() {
               : []
             const next = batchPoints.length
               ? [...existing, ...batchPoints]
-              : [...existing, { t: timestamp, v: f.value }]
+              : typeof f.value === 'number'
+                ? [...existing, { t: timestamp, v: f.value }]
+                : existing
             updated[f.name] = next.length > HISTORY_LEN
               ? next.slice(next.length - HISTORY_LEN)
               : next

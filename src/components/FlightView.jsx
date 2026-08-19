@@ -36,9 +36,8 @@ export default function FlightView({
   const baroAlt     = fv(env, 'baro_alt',    null)
   const envTemp     = fv(env, 'temperature', null)
 
-  const voltage = fv(pwr, 'voltage_bus',   null)
-  const current = fv(pwr, 'current_total', null)
-  const pwrTemp = fv(pwr, 'temperature',   null)
+  const voltage = fv(pwr, 'voltage_24v',   null)
+  const current = fv(pwr, 'current_24v',   null)
 
   const rpm         = fv(vesc, 'rpm',             null)
   const motorTemp   = fv(vesc, 'temperature_mos', null)
@@ -175,11 +174,10 @@ export default function FlightView({
         {/* RIGHT: systems panel */}
         <div style={FL.rightPanel}>
 
-          <Card title="POWER" style={{ flexShrink: 0 }}>
-            <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:2, alignItems:'center', justifyItems:'center' }}>
-              <ArcGauge label="Voltage" value={voltage} unit="V"  min={9} max={14} warnLo={10.9} warnHi={12.9} size={80} />
+          <Card title="POWER (6S BATTERY)" style={{ flexShrink: 0 }}>
+            <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr 1fr', gap:2, alignItems:'center', justifyItems:'center' }}>
+              <ArcGauge label="Voltage" value={voltage} unit="V"  min={19.8} max={25.2} warnLo={21.0} warnHi={24.6} size={80} />
               <ArcGauge label="Current" value={current} unit="A"  min={0} max={15} warnHi={12}               size={80} />
-              <ArcGauge label="Temp"    value={pwrTemp} unit="°C" min={0} max={80} warnHi={60}               size={80} />
               <ArcGauge
                 label="Power"
                 value={voltage != null && current != null ? voltage * current : null}

@@ -34,9 +34,8 @@ export default function DashboardView({ packets, events = [], stageNames = {}, l
   const baroAlt     = fv(env, 'baro_alt',    null)
   const envTemp     = fv(env, 'temperature', null)
 
-  const voltage = fv(pwr,  'voltage_bus',   null)
-  const current = fv(pwr,  'current_total', null)
-  const pwrTemp = fv(pwr,  'temperature',   null)
+  const voltage = fv(pwr,  'voltage_24v',   null)
+  const current = fv(pwr,  'current_24v',   null)
 
   const rpm        = fv(vesc, 'rpm',             null)
   const motorTemp  = fv(vesc, 'temperature_mos', null)
@@ -216,11 +215,10 @@ export default function DashboardView({ packets, events = [], stageNames = {}, l
       {/* ── Row 2: Systems ───────────────────────────────────────────────── */}
       <div style={S.row}>
 
-        <Card title="POWER" style={{ flex:'2 1 0' }}>
-          <div style={{ flex:1, display:'grid', gridTemplateColumns:'1fr 1fr', gridTemplateRows:'1fr 1fr', gap:4, alignItems:'center', justifyItems:'center' }}>
+        <Card title="POWER (6S BATTERY)" style={{ flex:'2 1 0' }}>
+          <div style={{ flex:1, display:'grid', gridTemplateColumns:'1fr 1fr 1fr', gridTemplateRows:'1fr', gap:4, alignItems:'center', justifyItems:'center' }}>
             <ArcGauge label="Voltage" value={voltage} unit="V" min={19.8} max={25.2} warnLo={21.0} warnHi={24.6} size={100} />
             <ArcGauge label="Current" value={current} unit="A" min={0} max={15} warnHi={12} size={100} />
-            <ArcGauge label="Temp"    value={pwrTemp} unit="°C" min={0} max={80} warnHi={60} size={100} />
             <ArcGauge
               label="Power"
               value={voltage != null && current != null ? voltage * current : null}

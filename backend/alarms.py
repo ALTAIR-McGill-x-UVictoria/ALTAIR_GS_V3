@@ -25,7 +25,7 @@ from __future__ import annotations
 # Threshold rule:
 # {
 #   "label":    str,          # packet label (e.g. "Power")
-#   "field":    str,          # field name (e.g. "voltage_bus")
+#   "field":    str,          # field name (e.g. "voltage_24v")
 #   "type":     "threshold",
 #   "min":      float | None, # lower hard limit (None = no lower limit)
 #   "max":      float | None, # upper hard limit (None = no upper limit)
@@ -61,30 +61,21 @@ ALARM_RULES: list[dict] = [
     # ── Power ──────────────────────────────────────────────────────────────
     {
         "label":   "Power",
-        "field":   "voltage_bus",
+        "field":   "voltage_24v",
         "type":    "threshold",
-        "min":     10.5,    # LiPo 3S cutoff ~10.5 V
-        "max":     13.1,    # overcharge threshold
+        "min":     19.8,    # LiPo 6S cutoff ~3.3 V/cell
+        "max":     25.2,    # 6S full-charge ~4.2 V/cell
         "margin":  0.10,    # warn within 10% of limit
-        "message": "Bus voltage out of range",
+        "message": "Battery voltage out of range",
     },
     {
         "label":   "Power",
-        "field":   "current_total",
+        "field":   "current_24v",
         "type":    "threshold",
         "min":     None,
         "max":     15.0,    # A — system rated limit
         "margin":  0.15,
-        "message": "Total current draw too high",
-    },
-    {
-        "label":   "Power",
-        "field":   "temperature",
-        "type":    "threshold",
-        "min":     None,
-        "max":     70.0,    # degC — power board rated max
-        "margin":  0.15,
-        "message": "Power board temperature high",
+        "message": "Battery current draw too high",
     },
 
     # ── VESC ───────────────────────────────────────────────────────────────

@@ -5,11 +5,17 @@ Wraps the `zwoasi` library (which in turn wraps ASICamera2.dll) to
 provide async-safe camera capture. All blocking calls run in a
 ThreadPoolExecutor so they never stall the FastAPI event loop.
 
-Color sensors capture as demosaiced 8-bit RGB (ASI_IMG_RGB24) rather than
-the raw single-channel Bayer mosaic — the raw mosaic looks like a flat grey
-speckle field to any viewer that doesn't demosaic it, even though the sensor
-is genuinely responding to color. Mono sensors have no Bayer filter and
-capture as native 16-bit (ASI_IMG_RAW16). See CameraController._do_connect.
+All sensors capture at their native maximum bit depth via ASI_IMG_RAW16 —
+including color (Bayer-filtered) sensors, which means the saved data is the
+raw undemosaiced single-channel mosaic (each pixel only R, G, or B) rather
+than baked-in RGB. This preserves the sensor's full ADC range (e.g. 12-bit
+on the ASI585MC Pro, padded into 16-bit words) instead of discarding it for
+an in-driver demosaic to 8-bit/channel RGB24. The mosaic looks like a flat
+grey speckle field to any viewer that doesn't know to demosaic it, even
+though brightness still tracks real scene color correctly — the FITS header
+records the Bayer pattern (BAYERPAT) so downstream tools (Siril, PixInsight,
+DS9, or this repo's own gallery preview in backend/main.py) can debayer it.
+See CameraController._do_connect.
 
 Captures are saved as FITS (via astropy.io.fits) rather than TIFF+EXIF —
 the standard format for astronomical/scientific imaging, and directly
@@ -99,6 +105,17 @@ _CONTROL_NAMES = [
     "ASI_ANTI_DEW_HEATER",
 ]
 
+# zwoasi's get_camera_property()["BayerPattern"] is the ASI SDK's
+# ASI_BAYER_PATTERN enum (ASI_BAYER_RG=0, BG=1, GR=2, GB=3), naming the
+# color of the top-left 2x2 pixel pair. Mapped here to the 4-character FITS
+# BAYERPAT convention (e.g. "RGGB") that debayering tools expect.
+_BAYER_PATTERN_NAMES = {
+    0: "RGGB",
+    1: "BGGR",
+    2: "GRBG",
+    3: "GBRG",
+}
+
 
 class CameraController:
     """Thread-safe async wrapper around a ZWO ASI camera."""
@@ -118,6 +135,7 @@ class CameraController:
         self._exposure_ms = 1000
         self._camera_name = ""
         self._is_color    = False
+        self._bayer_pattern: str | None = None
 
     # ------------------------------------------------------------------
     # Connection lifecycle
@@ -174,21 +192,23 @@ class CameraController:
         self._camera_name = info.get("Name", "ZWO ASI")
         cam.set_control_value(zwoasi.ASI_GAIN,     self._gain)
         cam.set_control_value(zwoasi.ASI_EXPOSURE, self._exposure_ms * 1000)
-        # Color sensors (Bayer-filtered) capture as raw single-channel mosaic
-        # data in RAW16 mode — every pixel is only R, G, or B, so any viewer
-        # that doesn't know to demosaic it (including ours) just shows a flat
-        # grey/speckled image regardless of the actual scene color, even
-        # though brightness still tracks real light correctly. ASI_IMG_RGB24
-        # asks the SDK to demosaic in-driver and hand back real 3-channel
-        # color (8-bit/channel instead of RAW16's native 16-bit, but usable
-        # color beats unusable higher bit depth). Mono sensors have no Bayer
-        # filter — RAW16 is already correct there, so only switch for color.
+        # Always capture at the sensor's native max bit depth (RAW16, which
+        # returns however many bits the ADC actually has — e.g. 12-bit on
+        # the ASI585MC Pro — zero-padded into 16-bit words). For a color
+        # (Bayer-filtered) sensor this is the raw undemosaiced single-channel
+        # mosaic, not RGB — see the module docstring. We record which Bayer
+        # pattern it is here so _write_fits can tag BAYERPAT in the header
+        # for downstream debayering (Siril/PixInsight/DS9, or this repo's
+        # gallery preview in backend/main.py:_fits_to_pil).
         self._is_color = bool(info.get("IsColorCam", False))
-        cam.set_image_type(zwoasi.ASI_IMG_RGB24 if self._is_color else zwoasi.ASI_IMG_RAW16)
+        cam.set_image_type(zwoasi.ASI_IMG_RAW16)
+        if self._is_color:
+            self._bayer_pattern = _BAYER_PATTERN_NAMES.get(info.get("BayerPattern"))
         self._camera = cam
         self.connected = True
         logger.info("ZWO camera connected: %s (%s)", self._camera_name,
-                    "color sensor, RGB24" if self._is_color else "mono sensor, RAW16")
+                    f"color sensor, RAW16 mosaic ({self._bayer_pattern})" if self._is_color
+                    else "mono sensor, RAW16")
 
     async def disconnect(self) -> None:
         loop = asyncio.get_event_loop()
@@ -313,28 +333,20 @@ class CameraController:
         return saved_path
 
     def _do_capture_and_tag(self, output_path: Path, metadata: dict) -> str:
-        import numpy as np
-
-        # 1. Capture the raw frame array directly via zwoasi (no filename=
-        #    kwarg — that path round-trips through a PIL-saved file, which
-        #    we don't want since we're writing FITS instead).
+        # Capture the raw frame array directly via zwoasi (no filename=
+        # kwarg — that path round-trips through a PIL-saved file, which we
+        # don't want since we're writing FITS instead). RAW16 mode always
+        # hands back a single-channel (H, W) array, mono or Bayer mosaic.
         arr = self._camera.capture()
-        if arr.ndim == 3:
-            # zwoasi hands back color data in BGR order — the R<->B swap to
-            # RGB only happens inside its own filename-save branch, which
-            # we're bypassing, so do it ourselves. Then move the color axis
-            # first: (H, W, 3) -> (3, H, W), the standard FITS color-cube layout.
-            arr = arr[:, :, ::-1]
-            arr = np.ascontiguousarray(np.moveaxis(arr, -1, 0))
         logger.info("ZWO: captured frame → %s", output_path)
 
-        # 2. Read all sensor controls immediately after capture
+        # Read all sensor controls immediately after capture
         sensor_controls = self._do_get_all_controls()
 
-        # 3. Write FITS with metadata header — a write failure here means no
-        #    file was saved at all (unlike the old TIFF+EXIF flow, where a
-        #    failed EXIF injection still left a usable TIFF behind), so this
-        #    is allowed to propagate rather than being logged-and-swallowed.
+        # Write FITS with metadata header — a write failure here means no
+        # file was saved at all (unlike the old TIFF+EXIF flow, where a
+        # failed EXIF injection still left a usable TIFF behind), so this
+        # is allowed to propagate rather than being logged-and-swallowed.
         self._write_fits(output_path, arr, metadata, sensor_controls)
 
         return str(output_path)
@@ -378,10 +390,9 @@ class CameraController:
         # BAYERPAT is the de-facto standard card for "this 2-D frame is an
         # un-demosaiced colour mosaic" — Siril, ASTAP, PixInsight et al. read
         # it to debayer on load. Written whenever the capture path reported a
-        # pattern (currently the Canon RAW path; see camera_canon.py).
-        bayer = sensor.get("Bayer Pattern")
-        if bayer and arr.ndim == 2:
-            hdr["BAYERPAT"] = (str(bayer), "Bayer colour filter array pattern")
+        # pattern (ASI color sensors always; Canon RAW path via rawpy).
+        if self._bayer_pattern:
+            hdr["BAYERPAT"] = (self._bayer_pattern, "Bayer mosaic pattern; data is undemosaiced RAW")
 
         self._apply_metadata_headers(hdr, meta, sensor)
 
@@ -541,8 +552,8 @@ class EmulatedCameraController(CameraController):
         "Pixel Size um":  3.75,
         "Max Width px":   1920,
         "Max Height px":  1080,
-        "Bit Depth":      16,
-        "Is Color":       False,
+        "Bit Depth":      12,
+        "Is Color":       True,
         "Has Cooler":     False,
         "Has ST4 Port":   False,
         "Temperature":    24.5,
@@ -552,6 +563,12 @@ class EmulatedCameraController(CameraController):
         self._camera_name = "Emulated ASI Camera"
         self._camera = "emulated"   # sentinel — truthy, never dereferenced as a real handle
         self.connected = True
+        self._is_color = True
+        # Fixed pattern (not queried from real hardware) — just needs to be
+        # a valid BAYERPAT value so the gallery's debayer preview path
+        # (backend/main.py:_fits_to_pil) gets exercised the same way real
+        # ASI/Canon color captures do.
+        self._bayer_pattern = "RGGB"
         logger.info("Emulated camera connected: %s", self._camera_name)
 
     async def disconnect(self) -> None:
@@ -574,10 +591,11 @@ class EmulatedCameraController(CameraController):
 
     def _do_capture_and_tag(self, output_path: Path, metadata: dict) -> str:
         import numpy as np
-        # Synthetic 8-bit RGB noise frame — same shape/dtype a real color
-        # sensor in RGB24 mode would produce, so the FITS-write and gallery-
-        # preview paths get exercised the same way as real hardware.
-        arr = np.random.randint(0, 256, size=(3, 1080, 1920), dtype=np.uint8)
+        # Synthetic 12-bit-in-uint16 Bayer mosaic — same shape/dtype/BAYERPAT
+        # tagging a real color sensor in RAW16 mode would produce, so the
+        # FITS-write and gallery debayer-preview paths get exercised the
+        # same way as real hardware.
+        arr = np.random.randint(0, 4096, size=(1080, 1920), dtype=np.uint16)
         logger.info("Emulated: synthesized frame -> %s", output_path)
 
         sensor_controls = self._do_get_all_controls()

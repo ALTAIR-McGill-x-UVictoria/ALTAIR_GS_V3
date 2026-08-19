@@ -11,11 +11,16 @@ opentelemetry-exporter-otlp-proto-http>=1.27.0
 # non-pip binaries these need: ASI SDK shared library, ASCOM Platform).
 # Captures are saved as FITS (astropy.io.fits) — the standard astronomical
 # image format — with metadata in the header instead of EXIF. Pillow is
-# still needed for the gallery's FITS-to-JPEG preview generation.
+# still needed for the gallery's FITS-to-JPEG preview generation. Color
+# sensors capture the raw undemosaiced Bayer mosaic at native bit depth
+# (see camera.py's module docstring) — opencv-python-headless is used
+# purely to debayer that mosaic into a color preview for the gallery
+# (backend/main.py:_debayer); the saved FITS itself never touches it.
 nexstar>=0.0.5
 zwoasi>=0.2.0
 astropy>=6.0.0
 Pillow>=10.0.0
+opencv-python-headless>=4.9.0
 pywin32>=306; sys_platform == "win32"
 
 # Direct AM3/AM5 mount control over INDI (Linux-friendly alternative to the

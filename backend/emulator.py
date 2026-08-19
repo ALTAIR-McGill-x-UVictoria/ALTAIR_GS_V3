@@ -366,7 +366,7 @@ def _environment_value(field_name: str, t: float) -> float:
     return None   # sentinel — caller falls back to sine wave
 
 
-def _heartbeat_value(field_name: str, t: float) -> float:
+def _heartbeat_value(field_name: str, t: float) -> float | str:
     """Heartbeat uses realistic system-metric values."""
     if field_name == "time_unix":
         return time.time()
@@ -379,6 +379,9 @@ def _heartbeat_value(field_name: str, t: float) -> float:
         return 40.0 + 40.0 * math.sin(2 * math.pi * t / _SWEEP_PERIOD + 1.0)
     if field_name == "tasks_running":
         return 5.0
+    if field_name == "log_dir":
+        # t is elapsed emulator time; back it out to get the wall-clock start.
+        return time.strftime("%Y-%m-%d_%H-%M-%SZ", time.gmtime(time.time() - t))
     return 0.0
 
 
@@ -472,7 +475,8 @@ class PacketEmulator:
                 phase = i * (2 * math.pi / max(len(entry["fields"]), 1))
                 value = base + amplitude * math.sin(2 * math.pi * t / _SWEEP_PERIOD + phase)
 
-            fields.append({**fd, "value": round(value, 6)})
+            rounded = value if isinstance(value, str) else round(value, 6)
+            fields.append({**fd, "value": rounded})
 
         return {
             "type":      "packet",

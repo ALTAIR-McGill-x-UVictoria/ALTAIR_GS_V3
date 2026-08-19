@@ -381,6 +381,10 @@ class CameraController:
         hdr["CREATOR"]  = "ALTAIR V2 Ground Station"
         if arr.ndim == 3:
             hdr["CTYPE3"] = ("RGB", "Axis 3 = color plane (R, G, B)")
+        # BAYERPAT is the de-facto standard card for "this 2-D frame is an
+        # un-demosaiced colour mosaic" — Siril, ASTAP, PixInsight et al. read
+        # it to debayer on load. Written whenever the capture path reported a
+        # pattern (ASI color sensors always; Canon RAW path via rawpy).
         if self._bayer_pattern:
             hdr["BAYERPAT"] = (self._bayer_pattern, "Bayer mosaic pattern; data is undemosaiced RAW")
 

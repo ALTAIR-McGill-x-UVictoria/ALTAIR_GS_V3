@@ -160,16 +160,28 @@ indi_getprop -h <indiserver-host> -p 7624
 If a property name doesn't match what `IndiMountController` expects, adjust
 `EQUATORIAL_EOD_COORD`/`ON_COORD_SET` in `backend/mount.py`.
 
-## 5. Canon EOS Rebel T3i via libgphoto2 (test alternative to the ZWO camera)
+## 5. Canon EOS Rebel T3i (test alternative to the ZWO camera)
 
 `backend/camera_canon.py` (`CanonCameraController`) is a test path for
 using a Canon Rebel T3i/600D DSLR as the telescope sensor instead of the
 ASI585MC, mainly to compare the T3i's much larger APS-C sensor against the
-ASI585MC's small-format one. It talks to the camera over USB via
-[libgphoto2](http://www.gphoto.org/) — the standard tethered-DSLR-control
-library on Linux/macOS/Windows — through the `gphoto2` PyPI package (Python
-bindings around libgphoto2, **not** related to the `zwoasi` package used for
-the ASI camera).
+ASI585MC's small-format one. It picks one of two backends automatically by
+`platform.system()` — the public interface and FITS output are identical
+either way, so nothing else in the backend needs to know which one is active.
+
+**Select it (either platform):** set `ALTAIR_CAMERA_TYPE=canon` before
+starting the backend (default is `zwo`):
+
+```bash
+ALTAIR_CAMERA_TYPE=canon python -m backend.main
+```
+
+### Linux / macOS backend — libgphoto2
+
+Talks to the camera over USB via [libgphoto2](http://www.gphoto.org/) —
+the standard tethered-DSLR-control library — through the `gphoto2` PyPI
+package (Python bindings around libgphoto2, **not** related to the
+`zwoasi` package used for the ASI camera).
 
 **Install:**
 
@@ -181,16 +193,6 @@ pip install gphoto2
 # macOS
 brew install libgphoto2
 pip install gphoto2
-```
-
-There is no first-class Windows build of libgphoto2; using the T3i path on
-Windows is unsupported today (the ZWO/ASI path remains the Windows option).
-
-**Select it:** set `ALTAIR_CAMERA_TYPE=canon` before starting the backend
-(default is `zwo`):
-
-```bash
-ALTAIR_CAMERA_TYPE=canon python -m backend.main
 ```
 
 **Known Linux gotcha — gvfs auto-mount steals the USB connection.** Most
@@ -208,15 +210,74 @@ killall gvfsd-gphoto2 gvfs-gphoto2-volume-monitor
 Communication/USB setting is **PTP** ("PC Connection" on the T3i), not Mass
 Storage — libgphoto2 needs PTP mode.
 
-**What's implemented / not:** capture forces JPEG output (no CR2/RAW
-decode dependency), ISO and shutter speed are snapped to the nearest value
-the camera actually offers (`gain`/`exposure_ms` in the shared
-`CameraController` API map to ISO / shutter speed respectively — see the
-module docstring in `camera_canon.py`), and exposures are capped at the
-camera's slowest fixed shutter speed (usually 30s) — **bulb mode for
-longer exposures is not implemented.** Captured frames still go through the
-same FITS-writing pipeline as the ASI camera, so the gallery, raw-pixel
-export, and metadata headers all work identically either way.
+### Windows backend — digiCamControl
+
+There is no first-class Windows build of libgphoto2, so on Windows
+(`platform.system() == "Windows"`) this module instead drives
+[digiCamControl](http://digicamcontrol.com/) — a free, open-source Windows
+DSLR tethering application — over its built-in local HTTP remote-control
+server, using only the Python standard library (`urllib`). No extra pip
+package is required.
+
+**Install:**
+
+1. Download and install digiCamControl from
+   [digicamcontrol.com](http://digicamcontrol.com/) (or its GitHub
+   releases page).
+2. Connect the T3i via USB. On the camera, set Communication/USB to
+   **PTP** ("PC Connection"), not Mass Storage.
+3. Launch digiCamControl and confirm the T3i appears in its camera list.
+4. In digiCamControl: **Settings → Web Server → Enable web server**
+   (default `http://127.0.0.1:5513`). Leave digiCamControl running in the
+   background — this backend talks to that server, it does not launch or
+   manage the digiCamControl process itself.
+
+If your web server listens on a non-default host/port, override it with
+`ALTAIR_DIGICAMCONTROL_URL` (e.g. `http://127.0.0.1:5513`) before starting
+the backend.
+
+**Troubleshooting:** if `connect()` reports it can't reach the server,
+confirm digiCamControl is running and the web server is enabled. If it
+reaches the server but reports no camera, check digiCamControl's own UI
+for the camera — a USB mode other than PTP, a loose cable, or another app
+(including a second digiCamControl instance) already holding the USB
+connection are the usual causes.
+
+### What's implemented / not (both backends)
+
+**RAW capture.** Both backends force the camera into RAW (CR2) mode at
+connect time and store the **un-demosaiced 16-bit Bayer mosaic** as a 2-D
+FITS image. This is what plate solvers want: single-channel, full bit
+depth, no interpolation. Decoding uses `rawpy` (`pip install rawpy`,
+prebuilt wheels on all platforms).
+
+The Bayer pattern is recorded in the FITS header as the standard
+`BAYERPAT` card (plus a `HIERARCH ALTAIR SENSOR BAYER PATTERN` copy), so
+Siril / ASTAP / PixInsight will debayer the file correctly on load. The
+gallery debayers **for preview only** (2x2 binned to half resolution) —
+the stored pixels are never modified, and `/api/gallery/rawpixels` still
+serves the true mosaic.
+
+Note the mosaic is colour-filtered, so a star's flux is split across the
+RGGB quad. Solvers handle this fine, but the data is not photometric.
+
+**Not implemented:** RAW+JPEG simultaneous capture (RAW only, since the
+gallery regenerates previews from the FITS), and **bulb mode** — exposures
+are capped at the camera's slowest fixed shutter speed, usually 30s.
+
+ISO and shutter speed are snapped to the nearest value the camera actually
+offers (`gain`/`exposure_ms` in the shared `CameraController` API map to
+ISO / shutter speed respectively — see the module docstring in
+`camera_canon.py`). Captured frames go through the same FITS-writing
+pipeline as the ASI camera, so metadata headers work identically
+regardless of camera or platform.
+
+**digiCamControl caveat (Windows).** Because its HTTP interface serves a
+decoded preview rather than the original raw bytes, the Windows backend
+reads the CR2 **from digiCamControl's session folder on disk**. That
+folder must be readable by the backend process. If digiCamControl is
+configured to save JPEG, capture fails with an explicit error rather than
+silently storing unsolvable data.
 
 ## Quick reference: what needs installing where
 
@@ -224,6 +285,7 @@ export, and metadata headers all work identically either way.
 |-------------------|-------------------------------|------------------------------------------------------|----------|
 | ZWO camera        | `zwoasi`, `astropy`, `Pillow` | ASI SDK shared library (this dir, or `apt install libasicamera2` on Linux) | any      |
 | Canon T3i (test)  | `gphoto2`                     | `libgphoto2-dev` (system package)                    | Linux/macOS |
+| Canon T3i (test)  | none (stdlib `urllib`)        | [digiCamControl](http://digicamcontrol.com/) running with its web server enabled | Windows |
 | NexStar mount     | `nexstar`                     | USB-serial driver for your cable, if needed          | any      |
 | AM5 mount (ASCOM) | `pywin32`                     | ASCOM Platform + ZWO ASCOM driver                    | Windows  |
 | AM3/AM5 mount (INDI) | none (stdlib `socket`)     | `indi-full`/`indi-bin` (`indi_lx200am5`) + `indiserver` | Linux    |

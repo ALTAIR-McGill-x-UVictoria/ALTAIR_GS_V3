@@ -30,12 +30,18 @@ Unit mapping, since a DSLR has no "gain" or millisecond-exposure control:
                           than driving bulb mode — true bulb (mirror-lock,
                           manual timed release) is not implemented here.
 
-Captures are downloaded as JPEG (imageformat is forced to the camera's
-"Large Fine JPEG" equivalent at connect time, when that config option
-exists) rather than CR2 RAW, so no extra RAW-decode dependency (rawpy/
-libraw) is needed. The JPEG is decoded to an (3, H, W) uint8 array and
-handed to the same _write_fits() the ASI controller uses, so gallery
-preview, raw-pixel export, and metadata headers all work identically
+Captures are downloaded as CR2 RAW (imageformat is forced to the camera's
+plain "RAW" choice at connect time, when that config option exists) rather
+than JPEG, to get the sensor's native bit depth (14-bit on the T3i/600D)
+instead of an in-camera-processed 8-bit JPEG. The CR2 is decoded with
+`rawpy` (wraps libraw — `pip install rawpy`) to the raw, undemosaiced
+single-channel Bayer mosaic (`raw_image_visible`), matching how camera.py's
+CameraController now always requests ASI_IMG_RAW16 for the ASI camera —
+see that module's docstring for why undemosaiced is preferred over a
+demosaiced-but-bit-depth-reduced image. The mosaic is handed to the same
+_write_fits() the ASI controller uses (with self._bayer_pattern set first
+so the FITS gets a BAYERPAT header), so gallery preview (which debayers for
+display), raw-pixel export, and metadata headers all work identically
 regardless of which camera produced the frame.
 """
 from __future__ import annotations
@@ -101,6 +107,7 @@ class CanonCameraController(CameraController):
         self._exposure_ms     = 1000    # shutter time; matched to nearest supported speed
         self._camera_name     = ""
         self._is_color        = True    # every Canon EOS body has a Bayer color sensor
+        self._bayer_pattern: str | None = None   # set per-capture from rawpy, see _do_capture_and_tag
         self._iso_choices: list[str]     = []
         self._shutter_choices: list[str] = []
 
@@ -132,19 +139,27 @@ class CanonCameraController(CameraController):
 
         config = camera.get_config()
 
-        # Force JPEG output so capture doesn't need a CR2/RAW decoder.
+        # Force plain RAW output (not "RAW + JPEG", which would double the
+        # per-shot transfer and leave an orphan JPEG on the card) so capture
+        # gets the sensor's native bit depth instead of an in-camera 8-bit
+        # JPEG. Preference order: a choice that says "raw" but not "+" (i.e.
+        # RAW-only, not a RAW+JPEG combo) first, then any "raw" choice as a
+        # fallback if that's all the body offers.
         fmt_widget = self._get_child(config, _FORMAT_NAMES)
         if fmt_widget is not None:
             try:
                 choices = list(fmt_widget.get_choices())
-                jpeg_choice = next(
-                    (c for c in choices if "jpeg" in c.lower() and "fine" in c.lower()),
-                    next((c for c in choices if "jpeg" in c.lower()), None),
+                raw_choice = next(
+                    (c for c in choices if "raw" in c.lower() and "+" not in c),
+                    next((c for c in choices if "raw" in c.lower()), None),
                 )
-                if jpeg_choice is not None:
-                    fmt_widget.set_value(jpeg_choice)
+                if raw_choice is not None:
+                    fmt_widget.set_value(raw_choice)
+                else:
+                    logger.warning("Canon: no RAW image format choice found among %r — "
+                                    "captures will stay in the camera's current format", choices)
             except Exception:
-                logger.debug("Canon: could not force JPEG image format", exc_info=True)
+                logger.debug("Canon: could not force RAW image format", exc_info=True)
 
         iso_widget     = self._get_child(config, _ISO_NAMES)
         shutter_widget = self._get_child(config, _SHUTTER_NAMES)
@@ -323,8 +338,7 @@ class CanonCameraController(CameraController):
         import io as _io
 
         import gphoto2 as gp
-        import numpy as np
-        from PIL import Image
+        import rawpy
 
         file_path = self._camera.capture(gp.GP_CAPTURE_IMAGE)
         cam_file = self._camera.file_get(file_path.folder, file_path.name, gp.GP_FILE_TYPE_NORMAL)
@@ -337,11 +351,37 @@ class CanonCameraController(CameraController):
         except Exception:
             logger.debug("Canon: could not delete frame from camera storage", exc_info=True)
 
-        img = Image.open(_io.BytesIO(raw_bytes)).convert("RGB")
-        arr = np.asarray(img)                                  # (H, W, 3) uint8
-        arr = np.ascontiguousarray(np.moveaxis(arr, -1, 0))     # -> (3, H, W), matches base FITS layout
+        # Decode the CR2 with rawpy/libraw to the raw, undemosaiced Bayer
+        # mosaic at the sensor's native bit depth (uint16-packed; 14-bit on
+        # the T3i/600D) — NOT rawpy's postprocess()/dcraw path, which would
+        # demosaic and tone-map down to an 8-bit-per-channel RGB image and
+        # throw away exactly the bit depth we're capturing RAW to keep.
+        # raw_image_visible excludes the sensor's masked/optical-black
+        # border pixels that raw_image includes.
+        with rawpy.imread(_io.BytesIO(raw_bytes)) as raw:
+            arr = raw.raw_image_visible.copy()                  # (H, W) uint16 Bayer mosaic
+            self._bayer_pattern = self._rawpy_bayer_pattern(raw)
+            bit_depth = int(raw.white_level).bit_length()
 
         sensor_controls = self._do_get_all_controls()
+        sensor_controls["Bit Depth"] = bit_depth
+
         self._write_fits(output_path, arr, metadata, sensor_controls)
 
         return str(output_path)
+
+    @staticmethod
+    def _rawpy_bayer_pattern(raw) -> str | None:
+        """
+        Build a 4-character FITS BAYERPAT string (e.g. "RGGB") from rawpy's
+        2x2 raw_pattern index grid + color_desc name table, matching the
+        convention camera.py uses for the ASI camera's BayerPattern.
+        """
+        try:
+            return "".join(
+                chr(raw.color_desc[raw.raw_pattern[row, col]])
+                for row in range(2) for col in range(2)
+            )
+        except Exception:
+            logger.debug("Canon: could not determine Bayer pattern from rawpy", exc_info=True)
+            return None

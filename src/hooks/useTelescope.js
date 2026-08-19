@@ -13,13 +13,17 @@ const WS_URL = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.ho
  *   wsReady         — bool
  *   tracking        — latest { azimuth, elevation, ra_hours, dec_deg, distance_m, slant_m, ... } | null
  *   mountStatus     — { connected, mount_type, port, position } | null
- *   cameraStatus    — { connected, gain, exposure_ms } | null
+ *   cameraStatus    — { connected, camera_type, camera_name, gain, exposure_ms } | null
  *   trackingEnabled    — bool
  *   autoCaptureEnabled — bool
  *   actions         — { connectMount, disconnectMount, gotoMount,
  *                       setTracking,
  *                       connectCamera, disconnectCamera,
- *                       setCameraSettings, captureFrame, setAutoCapture }
+ *                       setCameraSettings, refreshCameraSettings, captureFrame, setAutoCapture,
+ *                       solveFrame(filename, signal?) — pass an
+ *                       AbortController's signal to allow cancelling the
+ *                       wait; the astrometry.net job itself may still run
+ *                       to completion server-side regardless. }
  */
 export function useTelescope() {
   const ws             = useRef(null)
@@ -82,11 +86,12 @@ export function useTelescope() {
   // REST helpers
   // ------------------------------------------------------------------
 
-  async function post(path, body = {}) {
+  async function post(path, body = {}, signal = undefined) {
     const res = await apiFetch(path, {
       method:  'POST',
       headers: { 'Content-Type': 'application/json' },
       body:    JSON.stringify(body),
+      signal,
     })
     return res.json()
   }
@@ -97,11 +102,16 @@ export function useTelescope() {
     disconnectMount:   ()          => post('/api/telescope/mount/disconnect'),
     gotoMount:         (coords)    => post('/api/telescope/mount/goto', coords),
     setTracking:       (enabled)   => post('/api/telescope/tracking', { enabled }),
-    connectCamera:     ()          => post('/api/telescope/camera/connect'),
+    connectCamera:     (cameraType) => post('/api/telescope/camera/connect',
+                         cameraType ? { camera_type: cameraType } : {}),
     disconnectCamera:  ()          => post('/api/telescope/camera/disconnect'),
     setCameraSettings: (settings)  => post('/api/telescope/camera/settings', settings),
+    refreshCameraSettings: ()      => post('/api/telescope/camera/refresh_settings'),
     captureFrame:      (filename)   => post('/api/telescope/camera/capture', { filename }),
     setAutoCapture:    (enabled)   => post('/api/telescope/camera/auto_capture', { enabled }),
+    solveFrame:        (filename, signal) => post('/api/telescope/solve', { filename }, signal),
+    applySolveCorrection: (raHours, decDeg) => post('/api/telescope/solve/apply',
+                         { ra_hours: raHours, dec_deg: decDeg }),
   }
 
   return { wsReady, tracking, mountStatus, cameraStatus, trackingEnabled, autoCaptureEnabled, actions }

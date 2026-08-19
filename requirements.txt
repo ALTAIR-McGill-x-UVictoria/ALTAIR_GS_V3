@@ -41,3 +41,9 @@ gphoto2>=2.5.0; sys_platform != "win32"
 # for plate solving; rawpy (LibRaw bindings) does the CR2 -> array decode.
 # Ships prebuilt wheels for Windows/Linux/macOS.
 rawpy>=0.22.0
+
+# backend/solve_check.py (offline plate-solve harness, not used by the running
+# app) submits captures to the astrometry.net web API via astroquery's
+# AstrometryNet client -- see that module's docstring for why the web solver
+# is used instead of a local ASTAP install.
+astroquery>=0.4.7

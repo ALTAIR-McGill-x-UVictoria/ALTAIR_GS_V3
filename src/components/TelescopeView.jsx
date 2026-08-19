@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { useTelescope } from '../hooks/useTelescope'
 import { useSerial } from '../hooks/useSerial'
 
@@ -48,6 +48,15 @@ function Section({ title, children }) {
 // number <input>'s displayed text to get stuck with a leading zero.
 function stripLeadingZero(v) {
   return v.replace(/^0+(?=\d)/, '')
+}
+
+// Looks up the "seconds" the backend already parsed for a shutter choice
+// (see backend/camera_canon.py: _build_iso_shutter_choices) instead of
+// re-parsing "1/125"-style strings here — Bulb has no numeric value and
+// isn't settable via this dropdown (see the ⚠ reliability flag).
+function canonShutterSeconds(value, shutterChoices) {
+  const found = (shutterChoices || []).find(s => s.value === value)
+  return found ? found.seconds : null
 }
 
 function Row({ label, value, unit }) {
@@ -115,8 +124,12 @@ export default function TelescopeView() {
 
   const [mountPort,    setMountPort]   = useState('')
   const [mountType,    setMountType]   = useState('nexstar')
+  const [cameraType,   setCameraType]  = useState('zwo')
   const [gain,         setGain]        = useState('150')
   const [exposureMs,   setExposureMs]  = useState('1000')
+  const [canonIso,      setCanonIso]      = useState('100')
+  const [canonShutter,  setCanonShutter]  = useState('1/125')
+  const [canonAperture, setCanonAperture] = useState('')
   const [manualAz,     setManualAz]    = useState('')
   const [manualEl,     setManualEl]    = useState('')
   const [manualRa,     setManualRa]    = useState('')
@@ -124,6 +137,14 @@ export default function TelescopeView() {
   const [capturePath,  setCapturePath] = useState('')
   const [lastCapture,  setLastCapture] = useState(null)
   const [busy,         setBusy]        = useState(false)
+  const [solving,      setSolving]     = useState(false)
+  const [solveResult,  setSolveResult] = useState(null)
+  const [solveError,   setSolveError]  = useState(null)
+  const [applyArmed,   setApplyArmed]  = useState(false)
+  const [applying,     setApplying]    = useState(false)
+  const [applyError,   setApplyError]  = useState(null)
+  const [applyDone,    setApplyDone]   = useState(false)
+  const solveAbortRef = useRef(null)
   const [images,       setImages]      = useState([])
   const [activeIndex,  setActiveIndex] = useState(0)
   const [sidebarOpen,  setSidebarOpen] = useState(true)
@@ -172,6 +193,49 @@ export default function TelescopeView() {
   const activeMountType = mountStatus?.mount_type ?? mountType
   const cameraConnected = cameraStatus?.connected ?? false
   const activeImg       = images[activeIndex]
+
+  // cameraStatus.camera_type ("zwo"/"canon") is the source of truth once
+  // connected. Before that, fall back to the pending selection so the
+  // ISO/shutter labels and hint below are right immediately, without
+  // waiting on a round trip. ZWO's gain is a real sensor gain in dB-ish
+  // arbitrary units; the Canon backend (camera_canon.py) reinterprets the
+  // same gain/exposure_ms fields as ISO and shutter speed, snapped
+  // server-side to the nearest value the camera actually offers — see that
+  // module's docstring.
+  const activeCameraType = cameraStatus?.camera_type ?? cameraType
+  const isCanon = activeCameraType === 'canon'
+
+  // Keep the ISO/shutter dropdowns pointed at whatever the camera actually
+  // reports (on connect, and after any external change — e.g. another
+  // client's Apply) rather than a stale default that may not even be in
+  // the current choice list.
+  useEffect(() => {
+    if (!isCanon || !cameraStatus?.connected) return
+    if (cameraStatus.gain !== undefined && String(cameraStatus.gain) !== canonIso) {
+      setCanonIso(String(cameraStatus.gain))
+    }
+    const shutterChoices = cameraStatus.shutter || []
+    if (shutterChoices.length && !shutterChoices.some(s => s.value === canonShutter)) {
+      const closest = shutterChoices.reduce((best, s) => {
+        if (s.seconds == null) return best
+        const target = (cameraStatus.exposure_ms || 0) / 1000
+        return (best == null || Math.abs(s.seconds - target) < Math.abs(best.seconds - target)) ? s : best
+      }, null)
+      if (closest) setCanonShutter(closest.value)
+    }
+    if (cameraStatus.aperture && cameraStatus.aperture !== canonAperture) {
+      const apertureChoices = cameraStatus.aperture_choices || []
+      // The camera can report aperture in a different string form than the
+      // choices list uses (e.g. bare "8.0" vs "ƒ/8.0" — see
+      // _set_aperture's docstring in camera_canon.py) — match by parsed
+      // f-stop value rather than exact string so the dropdown still lands
+      // on the right option.
+      const reported = parseFloat(String(cameraStatus.aperture).replace(/[^\d.]/g, ''))
+      const match = apertureChoices.find(v => v === cameraStatus.aperture)
+        || apertureChoices.find(v => parseFloat(v.replace(/[^\d.]/g, '')) === reported)
+      if (match) setCanonAperture(match)
+    }
+  }, [isCanon, cameraStatus]) // eslint-disable-line react-hooks/exhaustive-deps
 
   return (
     <div style={styles.root}>
@@ -353,11 +417,20 @@ export default function TelescopeView() {
             </span>
           </div>
           <div style={{ ...styles.inputRow, marginTop: 8 }}>
+            <select
+              style={{ ...styles.input, flex: 0, minWidth: 130 }}
+              value={cameraType}
+              onChange={e => setCameraType(e.target.value)}
+              disabled={cameraConnected}
+            >
+              <option value="zwo">ZWO ASI585MC</option>
+              <option value="canon">Canon T3i (test)</option>
+            </select>
             {cameraConnected
               ? <button style={styles.btnDanger} disabled={busy}
                   onClick={() => run(actions.disconnectCamera, setCameraError)}>Disconnect</button>
               : <button style={styles.btn} disabled={busy}
-                  onClick={() => run(actions.connectCamera, setCameraError)}>Connect</button>
+                  onClick={() => run(() => actions.connectCamera(cameraType), setCameraError)}>Connect</button>
             }
           </div>
 
@@ -367,21 +440,89 @@ export default function TelescopeView() {
 
           {cameraConnected && (
             <>
-              <div style={{ ...styles.inputRow, marginTop: 8 }}>
-                <label style={styles.label}>Gain</label>
-                <input type="number" style={{ ...styles.input, width: 80 }}
-                  value={gain} onChange={e => setGain(stripLeadingZero(e.target.value))} />
-                <label style={styles.label}>Exp (ms)</label>
-                <input type="number" style={{ ...styles.input, width: 80 }}
-                  value={exposureMs} onChange={e => setExposureMs(stripLeadingZero(e.target.value))} />
-                <button style={styles.btn} disabled={busy}
-                  onClick={() => run(() => actions.setCameraSettings({
-                    gain: Number(gain) || 0,
-                    exposure_ms: Number(exposureMs) || 0,
-                  }), setCameraError)}>
-                  Apply
-                </button>
-              </div>
+              {isCanon ? (
+                <>
+                  <div style={{ ...styles.inputRow, marginTop: 8, flexWrap: 'wrap' }}>
+                    <label style={styles.label}>ISO</label>
+                    <select
+                      style={{ ...styles.input, width: 90 }}
+                      value={canonIso}
+                      onChange={e => setCanonIso(e.target.value)}
+                    >
+                      {(cameraStatus?.iso || []).map(v => (
+                        <option key={v} value={v}>{v}</option>
+                      ))}
+                    </select>
+                    <label style={styles.label}>Shutter</label>
+                    <select
+                      style={{ ...styles.input, width: 100 }}
+                      value={canonShutter}
+                      onChange={e => setCanonShutter(e.target.value)}
+                    >
+                      {(cameraStatus?.shutter || []).map(s => (
+                        <option key={s.value} value={s.value}>
+                          {s.value}{s.value !== 'Bulb' && 's'}{!s.reliable ? ' ⚠' : ''}
+                        </option>
+                      ))}
+                    </select>
+                    <label style={styles.label}>Aperture</label>
+                    <select
+                      style={{ ...styles.input, width: 90 }}
+                      value={canonAperture}
+                      onChange={e => setCanonAperture(e.target.value)}
+                      disabled={!(cameraStatus?.aperture_choices || []).length}
+                    >
+                      {(cameraStatus?.aperture_choices || []).map(v => (
+                        <option key={v} value={v}>{v}</option>
+                      ))}
+                    </select>
+                    <button style={styles.btn} disabled={busy}
+                      onClick={() => run(() => actions.setCameraSettings({
+                        gain: Number(canonIso) || 0,
+                        exposure_ms: Math.round((canonShutterSeconds(canonShutter, cameraStatus?.shutter) || 0) * 1000),
+                        ...(canonAperture ? { aperture: canonAperture } : {}),
+                      }), setCameraError)}>
+                      Apply
+                    </button>
+                    <button style={styles.btn} disabled={busy}
+                      onClick={() => run(actions.refreshCameraSettings, setCameraError)}>
+                      Read from Camera
+                    </button>
+                  </div>
+                  <div style={{ marginTop: 4, fontSize: 10, color: C.muted }}>
+                    Dropdowns are the camera's own current choices (varies with the
+                    attached lens — aperture range and shutter/flash sync limits both
+                    depend on it) — picking one always sets exactly that value, no
+                    snapping. ⚠ = Bulb, which has no fixed duration and isn't
+                    supported by this app (set it on the camera body itself). Every
+                    other listed shutter speed, whole/decimal seconds included, sets
+                    reliably, and so does every aperture value. "Auto" ISO can't be
+                    set remotely on some bodies either — if Apply doesn't change it,
+                    use a fixed ISO value instead. Aperture has no effect if the
+                    attached lens has no aperture ring/motor (e.g. some manual
+                    lenses) — the dropdown is disabled if the camera reports no
+                    aperture choices at all. "Read from Camera" re-queries ISO/
+                    shutter/aperture from the camera without changing anything —
+                    use it after adjusting a setting on the camera body directly.
+                  </div>
+                </>
+              ) : (
+                <div style={{ ...styles.inputRow, marginTop: 8 }}>
+                  <label style={styles.label}>Gain</label>
+                  <input type="number" style={{ ...styles.input, width: 80 }}
+                    value={gain} onChange={e => setGain(stripLeadingZero(e.target.value))} />
+                  <label style={styles.label}>Exp (ms)</label>
+                  <input type="number" style={{ ...styles.input, width: 80 }}
+                    value={exposureMs} onChange={e => setExposureMs(stripLeadingZero(e.target.value))} />
+                  <button style={styles.btn} disabled={busy}
+                    onClick={() => run(() => actions.setCameraSettings({
+                      gain: Number(gain) || 0,
+                      exposure_ms: Number(exposureMs) || 0,
+                    }), setCameraError)}>
+                    Apply
+                  </button>
+                </div>
+              )}
               <div style={{ ...styles.inputRow, marginTop: 8 }}>
                 <input style={styles.input} value={capturePath}
                   onChange={e => setCapturePath(e.target.value)}
@@ -407,6 +548,148 @@ export default function TelescopeView() {
               )}
               <div style={{ marginTop: 4, fontSize: 10, color: C.muted }}>
                 Reusing a name never overwrites — a repeat gets _1, _2, ... appended.
+              </div>
+
+              <div style={{ marginTop: 12, paddingTop: 10, borderTop: `1px solid ${C.border}` }}>
+                <div style={{ ...styles.inputRow }}>
+                  <button style={styles.btn} disabled={solving || !activeImg}
+                    onClick={async () => {
+                      setSolving(true)
+                      setSolveError(null)
+                      setSolveResult(null)
+                      setApplyArmed(false)
+                      setApplyError(null)
+                      setApplyDone(false)
+                      const controller = new AbortController()
+                      solveAbortRef.current = controller
+                      try {
+                        const res = await actions.solveFrame(activeImg.filename, controller.signal)
+                        if (res.ok) setSolveResult(res)
+                        else setSolveError(res.error || 'Solve failed')
+                      } catch (e) {
+                        if (e.name === 'AbortError') {
+                          setSolveError('Cancelled — the solve may still finish on '
+                            + 'astrometry.net\'s servers, but this page stopped waiting for it.')
+                        } else {
+                          setSolveError(e.message || 'Solve failed')
+                        }
+                      } finally {
+                        solveAbortRef.current = null
+                        setSolving(false)
+                      }
+                    }}>
+                    {solving ? 'Solving…' : 'Plate-Solve Current Image'}
+                  </button>
+                  {solving && (
+                    <button style={styles.btnDanger}
+                      onClick={() => solveAbortRef.current?.abort()}>
+                      Cancel
+                    </button>
+                  )}
+                </div>
+                <div style={{ marginTop: 4, fontSize: 10, color: C.muted }}>
+                  {activeImg
+                    ? <>Solves "{activeImg.filename}" against astrometry.net (can take a
+                        minute or more) and reports how far off the mount actually is —
+                        read-only, nothing is sent to the mount.</>
+                    : 'Capture or select an image first.'}
+                </div>
+                {solving && (
+                  <div style={{ marginTop: 6, fontSize: 10, color: C.muted }}>
+                    Submitted to astrometry.net — this can take a while, other controls
+                    still work while you wait. Cancel stops this page from waiting on it;
+                    the solve may still complete on astrometry.net's end regardless.
+                  </div>
+                )}
+                {solveError && (
+                  <div style={{ marginTop: 6, fontSize: 11, color: C.red }}>{solveError}</div>
+                )}
+                {solveResult && (
+                  <div style={{
+                    marginTop: 6, padding: 8, borderRadius: 4,
+                    border: `1px solid ${C.border}`, background: '#0e2030',
+                    fontSize: 11, color: C.text, lineHeight: 1.6,
+                  }}>
+                    <div>Solved center: RA {solveResult.solved_ra_hours?.toFixed(4)}h,
+                      Dec {solveResult.solved_dec_deg?.toFixed(4)}°</div>
+                    {solveResult.offset_azimuth_deg !== undefined ? (
+                      <>
+                        <div style={{ marginTop: 4, color: C.accent, fontWeight: 600 }}>
+                          Add to mount: Az {solveResult.offset_azimuth_deg >= 0 ? '+' : ''}
+                          {solveResult.offset_azimuth_deg.toFixed(3)}°,
+                          {' '}El {solveResult.offset_elevation_deg >= 0 ? '+' : ''}
+                          {solveResult.offset_elevation_deg.toFixed(3)}°
+                        </div>
+                        <div style={{ marginTop: 2, fontSize: 10, color: C.muted }}>
+                          Mount reported Az {solveResult.mount_azimuth?.toFixed(3)}°,
+                          El {solveResult.mount_elevation?.toFixed(3)}° at capture time —
+                          total error {(solveResult.err_vs_mount_arcsec / 60).toFixed(1)}′
+                        </div>
+
+                        {activeMountType === 'am5' ? (
+                          <div style={{ marginTop: 8, paddingTop: 8, borderTop: `1px solid ${C.border}` }}>
+                            <button
+                              style={applyArmed ? styles.btnDanger : styles.btn}
+                              disabled={applying || !mountConnected}
+                              onClick={async () => {
+                                if (!applyArmed) { setApplyArmed(true); return }
+                                setApplying(true)
+                                setApplyError(null)
+                                try {
+                                  const res = await actions.applySolveCorrection(
+                                    solveResult.solved_ra_hours, solveResult.solved_dec_deg)
+                                  if (res.ok) setApplyDone(true)
+                                  else setApplyError(res.error || 'Apply failed')
+                                } catch (e) {
+                                  setApplyError(e.message || 'Apply failed')
+                                } finally {
+                                  setApplying(false)
+                                  setApplyArmed(false)
+                                }
+                              }}>
+                              {applying ? 'Syncing…'
+                                : applyArmed ? 'Confirm: sync mount to solved position'
+                                : 'Apply Correction'}
+                            </button>
+                            {applyArmed && !applying && (
+                              <button style={{ ...styles.btn, marginLeft: 6 }}
+                                onClick={() => setApplyArmed(false)}>
+                                Cancel
+                              </button>
+                            )}
+                            <div style={{ marginTop: 4, fontSize: 10, color: C.muted }}>
+                              {!mountConnected
+                                ? 'Mount not connected.'
+                                : applyArmed
+                                  ? 'This tells the mount\'s ASCOM driver it is actually at the '
+                                    + 'solved RA/Dec above (a sync — the mount does not physically '
+                                    + 'move). Click again to confirm, or Cancel.'
+                                  : 'Syncs the AM5\'s ASCOM alignment model to the solved position '
+                                    + 'above. No physical movement; corrects future gotos.'}
+                            </div>
+                            {applyError && (
+                              <div style={{ marginTop: 4, fontSize: 11, color: C.red }}>{applyError}</div>
+                            )}
+                            {applyDone && (
+                              <div style={{ marginTop: 4, fontSize: 11, color: C.green }}>
+                                Synced — mount alignment updated.
+                              </div>
+                            )}
+                          </div>
+                        ) : (
+                          <div style={{ marginTop: 6, fontSize: 10, color: C.muted }}>
+                            Apply Correction is only available for the AM5/ASCOM mount
+                            (current: {activeMountType || 'none connected'}).
+                          </div>
+                        )}
+                      </>
+                    ) : (
+                      <div style={{ marginTop: 4, fontSize: 10, color: C.muted }}>
+                        No mount pointing recorded in this capture's metadata to compare against.
+                      </div>
+                    )}
+                  </div>
+                )}
               </div>
 
               <div style={{ ...styles.rowFlex, marginTop: 12, paddingTop: 10, borderTop: `1px solid ${C.border}` }}>

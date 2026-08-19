@@ -103,6 +103,12 @@ _CONTROL_NAMES = [
 class CameraController:
     """Thread-safe async wrapper around a ZWO ASI camera."""
 
+    # Identifies the active backend to the frontend (status_dict()) and to
+    # create_camera()'s own dispatch — see the camera_type values there.
+    # Subclasses override this; EmulatedCameraController below leaves it as
+    # "zwo" since it stands in for the same ASI hardware in ALTAIR_DEBUG mode.
+    camera_type = "zwo"
+
     def __init__(self, dll_path: str | Path | None = None) -> None:
         self._dll_path   = Path(dll_path) if dll_path else _DEFAULT_DLL
         self._camera     = None
@@ -510,6 +516,7 @@ class CameraController:
     def status_dict(self) -> dict:
         return {
             "connected":    self.connected,
+            "camera_type":  self.camera_type,
             "camera_name":  self._camera_name,
             "gain":         self._gain,
             "exposure_ms":  self._exposure_ms,

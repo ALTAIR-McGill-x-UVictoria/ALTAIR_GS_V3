@@ -11,11 +11,16 @@ opentelemetry-exporter-otlp-proto-http>=1.27.0
 # non-pip binaries these need: ASI SDK shared library, ASCOM Platform).
 # Captures are saved as FITS (astropy.io.fits) — the standard astronomical
 # image format — with metadata in the header instead of EXIF. Pillow is
-# still needed for the gallery's FITS-to-JPEG preview generation.
+# still needed for the gallery's FITS-to-JPEG preview generation. Color
+# sensors capture the raw undemosaiced Bayer mosaic at native bit depth
+# (see camera.py's module docstring) — opencv-python-headless is used
+# purely to debayer that mosaic into a color preview for the gallery
+# (backend/main.py:_debayer); the saved FITS itself never touches it.
 nexstar>=0.0.5
 zwoasi>=0.2.0
 astropy>=6.0.0
 Pillow>=10.0.0
+opencv-python-headless>=4.9.0
 pywin32>=306; sys_platform == "win32"
 
 # Direct AM3/AM5 mount control over INDI (Linux-friendly alternative to the
@@ -23,3 +28,27 @@ pywin32>=306; sys_platform == "win32"
 # speaks INDI's XML wire protocol directly with the standard library, no
 # extra pip package needed — but it requires a local `indiserver` running
 # `indi_lx200am5` (system package, e.g. `indi-full` on Debian/Ubuntu).
+
+# Canon EOS Rebel T3i test path (backend/camera_canon.py), selected via
+# ALTAIR_CAMERA_TYPE=canon — an alternative to the ZWO ASI585MC being
+# evaluated for its larger APS-C sensor. Two backends, picked automatically
+# by platform.system():
+#   - Linux/macOS: libgphoto2 installed system-wide first (e.g. `apt install
+#     libgphoto2-dev`); the package below only provides the Python bindings.
+#   - Windows: no extra pip package for camera control — drives
+#     digiCamControl (http://digicamcontrol.com/) over its local HTTP
+#     remote-control server using stdlib `urllib` only. digiCamControl
+#     itself must be installed and running. See backend/lib/README.md.
+gphoto2>=2.5.0; sys_platform != "win32"
+
+# CR2 RAW decoding for the Canon path (both platforms). Captures are shot
+# RAW and stored as the un-demosaiced 16-bit Bayer mosaic so they're usable
+# for plate solving; rawpy (LibRaw bindings) does the CR2 -> array decode.
+# Ships prebuilt wheels for Windows/Linux/macOS.
+rawpy>=0.22.0
+
+# backend/solve_check.py (offline plate-solve harness, not used by the running
+# app) submits captures to the astrometry.net web API via astroquery's
+# AstrometryNet client -- see that module's docstring for why the web solver
+# is used instead of a local ASTAP install.
+astroquery>=0.4.7

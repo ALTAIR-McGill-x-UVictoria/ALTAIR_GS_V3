@@ -21,6 +21,13 @@ backend/lib/*.dylib
 # Telemetry log sessions (keep the logs/ dir itself via .gitkeep)
 logs/*/
 
+# Camera captures (test/session output, not source)
+captures/*.fits
+captures/*.jpg
+captures/*.jpeg
+captures/*.tiff
+captures/*.tif
+
 # Editor
 .vscode/
 .idea/

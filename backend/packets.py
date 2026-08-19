@@ -129,6 +129,15 @@ def _code_to_voltage(code: int) -> float:
     return (float(code) / _ADC_FULL_SCALE_CODE) * _ADC_VREF_V + _ADC_VREF_V
 
 
+def _decode_field_value(v: Any) -> Any:
+    """Fixed-length string fields (struct 's' format) unpack to bytes; every
+    other field is numeric. Strip null padding and decode text fields instead
+    of rounding them."""
+    if isinstance(v, bytes):
+        return v.split(b"\x00", 1)[0].decode("utf-8", errors="replace")
+    return round(v, 6)
+
+
 def _decode_photodiode_batch(
     payload: bytes,
     frame_seq: int,
@@ -287,7 +296,7 @@ def decode_frame(raw: bytes) -> dict[str, Any] | None:
         "seq":       seq,
         "timestamp": round(timestamp, 4),
         "fields": [
-            {**fd, "value": round(v, 6)}
+            {**fd, "value": _decode_field_value(v)}
             for fd, v in zip(entry["fields"], values)
         ],
     }

@@ -16,6 +16,7 @@ Or via the helper script:
 from __future__ import annotations
 
 import asyncio
+import calendar
 import io
 import json
 import logging
@@ -686,11 +687,21 @@ class SerialReader:
             if _fc_radio_ack_event is not None:
                 _fc_radio_ack_event.set()
 
-        # Intercept GPS packets to keep _latest_gps up-to-date for telescope tracking
-        if msg.get("type") == "packet" and msg.get("label", "").lower() == "gps":
+        # Intercept GPS packets to keep _latest_gps up-to-date for telescope
+        # tracking. The FC's telemetry registry has two GPS packet classes —
+        # LocalGpsPacket (label "LocalGps", onboard MAX-M10M) and
+        # MavlinkGpsPacket (label "MavlinkGps", fused via the Pixhawk) —
+        # packets.py derives each label by stripping "Packet" off the class
+        # name (_label_from_classname). Deliberately keyed on "MavlinkGps"
+        # only: tracking should always use the Pixhawk-fused fix, never the
+        # onboard module's, regardless of which packets happen to be
+        # arriving. (Labels are matched exactly, not against "gps", since
+        # neither real label is literally that — see git history for the
+        # exact-match-on-"gps" bug this used to have, which silently matched
+        # neither and left tracking permanently unavailable.)
+        if msg.get("type") == "packet" and msg.get("label") == "MavlinkGps":
             global _latest_gps
-            fields = {f["name"]: f["value"] for f in msg.get("fields", [])}
-            _latest_gps = fields  # keys: lat, lon, alt, relative_alt, hdg
+            _latest_gps = {f["name"]: f["value"] for f in msg.get("fields", [])}  # keys: lat, lon, alt, relative_alt, hdg
 
         # Log packet to CSV and evaluate alarms
         if msg.get("type") == "packet":
@@ -964,7 +975,8 @@ _latest_events:  list[dict]      = []   # last 200 events
 # ---------------------------------------------------------------------------
 
 mount_controller: BaseMountController | None = None
-camera_controller = create_camera("zwo")
+# "zwo" (default, ASI585MC) or "canon" (Rebel T3i test — see backend/camera_canon.py).
+camera_controller = create_camera(os.getenv("ALTAIR_CAMERA_TYPE", "zwo"))
 
 # Held for the full duration of every camera exposure (see post_camera_capture
 # / _do_auto_capture below). Any mount motion — the tracking loop's periodic
@@ -1121,6 +1133,46 @@ def _list_images() -> list[dict]:
     return results
 
 
+def _debayer(mosaic, pattern: str):
+    """
+    Debayer a single-channel (H, W) raw mosaic (as written by
+    CameraController._write_fits for color sensors, tagged with a BAYERPAT
+    header) into an (H, W, 3) RGB array for preview purposes only — the
+    saved FITS itself stays the untouched max-bit-depth mosaic; this is
+    strictly a display-time conversion for the gallery thumbnail/full image.
+    Uses OpenCV's bilinear demosaic (same global white balance across
+    channels — good enough for a preview, not meant for science use).
+    Returns the original mosaic unchanged if opencv-python isn't installed
+    or the pattern is unrecognized, so the gallery still renders something
+    (a grey mosaic) rather than failing to load the image at all.
+    """
+    import numpy as np
+    try:
+        import cv2
+    except ImportError:
+        logger.warning("Gallery: opencv not installed, cannot debayer %r preview — "
+                        "showing raw mosaic instead (pip install opencv-python-headless)", pattern)
+        return mosaic
+
+    # cv2's COLOR_BAYER_XX2RGB codes name the pattern of the *second* row's
+    # first two pixels, which is the opposite convention from the FITS
+    # BAYERPAT keyword (which names the top-left/first-row pair) — e.g. FITS
+    # "RGGB" is cv2's BG code. This mapping already accounts for that swap.
+    code_map = {
+        "RGGB": cv2.COLOR_BayerBG2RGB,
+        "BGGR": cv2.COLOR_BayerRG2RGB,
+        "GRBG": cv2.COLOR_BayerGB2RGB,
+        "GBRG": cv2.COLOR_BayerGR2RGB,
+    }
+    code = code_map.get((pattern or "").upper())
+    if code is None:
+        logger.warning("Gallery: unrecognized BAYERPAT %r, showing raw mosaic instead", pattern)
+        return mosaic
+
+    src = mosaic if mosaic.dtype in (np.uint8, np.uint16) else mosaic.astype(np.uint16)
+    return cv2.cvtColor(src, code)
+
+
 def _fits_to_pil(path: Path):
     """Load a FITS primary HDU and normalize it to a displayable PIL image."""
     from astropy.io import fits
@@ -1129,6 +1181,7 @@ def _fits_to_pil(path: Path):
 
     with fits.open(path) as hdul:
         data = hdul[0].data
+        bayer_pattern = hdul[0].header.get("BAYERPAT")
     if data is None:
         raise ValueError("FITS file has no image data in the primary HDU")
 
@@ -1136,6 +1189,11 @@ def _fits_to_pil(path: Path):
         # Our color cube layout is (3, H, W) — CameraController._write_fits —
         # PIL wants channels-last (H, W, 3).
         data = np.moveaxis(data, 0, -1)
+    elif data.ndim == 2 and bayer_pattern:
+        # Color-sensor captures are saved as the raw undemosaiced mosaic
+        # (see camera.py's module docstring) — debayer here, for preview
+        # display only, so the gallery still shows a color photo.
+        data = _debayer(data, str(bayer_pattern).strip())
 
     if data.dtype == np.uint8:
         arr = data
@@ -1994,12 +2052,29 @@ async def post_tracking(body: dict):
 
 
 @app.post("/api/telescope/camera/connect")
-async def post_camera_connect():
+async def post_camera_connect(body: dict | None = None):
+    """
+    Body (optional): { "camera_type": "zwo"|"canon" }
+    Omitting camera_type (or POSTing no body) reconnects whichever
+    controller is already active — same as before this field existed.
+    Switching type rebuilds camera_controller via create_camera(), mirroring
+    how /api/telescope/mount/connect swaps mount_controller. Under
+    ALTAIR_DEBUG=1, create_camera() ignores the requested type and always
+    returns the emulator.
+    """
+    global camera_controller
+    camera_type = (body or {}).get("camera_type") or camera_controller.camera_type
+
+    if camera_type != camera_controller.camera_type:
+        if camera_controller.connected:
+            await camera_controller.disconnect()
+        camera_controller = create_camera(camera_type)
+
     try:
         await camera_controller.connect()
         await _broadcast_telescope({"type": "telescope_status",
                                     "camera": camera_controller.status_dict()})
-        return {"ok": True}
+        return {"ok": True, "camera_type": camera_controller.camera_type}
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
@@ -2018,6 +2093,38 @@ async def post_camera_settings(body: dict):
         await camera_controller.set_gain(int(body["gain"]))
     if "exposure_ms" in body:
         await camera_controller.set_exposure_ms(int(body["exposure_ms"]))
+    if "aperture" in body:
+        # set_aperture only exists on CanonCameraController — ZWO's ASI
+        # sensor has no lens iris to control, so there's nothing to check
+        # against on that path. See camera_canon.py: CanonCameraController.set_aperture.
+        set_aperture = getattr(camera_controller, "set_aperture", None)
+        if set_aperture is None:
+            return {"ok": False, "error": "This camera has no aperture control."}
+        await set_aperture(str(body["aperture"]))
+    return {"ok": True, "camera": camera_controller.status_dict()}
+
+
+@app.post("/api/telescope/camera/refresh_settings")
+async def post_camera_refresh_settings():
+    """
+    Re-reads ISO/shutter/aperture (current values and choice lists) straight
+    from the connected camera, WITHOUT writing anything to it — the opposite
+    of the settings endpoint above. Only meaningful for the Canon path
+    (refresh_settings only exists on CanonCameraController; ZWO's cached gain
+    /exposure_ms are always in sync since every set_gain/set_exposure_ms call
+    writes straight through). Useful after adjusting ISO/shutter/aperture on
+    the camera body's own controls directly, so the UI catches up instead of
+    silently showing stale values until the next Apply.
+    """
+    refresh = getattr(camera_controller, "refresh_settings", None)
+    if refresh is None:
+        return {"ok": False, "error": "This camera has no settings to refresh."}
+    try:
+        await refresh()
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    await _broadcast_telescope({"type": "telescope_status",
+                                "camera": camera_controller.status_dict()})
     return {"ok": True, "camera": camera_controller.status_dict()}
 
 
@@ -2083,6 +2190,146 @@ async def post_camera_capture(body: dict):
         return {"ok": True, "path": saved}
     except Exception as e:
         return {"ok": False, "error": str(e)}
+
+
+@app.post("/api/telescope/solve")
+async def post_telescope_solve(body: dict):
+    """
+    Plate-solve a capture and report the pointing offset — for the field
+    case where the payload is out of frame or the pointing looks slightly
+    off: solve the frame you just took, get back how far off the mount
+    actually is, and dial the correction in by hand. Read-only; this never
+    commands the mount itself.
+
+    Body: {"filename": "<name in the capture dir>"} — defaults to the most
+    recent capture if omitted.
+
+    Solving happens against the astrometry.net web API (see
+    backend/plate_solve.py) and can take tens of seconds to a few minutes,
+    so this is a deliberate, explicit action, not something to poll or
+    call automatically.
+    """
+    from backend.plate_solve import get_client, solve_one
+    from backend.tracking import radec_to_azalt
+
+    filename = body.get("filename")
+    if filename:
+        target_path = _capture_dir / filename
+    else:
+        images = _list_images()
+        if not images:
+            return {"ok": False, "error": "No captures found to solve."}
+        target_path = _capture_dir / images[0]["filename"]
+
+    if not target_path.exists():
+        return {"ok": False, "error": f"Capture not found: {target_path.name}"}
+
+    ast = get_client()
+    if ast is None:
+        return {
+            "ok": False,
+            "error": "ASTROMETRY_API_KEY is not set on the server. Get a free "
+                     "key at https://nova.astrometry.net/api_help and set it "
+                     "as an environment variable, then restart the backend.",
+        }
+
+    loop = asyncio.get_event_loop()
+    try:
+        result = await loop.run_in_executor(
+            None, solve_one, ast, target_path, int(body.get("timeout", 300))
+        )
+    except Exception as e:
+        return {"ok": False, "error": f"Solve failed: {e}"}
+
+    if not result.solved:
+        return {"ok": False, "error": result.message, "filename": target_path.name}
+
+    response: dict = {
+        "ok": True,
+        "filename": target_path.name,
+        "solved_ra_hours": result.solved_ra_h,
+        "solved_dec_deg":  result.solved_dec_d,
+    }
+
+    # Offset vs the mount's own reported pointing at capture time — this is
+    # "is the mount pointing where it thinks it is", the number worth
+    # correcting by hand. Converting both sides through Az/El at the SAME
+    # timestamp (the capture's own DATE-OBS-equivalent, not "now") matters:
+    # RA/Dec is time-dependent (Earth's rotation), so comparing solved vs
+    # mount RA/Dec directly, or converting each at a different moment, folds
+    # in a spurious time-dependent term on top of the real pointing offset.
+    if result.mount_ra_h is not None and result.mount_dec_d is not None:
+        from astropy.io import fits as _fits
+
+        capture_utc = _fits.getheader(target_path).get("DATE-OBS")
+        unix_utc = None
+        if capture_utc:
+            try:
+                unix_utc = calendar.timegm(time.strptime(capture_utc, "%Y-%m-%dT%H:%M:%S"))
+            except ValueError:
+                pass
+
+        solved_az, solved_el = radec_to_azalt(result.solved_ra_h, result.solved_dec_d, unix_utc=unix_utc)
+        mount_az,  mount_el  = radec_to_azalt(result.mount_ra_h,  result.mount_dec_d,  unix_utc=unix_utc)
+
+        response["mount_ra_hours"]  = result.mount_ra_h
+        response["mount_dec_deg"]   = result.mount_dec_d
+        response["solved_azimuth"]   = round(solved_az, 4)
+        response["solved_elevation"] = round(solved_el, 4)
+        response["mount_azimuth"]    = round(mount_az, 4)
+        response["mount_elevation"]  = round(mount_el, 4)
+        # Positive offset_azimuth/elevation means: the true pointing (solved)
+        # is that many degrees BEYOND where the mount thinks it is, so add
+        # this to the mount's azimuth/elevation to correct it.
+        response["offset_azimuth_deg"]   = round(((solved_az - mount_az + 540) % 360) - 180, 4)
+        response["offset_elevation_deg"] = round(solved_el - mount_el, 4)
+        response["err_vs_mount_arcsec"]  = round(result.err_vs_mount_arcsec, 1)
+
+    return response
+
+
+@app.post("/api/telescope/solve/apply")
+async def post_telescope_solve_apply(body: dict):
+    """
+    Apply a plate-solved RA/Dec correction to the mount via ASCOM sync —
+    tells the driver's alignment model "you are actually pointed here"
+    without physically slewing. The frontend calls this only after the
+    operator has seen the solved offset and explicitly confirmed it (see
+    TelescopeView.jsx's two-step confirm on the Apply Correction button);
+    this endpoint itself does not re-confirm, it trusts the caller meant it.
+
+    ASCOM (AM5Controller) only — NexStar has no sync primitive wired up
+    here, and INDI sync semantics vary enough by driver that they aren't
+    considered safe to call without per-driver verification. Any other
+    mount type is rejected with a clear error rather than silently
+    attempting something unsupported.
+
+    Body: {"ra_hours": float, "dec_deg": float} — normally the
+    solved_ra_hours/solved_dec_deg straight out of POST /api/telescope/solve.
+    """
+    if mount_controller is None or not mount_controller.connected:
+        return {"ok": False, "error": "Mount is not connected."}
+    if mount_controller.mount_type != "am5":
+        return {
+            "ok": False,
+            "error": f"Sync is only supported for the AM5/ASCOM mount type "
+                     f"in this backend (current: {mount_controller.mount_type}).",
+        }
+
+    try:
+        ra_hours = float(body["ra_hours"])
+        dec_deg  = float(body["dec_deg"])
+    except (KeyError, TypeError, ValueError):
+        return {"ok": False, "error": "Body must include numeric ra_hours and dec_deg."}
+
+    try:
+        await mount_controller.sync(ra_hours, dec_deg)
+    except Exception as e:
+        return {"ok": False, "error": f"Sync failed: {e}"}
+
+    pos = await mount_controller.get_position()
+    await _broadcast_telescope({"type": "telescope_status", "mount": mount_controller.status_dict()})
+    return {"ok": True, "ra_hours": ra_hours, "dec_deg": dec_deg, "position": pos}
 
 
 @app.post("/api/telescope/camera/auto_capture")

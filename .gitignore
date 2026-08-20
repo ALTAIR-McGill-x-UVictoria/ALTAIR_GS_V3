@@ -21,12 +21,16 @@ backend/lib/*.dylib
 # Telemetry log sessions (keep the logs/ dir itself via .gitkeep)
 logs/*/
 
-# Camera captures (test/session output, not source)
-captures/*.fits
-captures/*.jpg
-captures/*.jpeg
-captures/*.tiff
-captures/*.tif
+# Camera captures (test/session output, not source) — recursive, so
+# subdirectories like captures/2026-08-19/tests/ are excluded too, not just
+# files directly under captures/. See git history: 343e280 previously slipped
+# ~100MB+ of FITS/CR2 into a commit because this only matched the top level.
+captures/**/*.fits
+captures/**/*.cr2
+captures/**/*.jpg
+captures/**/*.jpeg
+captures/**/*.tiff
+captures/**/*.tif
 
 # Editor
 .vscode/

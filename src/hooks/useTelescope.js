@@ -23,7 +23,12 @@ const WS_URL = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.ho
  *                       solveFrame(filename, signal?) — pass an
  *                       AbortController's signal to allow cancelling the
  *                       wait; the astrometry.net job itself may still run
- *                       to completion server-side regardless. }
+ *                       to completion server-side regardless.
+ *                       getCaptureDir, setCaptureDir(dir) — read/set the
+ *                       directory captures are saved to.
+ *                       setGpsSource('mavlink'|'local') — pick which GPS
+ *                       fix (Pixhawk-fused vs. onboard module) tracking
+ *                       uses. }
  */
 export function useTelescope() {
   const ws             = useRef(null)
@@ -35,6 +40,7 @@ export function useTelescope() {
   const [cameraStatus,       setCameraStatus]       = useState(null)
   const [trackingEnabled,    setTrackingEnabled]    = useState(false)
   const [autoCaptureEnabled, setAutoCaptureEnabled] = useState(false)
+  const [gpsSource,          setGpsSourceState]     = useState('mavlink')
 
   // Stable ref — avoids useCallback dependency cycle
   const connectRef = useRef(null)
@@ -67,6 +73,7 @@ export function useTelescope() {
         if (msg.camera              !== undefined) setCameraStatus(msg.camera)
         if (msg.tracking_enabled    !== undefined) setTrackingEnabled(msg.tracking_enabled)
         if (msg.auto_capture_enabled !== undefined) setAutoCaptureEnabled(msg.auto_capture_enabled)
+        if (msg.gps_source          !== undefined) setGpsSourceState(msg.gps_source)
       }
     }
   }
@@ -112,7 +119,10 @@ export function useTelescope() {
     solveFrame:        (filename, signal) => post('/api/telescope/solve', { filename }, signal),
     applySolveCorrection: (raHours, decDeg) => post('/api/telescope/solve/apply',
                          { ra_hours: raHours, dec_deg: decDeg }),
+    getCaptureDir:     ()          => apiFetch('/api/gallery/config').then(r => r.json()),
+    setCaptureDir:     (dir)       => post('/api/gallery/config', { capture_dir: dir }),
+    setGpsSource:      (source)    => post('/api/telescope/gps_source', { source }),
   }
 
-  return { wsReady, tracking, mountStatus, cameraStatus, trackingEnabled, autoCaptureEnabled, actions }
+  return { wsReady, tracking, mountStatus, cameraStatus, trackingEnabled, autoCaptureEnabled, gpsSource, actions }
 }

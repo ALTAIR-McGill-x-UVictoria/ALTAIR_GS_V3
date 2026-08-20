@@ -584,10 +584,12 @@ class _GphotoBackend:
 
     def _capture_frame(self):
         """
-        Capture a RAW frame and return (arr, bayer_pattern, bit_depth) — a
-        2-D (H, W) uint16 Bayer mosaic, its pattern string, and the sensor's
-        native ADC bit depth. See _decode_raw_to_mono_bayer for why this
-        stays un-demosaiced.
+        Capture a RAW frame and return (arr, bayer_pattern, bit_depth,
+        raw_bytes) — a 2-D (H, W) uint16 Bayer mosaic, its pattern string,
+        the sensor's native ADC bit depth, and the original CR2 file bytes
+        (kept so the caller can save the untouched RAW alongside the FITS;
+        see _decode_raw_to_mono_bayer for why the decoded array stays
+        un-demosaiced).
         """
         import gphoto2 as gp
 
@@ -602,7 +604,8 @@ class _GphotoBackend:
         except Exception:
             logger.debug("Canon: could not delete frame from camera storage", exc_info=True)
 
-        return _decode_raw_to_mono_bayer(raw_bytes)
+        arr, pattern, bit_depth = _decode_raw_to_mono_bayer(raw_bytes)
+        return arr, pattern, bit_depth, raw_bytes
 
 
 # ---------------------------------------------------------------------------
@@ -1027,9 +1030,10 @@ class _DigiCamControlBackend:
 
     def _capture_frame(self):
         """
-        Trigger a RAW capture and return (arr, bayer_pattern, bit_depth) — a
-        2-D (H, W) uint16 Bayer mosaic, its pattern string, and the sensor's
-        native ADC bit depth.
+        Trigger a RAW capture and return (arr, bayer_pattern, bit_depth,
+        raw_bytes) — a 2-D (H, W) uint16 Bayer mosaic, its pattern string,
+        the sensor's native ADC bit depth, and the original CR2 file bytes
+        (kept so the caller can save the untouched RAW alongside the FITS).
 
         Unlike the gphoto2 backend (which pulls bytes straight off the camera
         over USB), digiCamControl downloads the file to its own session folder
@@ -1143,7 +1147,8 @@ class _DigiCamControlBackend:
             )
         logger.info("Canon (digiCamControl): captured %s (%d bytes)", path.name, len(raw_bytes))
 
-        return _decode_raw_to_mono_bayer(raw_bytes)
+        arr, pattern, bit_depth = _decode_raw_to_mono_bayer(raw_bytes)
+        return arr, pattern, bit_depth, raw_bytes
 
 
 # ---------------------------------------------------------------------------
@@ -1297,7 +1302,7 @@ class CanonCameraController(CameraController):
     # ------------------------------------------------------------------
 
     def _do_capture_and_tag(self, output_path: Path, metadata: dict) -> str:
-        arr, bayer_pattern, bit_depth = self._backend._capture_frame()
+        arr, bayer_pattern, bit_depth, raw_bytes = self._backend._capture_frame()
         sensor_controls = self._backend._do_get_all_controls()
         sensor_controls["Bit Depth"] = bit_depth
         # Consumed by CameraController._write_fits (camera.py) to tag the
@@ -1307,4 +1312,14 @@ class CanonCameraController(CameraController):
         # see _decode_raw_to_mono_bayer.
         self._bayer_pattern = bayer_pattern
         self._write_fits(output_path, arr, metadata, sensor_controls)
+
+        # Keep the camera's original CR2 too, next to the FITS — previously
+        # decoded then discarded (file_delete'd off the card / left in
+        # digiCamControl's session folder), losing the untouched raw file a
+        # user might want for e.g. Canon's own DPP or Lightroom, distinct
+        # from the FITS this app itself consumes for plate solving/gallery.
+        raw_path = output_path.with_suffix(".cr2")
+        raw_path.write_bytes(raw_bytes)
+        logger.info("Canon: RAW written to %s", raw_path.name)
+
         return str(output_path)

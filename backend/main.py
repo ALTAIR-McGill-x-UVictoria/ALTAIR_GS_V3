@@ -687,21 +687,30 @@ class SerialReader:
             if _fc_radio_ack_event is not None:
                 _fc_radio_ack_event.set()
 
-        # Intercept GPS packets to keep _latest_gps up-to-date for telescope
-        # tracking. The FC's telemetry registry has two GPS packet classes —
-        # LocalGpsPacket (label "LocalGps", onboard MAX-M10M) and
-        # MavlinkGpsPacket (label "MavlinkGps", fused via the Pixhawk) —
-        # packets.py derives each label by stripping "Packet" off the class
-        # name (_label_from_classname). Deliberately keyed on "MavlinkGps"
-        # only: tracking should always use the Pixhawk-fused fix, never the
-        # onboard module's, regardless of which packets happen to be
-        # arriving. (Labels are matched exactly, not against "gps", since
-        # neither real label is literally that — see git history for the
-        # exact-match-on-"gps" bug this used to have, which silently matched
-        # neither and left tracking permanently unavailable.)
+        # Intercept GPS packets to keep _latest_gps_mavlink/_latest_gps_local
+        # up-to-date for telescope tracking. The FC's telemetry registry has
+        # two GPS packet classes — LocalGpsPacket (label "LocalGps", onboard
+        # MAX-M10M) and MavlinkGpsPacket (label "MavlinkGps", fused via the
+        # Pixhawk) — packets.py derives each label by stripping "Packet" off
+        # the class name (_label_from_classname). Both are tracked separately
+        # and _gps_source picks which one _tracking_poll_loop actually uses
+        # (see /api/telescope/gps_source) — MavlinkGps and LocalGps can go
+        # stale/zero independently of each other (e.g. Pixhawk not GPS-locked
+        # while the onboard module is fine, or vice versa), so a frontend
+        # switch lets the operator pick the live one instead of tracking
+        # silently aiming at a dead fix from the default source. (Labels are
+        # matched exactly, not against "gps", since neither real label is
+        # literally that — see git history for the exact-match-on-"gps" bug
+        # this used to have, which silently matched neither and left tracking
+        # permanently unavailable.)
         if msg.get("type") == "packet" and msg.get("label") == "MavlinkGps":
-            global _latest_gps
-            _latest_gps = {f["name"]: f["value"] for f in msg.get("fields", [])}  # keys: lat, lon, alt, relative_alt, hdg
+            global _latest_gps_mavlink
+            fields = {f["name"]: f["value"] for f in msg.get("fields", [])}  # keys: lat, lon, alt, relative_alt, hdg
+            _latest_gps_mavlink = {"lat": fields.get("lat"), "lon": fields.get("lon"), "alt": fields.get("alt")}
+        elif msg.get("type") == "packet" and msg.get("label") == "LocalGps":
+            global _latest_gps_local
+            fields = {f["name"]: f["value"] for f in msg.get("fields", [])}  # keys: lat, lon, alt_msl, speed_ms, heading_deg, fix_type, num_sv
+            _latest_gps_local = {"lat": fields.get("lat"), "lon": fields.get("lon"), "alt": fields.get("alt_msl")}
 
         # Log packet to CSV and evaluate alarms
         if msg.get("type") == "packet":
@@ -988,8 +997,11 @@ camera_controller = create_camera(os.getenv("ALTAIR_CAMERA_TYPE", "zwo"))
 # middle of a multi-second exposure.
 _capture_lock = asyncio.Lock()
 
-# Latest GPS data from telemetry — updated by _broadcast, read by tracking poll
-_latest_gps: dict | None = None
+# Latest GPS data from telemetry — updated by _broadcast, read by tracking poll.
+# Tracked separately per source; _gps_source picks which one tracking uses.
+_latest_gps_mavlink: dict | None = None
+_latest_gps_local:   dict | None = None
+_gps_source = "mavlink"   # "mavlink" | "local"
 
 # Latest computed tracking params — updated by _tracking_poll_loop, read at capture time
 _latest_tracking: dict | None = None
@@ -1300,11 +1312,11 @@ async def _tracking_poll_loop(interval_s: float = 1.0) -> None:
     Periodically compute tracking params from latest GPS and broadcast to
     telescope clients. Also commands the mount if tracking is enabled.
     """
-    global _latest_gps, _latest_tracking, _tracking_enabled
+    global _latest_gps_mavlink, _latest_gps_local, _gps_source, _latest_tracking, _tracking_enabled
     while True:
         await asyncio.sleep(interval_s)
-        gps = _latest_gps
-        if gps is None:
+        gps = _latest_gps_mavlink if _gps_source == "mavlink" else _latest_gps_local
+        if gps is None or gps["lat"] is None or gps["lon"] is None or gps["alt"] is None:
             continue
         try:
             params = calculate_tracking_params(
@@ -1863,6 +1875,33 @@ async def get_debug_emulate():
     return {"emulating": _emulating}
 
 
+@app.post("/api/debug/set_gps")
+async def post_debug_set_gps(body: dict):
+    """
+    Manually inject a payload GPS fix for telescope tracking, bypassing the
+    serial link entirely — for testing the tracking/mount-goto pipeline
+    (e.g. after a launch abort with no live payload telemetry) without the
+    packet emulator. Writes to whichever source _gps_source currently
+    selects, so _tracking_poll_loop picks it up on its next 1s cycle exactly
+    like real telemetry.
+    Body: { "lat": float, "lon": float, "alt": float }
+    """
+    global _latest_gps_mavlink, _latest_gps_local
+    try:
+        lat = float(body["lat"])
+        lon = float(body["lon"])
+        alt = float(body["alt"])
+    except (KeyError, TypeError, ValueError):
+        return {"ok": False, "error": "Body must include numeric lat, lon, alt"}
+    fix = {"lat": lat, "lon": lon, "alt": alt}
+    if _gps_source == "mavlink":
+        _latest_gps_mavlink = fix
+    else:
+        _latest_gps_local = fix
+    logger.info("Debug: injected payload GPS (%s) lat=%.6f lon=%.6f alt=%.1f", _gps_source, lat, lon, alt)
+    return {"ok": True, "gps_source": _gps_source, "latest_gps": fix}
+
+
 # ---------------------------------------------------------------------------
 # WebSocket endpoint
 # ---------------------------------------------------------------------------
@@ -1943,6 +1982,7 @@ async def telescope_ws_endpoint(ws: WebSocket):
         "camera": camera_controller.status_dict(),
         "tracking_enabled": _tracking_enabled,
         "auto_capture_enabled": _auto_capture_enabled,
+        "gps_source": _gps_source,
     }))
     try:
         while True:
@@ -1965,8 +2005,32 @@ def get_telescope_status():
         "camera":           camera_controller.status_dict(),
         "tracking_enabled": _tracking_enabled,
         "auto_capture_enabled": _auto_capture_enabled,
-        "latest_gps":       _latest_gps,
+        "gps_source":       _gps_source,
+        "latest_gps_mavlink": _latest_gps_mavlink,
+        "latest_gps_local":   _latest_gps_local,
+        "latest_gps":       _latest_gps_mavlink if _gps_source == "mavlink" else _latest_gps_local,
     }
+
+
+@app.post("/api/telescope/gps_source")
+async def post_gps_source(body: dict):
+    """
+    Select which GPS fix telescope tracking uses: the Pixhawk-fused
+    MavlinkGps fix ("mavlink", the default) or the onboard MAX-M10M's
+    LocalGps fix ("local"). The two update independently and can go
+    stale/zero at different times (e.g. Pixhawk not GPS-locked while the
+    onboard module is fine, or vice versa) — this lets the operator switch
+    to whichever is actually live instead of tracking silently aiming at a
+    dead fix from the default source.
+    """
+    global _gps_source
+    source = body.get("source", "")
+    if source not in ("mavlink", "local"):
+        return {"ok": False, "error": "source must be 'mavlink' or 'local'"}
+    _gps_source = source
+    logger.info("Telescope GPS source set to %r", source)
+    await _broadcast_telescope({"type": "telescope_status", "gps_source": _gps_source})
+    return {"ok": True, "gps_source": _gps_source}
 
 
 @app.post("/api/telescope/mount/connect")
@@ -2132,7 +2196,7 @@ async def _build_capture_metadata() -> dict:
     """Assemble capture metadata from all available live sources."""
     capture_meta: dict = {"capture_utc": time.time()}
 
-    gps = _latest_gps
+    gps = _latest_gps_mavlink if _gps_source == "mavlink" else _latest_gps_local
     if gps:
         capture_meta["payload_lat"]       = gps.get("lat")
         capture_meta["payload_lon"]       = gps.get("lon")

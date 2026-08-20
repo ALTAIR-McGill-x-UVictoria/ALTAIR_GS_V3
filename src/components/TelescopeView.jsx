@@ -117,6 +117,7 @@ export default function TelescopeView() {
     cameraStatus,
     trackingEnabled,
     autoCaptureEnabled,
+    gpsSource,
     actions,
   } = useTelescope()
 
@@ -150,6 +151,10 @@ export default function TelescopeView() {
   const [sidebarOpen,  setSidebarOpen] = useState(true)
   const [mountError,   setMountError]  = useState(null)
   const [cameraError,  setCameraError] = useState(null)
+  const [captureDir,      setCaptureDirInput] = useState('')
+  const [captureDirSaved, setCaptureDirSaved] = useState('')
+  const [captureDirError, setCaptureDirError] = useState(null)
+  const [captureDirBusy,  setCaptureDirBusy]  = useState(false)
 
   const run = async (fn, setError = null) => {
     setBusy(true)
@@ -183,6 +188,15 @@ export default function TelescopeView() {
     fetchImages()
     const id = setInterval(fetchImages, 5000)
     return () => clearInterval(id)
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    actions.getCaptureDir().then(cfg => {
+      if (cfg?.capture_dir) {
+        setCaptureDirInput(cfg.capture_dir)
+        setCaptureDirSaved(cfg.capture_dir)
+      }
+    }).catch(() => { /* backend not ready */ })
   }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
@@ -377,6 +391,23 @@ export default function TelescopeView() {
           <div style={{ marginTop: 4, fontSize: 10, color: C.muted }}>
             Mount must be connected. Slews to computed Az/El each second.
           </div>
+
+          <div style={{ marginTop: 10, paddingTop: 8, borderTop: `1px solid ${C.border}` }}>
+            <label style={{ ...styles.label, display: 'block', marginBottom: 4 }}>GPS Source</label>
+            <select
+              style={styles.input}
+              value={gpsSource}
+              onChange={e => run(() => actions.setGpsSource(e.target.value), setMountError)}
+              disabled={busy}
+            >
+              <option value="mavlink">MavlinkGps (Pixhawk-fused)</option>
+              <option value="local">LocalGps (onboard MAX-M10M)</option>
+            </select>
+            <div style={{ marginTop: 4, fontSize: 10, color: C.muted }}>
+              The two update independently and can go stale/zero at different
+              times. If tracking aims at a bad target, try switching source.
+            </div>
+          </div>
         </Section>
 
         <Section title="Tracking Geometry">
@@ -437,6 +468,43 @@ export default function TelescopeView() {
           {cameraError && (
             <div style={{ marginTop: 6, fontSize: 11, color: C.red }}>{cameraError}</div>
           )}
+
+          <div style={{ marginTop: 10, paddingTop: 8, borderTop: `1px solid ${C.border}` }}>
+            <label style={{ ...styles.label, display: 'block', marginBottom: 4 }}>Save Directory</label>
+            <div style={styles.inputRow}>
+              <input style={styles.input} value={captureDir}
+                onChange={e => setCaptureDirInput(e.target.value)}
+                placeholder="captures/" />
+              <button style={styles.btn} disabled={captureDirBusy || !captureDir.trim()}
+                onClick={async () => {
+                  setCaptureDirBusy(true)
+                  setCaptureDirError(null)
+                  try {
+                    const res = await actions.setCaptureDir(captureDir.trim())
+                    if (res.ok) {
+                      setCaptureDirInput(res.capture_dir)
+                      setCaptureDirSaved(res.capture_dir)
+                    } else {
+                      setCaptureDirError(res.error || 'Failed to set directory')
+                    }
+                  } catch (e) {
+                    setCaptureDirError(e.message || 'Failed to set directory')
+                  } finally {
+                    setCaptureDirBusy(false)
+                  }
+                }}>
+                Set
+              </button>
+            </div>
+            {captureDirError && (
+              <div style={{ marginTop: 4, fontSize: 11, color: C.red }}>{captureDirError}</div>
+            )}
+            {captureDirSaved && (
+              <div style={{ marginTop: 4, fontSize: 10, color: C.muted }}>
+                Captures save to: {captureDirSaved}
+              </div>
+            )}
+          </div>
 
           {cameraConnected && (
             <>
@@ -543,11 +611,12 @@ export default function TelescopeView() {
               </div>
               {lastCapture && (
                 <div style={{ marginTop: 4, fontSize: 10, color: C.green }}>
-                  Saved: {lastCapture}
+                  Saved: {lastCapture}{isCanon ? ' (+ matching .cr2 RAW)' : ''}
                 </div>
               )}
               <div style={{ marginTop: 4, fontSize: 10, color: C.muted }}>
                 Reusing a name never overwrites — a repeat gets _1, _2, ... appended.
+                {isCanon && ' Canon captures also save the original CR2 RAW file alongside the FITS.'}
               </div>
 
               <div style={{ marginTop: 12, paddingTop: 10, borderTop: `1px solid ${C.border}` }}>

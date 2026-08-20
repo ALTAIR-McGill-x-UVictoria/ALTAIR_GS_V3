@@ -288,6 +288,36 @@ class AM5Controller(BaseMountController):
         if not tel.Connected:
             raise RuntimeError(f"ASCOM driver {progid!r} refused connection")
         logger.info("AM5 connected via ASCOM ProgID=%s — %s", progid, tel.Description)
+
+        # The driver computes its own horizon check from SiteLatitude /
+        # SiteLongitude / SiteElevation, set independently in its own setup
+        # dialog — NOT from backend.tracking.GS_LAT/GS_LON. If those go
+        # stale or were never set to this ground station's location, the
+        # driver derives a different (sometimes negative) elevation for the
+        # same RA/Dec we send and rejects the slew as "below horizon" even
+        # though our own tracking math says it's above. Push our GS
+        # position into the driver on every connect so both sides agree.
+        try:
+            from backend.tracking import GS_LAT, GS_LON, GS_ALT
+            tel.SiteLatitude  = GS_LAT
+            tel.SiteLongitude = GS_LON
+            tel.SiteElevation = GS_ALT
+            logger.info("AM5 site set to lat=%.4f lon=%.4f alt=%.1f", GS_LAT, GS_LON, GS_ALT)
+        except Exception as e:
+            logger.warning("AM5: could not set site lat/lon/elevation on driver: %s", e)
+
+        # There's no park/unpark control in this app — parking only ever
+        # happens via the mount's own hand controller or a previous ASCOM
+        # session. AtPark blocks SlewToCoordinates with a driver-level
+        # error, so unpark unconditionally on connect to keep the mount
+        # slew-ready.
+        try:
+            if getattr(tel, "AtPark", False):
+                tel.Unpark()
+                logger.info("AM5 was parked — unparked on connect")
+        except Exception as e:
+            logger.warning("AM5: could not unpark on connect: %s", e)
+
         self._telescope = tel
         self.connected = True
         self.port_name = progid   # repurpose port_name to hold the ProgID for display
@@ -334,6 +364,16 @@ class AM5Controller(BaseMountController):
         logger.info("AM5 slewed to RA=%.4fh Dec=%.4f°", ra_hours, dec_deg)
 
     def _do_goto(self, ra_hours: float, dec_deg: float) -> None:
+        # Re-push site position before every slew: GS_LAT/GS_LON can update
+        # after connect (e.g. GS GPS fix arrives later), and the driver's
+        # horizon check uses whatever it was last told, not our live value.
+        try:
+            from backend.tracking import GS_LAT, GS_LON, GS_ALT
+            self._telescope.SiteLatitude  = GS_LAT
+            self._telescope.SiteLongitude = GS_LON
+            self._telescope.SiteElevation = GS_ALT
+        except Exception as e:
+            logger.warning("AM5: could not refresh site lat/lon/elevation before goto: %s", e)
         self._telescope.Tracking = True
         self._telescope.SlewToCoordinates(ra_hours, dec_deg)
 

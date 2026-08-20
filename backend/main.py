@@ -704,14 +704,28 @@ class SerialReader:
         # literally that — see git history for the exact-match-on-"gps" bug
         # this used to have, which silently matched neither and left tracking
         # permanently unavailable.)
+        # Both sources normalize to the same schema — {lat, lon, alt,
+        # relative_alt, hdg, num_sv} — so every downstream reader (tracking
+        # loop, capture metadata) can treat _latest_gps_mavlink/_local
+        # identically regardless of which packet type populated them.
+        # relative_alt/fix_type have no MAVLink/LocalGps equivalent on the
+        # other side respectively; left None rather than guessing.
         if msg.get("type") == "packet" and msg.get("label") == "MavlinkGps":
             global _latest_gps_mavlink
-            fields = {f["name"]: f["value"] for f in msg.get("fields", [])}  # keys: lat, lon, alt, relative_alt, hdg
-            _latest_gps_mavlink = {"lat": fields.get("lat"), "lon": fields.get("lon"), "alt": fields.get("alt")}
+            fields = {f["name"]: f["value"] for f in msg.get("fields", [])}  # keys: lat, lon, alt, relative_alt, hdg, num_sv
+            _latest_gps_mavlink = {
+                "lat": fields.get("lat"), "lon": fields.get("lon"), "alt": fields.get("alt"),
+                "relative_alt": fields.get("relative_alt"), "hdg": fields.get("hdg"),
+                "num_sv": fields.get("num_sv"),
+            }
         elif msg.get("type") == "packet" and msg.get("label") == "LocalGps":
             global _latest_gps_local
             fields = {f["name"]: f["value"] for f in msg.get("fields", [])}  # keys: lat, lon, alt_msl, speed_ms, heading_deg, fix_type, num_sv
-            _latest_gps_local = {"lat": fields.get("lat"), "lon": fields.get("lon"), "alt": fields.get("alt_msl")}
+            _latest_gps_local = {
+                "lat": fields.get("lat"), "lon": fields.get("lon"), "alt": fields.get("alt_msl"),
+                "relative_alt": None, "hdg": fields.get("heading_deg"),
+                "num_sv": fields.get("num_sv"),
+            }
 
         # Log packet to CSV and evaluate alarms
         if msg.get("type") == "packet":

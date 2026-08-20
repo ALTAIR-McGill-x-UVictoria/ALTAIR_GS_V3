@@ -20,6 +20,25 @@ GS_LAT: float =  45.5088   # deg N
 GS_LON: float = -73.5542   # deg E (negative = West)
 GS_ALT: float =   0.0      # m MSL
 
+# ---------------------------------------------------------------------------
+# Manual pointing correction (software offset, not an ASCOM sync)
+# ---------------------------------------------------------------------------
+# Applied to every calculate_tracking_params() output before it reaches the
+# mount. Alternative to mc.sync() for correcting mount pointing error from a
+# plate solve: instead of editing the mount driver's own alignment model
+# (ASCOM SyncToCoordinates), the correction lives here and is added to the
+# computed Az/El on every cycle. This matters for alt-az mounts (e.g. ZWO
+# AM3 run without an equatorial wedge) where the ASCOM driver has to back a
+# sync out through its own alt-az/field-rotation math — a plain post-hoc
+# Az/El offset sidesteps that and is trivially inspectable/resettable from
+# here, at the cost of only being locally valid (it doesn't refit a
+# cone/tilt error model across the whole sky the way a real sync does).
+# Set via POST /api/telescope/offset in main.py; reset to 0 on backend
+# restart (a stale hidden correction silently carried into the next flight
+# would be worse than requiring it be re-applied).
+POINTING_OFFSET_AZ_DEG: float = 0.0
+POINTING_OFFSET_EL_DEG: float = 0.0
+
 _DEG2RAD = math.pi / 180.0
 _RAD2DEG = 180.0 / math.pi
 
@@ -221,13 +240,14 @@ def calculate_tracking_params(
     Returns
     -------
     dict with keys:
-        azimuth     (deg, 0-360 clockwise from North)
-        elevation   (deg, above horizon)
+        azimuth     (deg, 0-360 clockwise from North — includes POINTING_OFFSET_*)
+        elevation   (deg, above horizon — includes POINTING_OFFSET_*)
         distance_m  (horizontal great-circle distance, metres)
         slant_m     (3-D slant range, metres)
         gs_lat      (ground station latitude used)
         gs_lon      (ground station longitude used)
         gs_alt      (ground station altitude used)
+        offset_applied (bool — whether a non-zero manual offset was added)
     """
     dist_m = haversine_distance(GS_LAT, GS_LON, payload_lat, payload_lon)
     az     = bearing(GS_LAT, GS_LON, payload_lat, payload_lon)
@@ -235,6 +255,13 @@ def calculate_tracking_params(
 
     alt_diff = payload_alt_m - GS_ALT
     slant_m  = math.sqrt(dist_m ** 2 + alt_diff ** 2)
+
+    # Apply the manual pointing correction (if any) AFTER computing distance/
+    # slant from the true geometry, but BEFORE the RA/Dec conversion below —
+    # so RA/Dec (used by equatorial-goto mounts) reflects the same corrected
+    # Az/El an alt-az mount would be sent, keeping both mount types consistent.
+    az = (az + POINTING_OFFSET_AZ_DEG) % 360.0
+    el = el + POINTING_OFFSET_EL_DEG
 
     ra_h, dec_d = azalt_to_radec(az, el)
 
@@ -248,4 +275,5 @@ def calculate_tracking_params(
         "gs_lat":     GS_LAT,
         "gs_lon":     GS_LON,
         "gs_alt":     GS_ALT,
+        "offset_applied": bool(POINTING_OFFSET_AZ_DEG or POINTING_OFFSET_EL_DEG),
     }

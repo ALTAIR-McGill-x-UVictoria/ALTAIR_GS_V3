@@ -175,6 +175,20 @@ class NexStarController(BaseMountController):
         self.port_name = ""
         logger.info("NexStar disconnected")
 
+    def _require_hc(self):
+        """
+        Guard against _hc having gone None between a caller's `if not
+        self.connected` check and this method actually running in the
+        executor — e.g. a disconnect() queued just ahead of a goto() /
+        get_position() call in the same single-worker executor. Without
+        this, the dereference below raises a bare AttributeError instead of
+        a clear, catchable "disconnected mid-call" error.
+        """
+        hc = self._hc
+        if hc is None:
+            raise RuntimeError("NexStar disconnected while this call was queued — aborting")
+        return hc
+
     async def get_position(self) -> dict:
         pos = await self._run(self._do_get_position)
         self._last_position = pos
@@ -182,7 +196,8 @@ class NexStarController(BaseMountController):
 
     def _do_get_position(self) -> dict:
         import nexstar as ns
-        az, el = self._hc.getPosition(coordinateMode=ns.AZM_ALT, highPrecisionFlag=True)
+        hc = self._require_hc()
+        az, el = hc.getPosition(coordinateMode=ns.AZM_ALT, highPrecisionFlag=True)
         return {"azimuth": az, "elevation": el}
 
     async def goto(self, azimuth: float = 0.0, elevation: float = 0.0, **_) -> None:
@@ -208,7 +223,8 @@ class NexStarController(BaseMountController):
 
     def _do_goto(self, azimuth: float, elevation: float) -> None:
         import nexstar as ns
-        self._hc.gotoPosition(
+        hc = self._require_hc()
+        hc.gotoPosition(
             firstCoordinate=azimuth,
             secondCoordinate=elevation,
             coordinateMode=ns.AZM_ALT,
@@ -216,8 +232,9 @@ class NexStarController(BaseMountController):
         )
 
     def _do_wait_goto(self) -> None:
+        hc = self._require_hc()
         while True:
-            if not self._hc.getGotoInProgress():
+            if not hc.getGotoInProgress():
                 break
             time.sleep(0.2)
 
@@ -336,15 +353,30 @@ class AM5Controller(BaseMountController):
         self.port_name = ""
         logger.info("AM5 disconnected")
 
+    def _require_telescope(self):
+        """
+        Guard against _telescope having gone None between a caller's
+        `if not self.connected` check and this method actually running in
+        the executor — e.g. a disconnect() queued just ahead of a goto() /
+        get_position() / sync() call in the same single-worker executor.
+        Without this, the dereference below raises a bare AttributeError
+        instead of a clear, catchable "disconnected mid-call" error.
+        """
+        tel = self._telescope
+        if tel is None:
+            raise RuntimeError("AM5 disconnected while this call was queued — aborting")
+        return tel
+
     async def get_position(self) -> dict:
         pos = await self._run(self._do_get_position)
         self._last_position = pos
         return pos
 
     def _do_get_position(self) -> dict:
+        tel = self._require_telescope()
         # ASCOM reports RA (hours) and Dec (degrees)
-        ra_h  = self._telescope.RightAscension   # decimal hours
-        dec_d = self._telescope.Declination      # degrees
+        ra_h  = tel.RightAscension   # decimal hours
+        dec_d = tel.Declination      # degrees
         # Convert to Az/El for UI consistency using tracking math
         from backend.tracking import radec_to_azalt
         az, el = radec_to_azalt(ra_h, dec_d)
@@ -364,21 +396,23 @@ class AM5Controller(BaseMountController):
         logger.info("AM5 slewed to RA=%.4fh Dec=%.4f°", ra_hours, dec_deg)
 
     def _do_goto(self, ra_hours: float, dec_deg: float) -> None:
+        tel = self._require_telescope()
         # Re-push site position before every slew: GS_LAT/GS_LON can update
         # after connect (e.g. GS GPS fix arrives later), and the driver's
         # horizon check uses whatever it was last told, not our live value.
         try:
             from backend.tracking import GS_LAT, GS_LON, GS_ALT
-            self._telescope.SiteLatitude  = GS_LAT
-            self._telescope.SiteLongitude = GS_LON
-            self._telescope.SiteElevation = GS_ALT
+            tel.SiteLatitude  = GS_LAT
+            tel.SiteLongitude = GS_LON
+            tel.SiteElevation = GS_ALT
         except Exception as e:
             logger.warning("AM5: could not refresh site lat/lon/elevation before goto: %s", e)
-        self._telescope.Tracking = True
-        self._telescope.SlewToCoordinates(ra_hours, dec_deg)
+        tel.Tracking = True
+        tel.SlewToCoordinates(ra_hours, dec_deg)
 
     def _do_wait_slew(self) -> None:
-        while self._telescope.Slewing:
+        tel = self._require_telescope()
+        while tel.Slewing:
             time.sleep(0.2)
 
     async def sync(self, ra_hours: float, dec_deg: float) -> None:
@@ -394,13 +428,14 @@ class AM5Controller(BaseMountController):
         logger.info("AM5 synced to RA=%.4fh Dec=%.4f° (no slew)", ra_hours, dec_deg)
 
     def _do_sync(self, ra_hours: float, dec_deg: float) -> None:
-        if not getattr(self._telescope, "CanSync", True):
+        tel = self._require_telescope()
+        if not getattr(tel, "CanSync", True):
             raise RuntimeError(
                 "This ASCOM driver reports CanSync=False — it does not "
                 "support sync. Check the driver's capabilities in its "
                 "setup dialog."
             )
-        self._telescope.SyncToCoordinates(ra_hours, dec_deg)
+        tel.SyncToCoordinates(ra_hours, dec_deg)
 
 
 # ---------------------------------------------------------------------------
@@ -514,13 +549,28 @@ class IndiMountController(BaseMountController):
         self.port_name = ""
         logger.info("INDI mount disconnected")
 
+    def _require_indi(self):
+        """
+        Guard against _indi/_device having gone None between a caller's `if
+        not self.connected` check and this method actually running in the
+        executor — e.g. a disconnect() queued just ahead of a goto() /
+        get_position() call in the same single-worker executor. Without
+        this, the dereference below raises a bare AttributeError instead of
+        a clear, catchable "disconnected mid-call" error.
+        """
+        indi, device = self._indi, self._device
+        if indi is None or device is None:
+            raise RuntimeError("INDI mount disconnected while this call was queued — aborting")
+        return indi, device
+
     async def get_position(self) -> dict:
         pos = await self._run(self._do_get_position)
         self._last_position = pos
         return pos
 
     def _do_get_position(self) -> dict:
-        coords = self._indi.get_number(self._device, "EQUATORIAL_EOD_COORD")
+        indi, device = self._require_indi()
+        coords = indi.get_number(device, "EQUATORIAL_EOD_COORD")
         ra_h  = coords.get("RA", 0.0)
         dec_d = coords.get("DEC", 0.0)
         from backend.tracking import radec_to_azalt
@@ -535,12 +585,13 @@ class IndiMountController(BaseMountController):
         logger.info("INDI mount slewed to RA=%.4fh Dec=%.4f°", ra_hours, dec_deg)
 
     def _do_goto(self, ra_hours: float, dec_deg: float) -> None:
+        indi, device = self._require_indi()
         try:
-            self._indi.send_switch(self._device, "ON_COORD_SET", self._ON_COORD_SET_SLEW)
+            indi.send_switch(device, "ON_COORD_SET", self._ON_COORD_SET_SLEW)
         except Exception:
             pass  # some drivers default to SLEW already / don't expose this switch
-        self._indi.send_number_and_wait(self._device, "EQUATORIAL_EOD_COORD",
-                                         {"RA": ra_hours, "DEC": dec_deg}, timeout=120.0)
+        indi.send_number_and_wait(device, "EQUATORIAL_EOD_COORD",
+                                   {"RA": ra_hours, "DEC": dec_deg}, timeout=120.0)
 
 
 # ---------------------------------------------------------------------------

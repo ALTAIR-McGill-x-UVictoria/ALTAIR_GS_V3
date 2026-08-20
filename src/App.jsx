@@ -170,9 +170,14 @@ export default function App() {
             <GraphsView packets={packets} history={history} />
           )}
 
-          {activeTab === 'Telescope' && (
+          {/* Always mounted (just hidden) rather than conditionally rendered —
+              TelescopeView owns a lot of local UI state (mount/camera setup
+              fields, pointing offset inputs, plate-solve results, its own
+              /api/ws/telescope connection) that would otherwise reset every
+              time the operator switches tabs and comes back. */}
+          <div style={{ display: activeTab === 'Telescope' ? 'contents' : 'none' }}>
             <TelescopeView />
-          )}
+          </div>
 
           {activeTab === 'Settings' && (
             <SettingsView packets={packets} lastAck={lastAck} overrideChecks={overrideChecks} onOverrideChange={setOverrideChecks} currentStage={currentStage} />

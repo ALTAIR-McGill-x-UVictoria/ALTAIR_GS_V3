@@ -1031,6 +1031,16 @@ camera_controller = create_camera(os.getenv("ALTAIR_CAMERA_TYPE", "zwo"))
 # middle of a multi-second exposure.
 _capture_lock = asyncio.Lock()
 
+# Serializes every operation that reads-then-acts on the `mount_controller`
+# global: connect, disconnect, and both manual and tracking-loop goto. Without
+# this, an `await` between "read mount_controller" and "call .goto()/.connect()
+# on it" lets a concurrent request reassign or tear down the global mid-flight
+# — e.g. a disconnect racing a queued goto, or the tracking loop commanding a
+# controller object that a concurrent /mount/connect just replaced. Held for
+# the full connect/disconnect/goto call, not just the reassignment, so callers
+# that lose the race simply wait rather than observing a torn state.
+_mount_lock = asyncio.Lock()
+
 # Latest GPS data from telemetry — updated by _broadcast, read by tracking poll.
 # Tracked separately per source; _gps_source picks which one tracking uses.
 _latest_gps_mavlink: dict | None = None
@@ -1362,22 +1372,35 @@ async def _tracking_poll_loop(interval_s: float = 1.0) -> None:
             msg = {"type": "tracking", **params}
             await _broadcast_telescope(msg)
 
-            if _tracking_enabled and mount_controller is not None and mount_controller.connected:
+            # Pin the controller reference for this cycle so a concurrent
+            # /mount/connect or /mount/disconnect reassigning the global
+            # mid-cycle can't cause us to check one controller and command
+            # another. See _mount_lock's docstring.
+            mc = mount_controller
+            if _tracking_enabled and mc is not None and mc.connected:
                 if _capture_lock.locked():
                     # A capture is mid-exposure right now — skip commanding the
                     # mount this cycle rather than moving it under the sensor.
                     # We pick back up on the next 1s poll once the lock frees.
                     logger.debug("Tracking poll: capture in progress, skipping mount command")
-                elif mount_controller.mount_type in ("am5", "indi"):
-                    await mount_controller.goto(
-                        ra_hours=params["ra_hours"],
-                        dec_deg=params["dec_deg"],
-                    )
+                elif _mount_lock.locked():
+                    # A manual goto/connect/disconnect is in flight — skip this
+                    # cycle rather than queue up and stomp on it out of order.
+                    # We pick back up on the next 1s poll once the lock frees.
+                    logger.debug("Tracking poll: mount busy, skipping mount command")
                 else:
-                    await mount_controller.goto(
-                        azimuth=params["azimuth"],
-                        elevation=params["elevation"],
-                    )
+                    async with _mount_lock:
+                        # Re-check after acquiring: the lock only guarantees no
+                        # other mount op is running concurrently now, not that
+                        # `mc` is still the live controller or still connected
+                        # — a disconnect could have completed just before we
+                        # got the lock.
+                        if mc is not mount_controller or not mc.connected:
+                            logger.debug("Tracking poll: mount changed while waiting for lock, skipping")
+                        elif mc.mount_type in ("am5", "indi"):
+                            await mc.goto(ra_hours=params["ra_hours"], dec_deg=params["dec_deg"])
+                        else:
+                            await mc.goto(azimuth=params["azimuth"], elevation=params["elevation"])
         except Exception as e:
             logger.warning("Tracking poll error: %s", e)
 
@@ -2010,6 +2033,7 @@ async def telescope_ws_endpoint(ws: WebSocket):
     _telescope_clients.add(ws)
     logger.info("Telescope WS client connected (%d total)", len(_telescope_clients))
     # Send current status immediately
+    import backend.tracking as _tracking
     await ws.send_text(json.dumps({
         "type":   "telescope_status",
         "mount":  mount_controller.status_dict() if mount_controller else None,
@@ -2017,6 +2041,10 @@ async def telescope_ws_endpoint(ws: WebSocket):
         "tracking_enabled": _tracking_enabled,
         "auto_capture_enabled": _auto_capture_enabled,
         "gps_source": _gps_source,
+        "pointing_offset": {
+            "azimuth_deg":   _tracking.POINTING_OFFSET_AZ_DEG,
+            "elevation_deg": _tracking.POINTING_OFFSET_EL_DEG,
+        },
     }))
     try:
         while True:
@@ -2034,6 +2062,7 @@ async def telescope_ws_endpoint(ws: WebSocket):
 
 @app.get("/api/telescope/status")
 def get_telescope_status():
+    import backend.tracking as _tracking
     return {
         "mount":            mount_controller.status_dict() if mount_controller else None,
         "camera":           camera_controller.status_dict(),
@@ -2043,6 +2072,10 @@ def get_telescope_status():
         "latest_gps_mavlink": _latest_gps_mavlink,
         "latest_gps_local":   _latest_gps_local,
         "latest_gps":       _latest_gps_mavlink if _gps_source == "mavlink" else _latest_gps_local,
+        "pointing_offset": {
+            "azimuth_deg":   _tracking.POINTING_OFFSET_AZ_DEG,
+            "elevation_deg": _tracking.POINTING_OFFSET_EL_DEG,
+        },
     }
 
 
@@ -2067,6 +2100,51 @@ async def post_gps_source(body: dict):
     return {"ok": True, "gps_source": _gps_source}
 
 
+@app.post("/api/telescope/offset")
+async def post_telescope_offset(body: dict):
+    """
+    Set (or clear) the manual Az/El pointing correction applied in
+    backend/tracking.py's calculate_tracking_params() — the "artificial
+    offset" alternative to POST /api/telescope/solve/apply's ASCOM sync.
+
+    Unlike sync, this never touches the mount driver: it just adds a fixed
+    delta to every computed Az/El (and the RA/Dec derived from it) before
+    the tracking loop commands the mount. Works identically for every mount
+    type, including alt-az mounts (e.g. AM3 without an equatorial wedge)
+    where an ASCOM sync has to be backed out through the driver's own
+    alt-az/field-rotation math and is more failure-prone.
+
+    Body: {"azimuth_deg": float, "elevation_deg": float} — normally the
+    offset_azimuth_deg/offset_elevation_deg straight out of POST
+    /api/telescope/solve. Omit both (or POST {}) to clear the offset back
+    to zero.
+    """
+    import backend.tracking as _tracking
+    try:
+        az_off = float(body.get("azimuth_deg", 0.0))
+        el_off = float(body.get("elevation_deg", 0.0))
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "azimuth_deg/elevation_deg must be numeric"}
+
+    _tracking.POINTING_OFFSET_AZ_DEG = az_off
+    _tracking.POINTING_OFFSET_EL_DEG = el_off
+    logger.info("Telescope pointing offset set to Az %+.4f° El %+.4f°", az_off, el_off)
+    await _broadcast_telescope({
+        "type": "telescope_status",
+        "pointing_offset": {"azimuth_deg": az_off, "elevation_deg": el_off},
+    })
+    return {"ok": True, "azimuth_deg": az_off, "elevation_deg": el_off}
+
+
+@app.get("/api/telescope/offset")
+def get_telescope_offset():
+    import backend.tracking as _tracking
+    return {
+        "azimuth_deg":   _tracking.POINTING_OFFSET_AZ_DEG,
+        "elevation_deg": _tracking.POINTING_OFFSET_EL_DEG,
+    }
+
+
 @app.post("/api/telescope/mount/connect")
 async def post_mount_connect(body: dict):
     """
@@ -2082,58 +2160,78 @@ async def post_mount_connect(body: dict):
     if not port and mount_type == "nexstar":
         return {"ok": False, "error": "port required for NexStar"}
 
-    # Disconnect any existing mount first
-    if mount_controller is not None and mount_controller.connected:
-        await mount_controller.disconnect()
+    async with _mount_lock:
+        # Disconnect any existing mount first
+        if mount_controller is not None and mount_controller.connected:
+            await mount_controller.disconnect()
 
-    try:
-        mount_controller = create_mount(mount_type)
-        if mount_type == "am5":
-            await mount_controller.connect(port=port, progid=progid)
-        else:
-            await mount_controller.connect(port=port)
-        await _broadcast_telescope({"type": "telescope_status",
-                                    "mount": mount_controller.status_dict()})
-        return {"ok": True, "mount_type": mount_type}
-    except Exception as e:
-        mount_controller = None
-        return {"ok": False, "error": str(e)}
+        try:
+            mount_controller = create_mount(mount_type)
+            if mount_type == "am5":
+                await mount_controller.connect(port=port, progid=progid)
+            else:
+                await mount_controller.connect(port=port)
+            await _broadcast_telescope({"type": "telescope_status",
+                                        "mount": mount_controller.status_dict()})
+            return {"ok": True, "mount_type": mount_type}
+        except Exception as e:
+            mount_controller = None
+            return {"ok": False, "error": str(e)}
 
 
 @app.post("/api/telescope/mount/disconnect")
 async def post_mount_disconnect():
     global mount_controller
-    if mount_controller is not None:
-        await mount_controller.disconnect()
-    await _broadcast_telescope({"type": "telescope_status",
-                                 "mount": mount_controller.status_dict() if mount_controller else None})
-    return {"ok": True}
+    async with _mount_lock:
+        if mount_controller is not None:
+            await mount_controller.disconnect()
+        await _broadcast_telescope({"type": "telescope_status",
+                                     "mount": mount_controller.status_dict() if mount_controller else None})
+        return {"ok": True}
 
 
-async def _goto_after_capture(**kwargs) -> None:
+async def _goto_after_capture(mc: BaseMountController, **kwargs) -> None:
     """
-    Run mount_controller.goto(**kwargs), waiting first for any in-progress
-    capture to finish — see _capture_lock's docstring. A manual slew request
-    still gets honored, just deferred until the sensor is clear instead of
-    moving the mount mid-exposure.
+    Run mc.goto(**kwargs), waiting first for any in-progress capture to
+    finish (see _capture_lock's docstring) and serialized against any other
+    mount operation via _mount_lock. A manual slew request still gets
+    honored, just deferred until the sensor is clear instead of moving the
+    mount mid-exposure.
+
+    Takes the controller as a parameter, pinned by the caller at request
+    time, rather than reading the `mount_controller` global itself — this
+    task can sit queued for a while (behind a capture, behind the lock), and
+    by the time it runs a concurrent /mount/connect or /mount/disconnect may
+    have swapped the global out from under it. Always run to completion
+    (even against a controller that's since been superseded) rather than
+    silently commanding whatever the global happens to point to now, and
+    log rather than drop any exception, since this runs detached via
+    asyncio.create_task and nothing else observes its result.
     """
-    async with _capture_lock:
-        await mount_controller.goto(**kwargs)
+    try:
+        async with _capture_lock, _mount_lock:
+            if not mc.connected:
+                logger.warning("Mount goto aborted: mount disconnected before it could run")
+                return
+            await mc.goto(**kwargs)
+    except Exception:
+        logger.exception("Mount goto failed: %s", kwargs)
 
 
 @app.post("/api/telescope/mount/goto")
 async def post_mount_goto(body: dict):
-    if mount_controller is None or not mount_controller.connected:
+    mc = mount_controller   # pin: see _goto_after_capture's docstring
+    if mc is None or not mc.connected:
         return {"ok": False, "error": "Mount not connected"}
-    if mount_controller.mount_type in ("am5", "indi"):
+    if mc.mount_type in ("am5", "indi"):
         ra  = float(body.get("ra_hours", 0))
         dec = float(body.get("dec_deg",  0))
-        asyncio.create_task(_goto_after_capture(ra_hours=ra, dec_deg=dec))
+        asyncio.create_task(_goto_after_capture(mc, ra_hours=ra, dec_deg=dec))
         return {"ok": True, "ra_hours": ra, "dec_deg": dec}
     else:
         az = float(body.get("azimuth",   0))
         el = float(body.get("elevation", 0))
-        asyncio.create_task(_goto_after_capture(azimuth=az, elevation=el))
+        asyncio.create_task(_goto_after_capture(mc, azimuth=az, elevation=el))
         return {"ok": True, "azimuth": az, "elevation": el}
 
 
@@ -2250,17 +2348,22 @@ async def _build_capture_metadata() -> dict:
         capture_meta["gs_lon"]     = tracking.get("gs_lon")
         capture_meta["gs_alt"]     = tracking.get("gs_alt")
 
-    if mount_controller is not None:
-        capture_meta["mount_type"]       = mount_controller.mount_type
-        capture_meta["mount_port"]       = mount_controller.port_name
-        capture_meta["mount_connected"]  = mount_controller.connected
+    mc = mount_controller   # pin: avoid a torn read across the awaits below
+    if mc is not None:
+        capture_meta["mount_type"]       = mc.mount_type
+        capture_meta["mount_port"]       = mc.port_name
+        capture_meta["mount_connected"]  = mc.connected
         capture_meta["tracking_enabled"] = _tracking_enabled
-        if mount_controller.connected:
+        if mc.connected:
             # Live-query the mount's own reported pointing — distinct from
             # the tracking-computed target above, which is derived from the
             # payload's GPS fix rather than read back from the mount itself.
+            # Not wrapped in _mount_lock: this is a best-effort read-only
+            # query for metadata, not a motion command, and get_position()
+            # already fails cleanly (RuntimeError) via _require_telescope if
+            # a disconnect races it — caught below same as any other error.
             try:
-                pos = await mount_controller.get_position()
+                pos = await mc.get_position()
                 capture_meta["mount_azimuth"]   = pos.get("azimuth")
                 capture_meta["mount_elevation"] = pos.get("elevation")
                 capture_meta["mount_ra_hours"]  = pos.get("ra_hours")

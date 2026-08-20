@@ -20,15 +20,29 @@ const WS_URL = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.ho
  *                       setTracking,
  *                       connectCamera, disconnectCamera,
  *                       setCameraSettings, refreshCameraSettings, captureFrame, setAutoCapture,
- *                       solveFrame(filename, signal?) — pass an
+ *                       solveFrame(filename, signal?, method?) — pass an
  *                       AbortController's signal to allow cancelling the
  *                       wait; the astrometry.net job itself may still run
- *                       to completion server-side regardless.
+ *                       to completion server-side regardless. method is
+ *                       'web' (default, astrometry.net API) or 'local'
+ *                       (self-hosted solve-field via Docker — see
+ *                       backend/plate_solve.py).
  *                       getCaptureDir, setCaptureDir(dir) — read/set the
  *                       directory captures are saved to.
  *                       setGpsSource('mavlink'|'local') — pick which GPS
  *                       fix (Pixhawk-fused vs. onboard module) tracking
- *                       uses. }
+ *                       uses.
+ *                       setDebugGps(lat, lon, alt) — inject a fake payload
+ *                       GPS fix (bypasses serial telemetry) for exercising
+ *                       the tracking/goto pipeline before a flight — see
+ *                       backend main.py's /api/debug/set_gps.
+ *                       setPointingOffset(azDeg, elDeg) — set the manual
+ *                       Az/El correction applied in backend/tracking.py,
+ *                       the artificial-offset alternative to
+ *                       applySolveCorrection's ASCOM sync. Call with
+ *                       (0, 0) to clear it. }
+ *   pointingOffset  — { azimuth_deg, elevation_deg } currently applied by
+ *                      the backend (0/0 when no correction is active)
  */
 export function useTelescope() {
   const ws             = useRef(null)
@@ -41,6 +55,7 @@ export function useTelescope() {
   const [trackingEnabled,    setTrackingEnabled]    = useState(false)
   const [autoCaptureEnabled, setAutoCaptureEnabled] = useState(false)
   const [gpsSource,          setGpsSourceState]     = useState('mavlink')
+  const [pointingOffset,     setPointingOffsetState] = useState({ azimuth_deg: 0, elevation_deg: 0 })
 
   // Stable ref — avoids useCallback dependency cycle
   const connectRef = useRef(null)
@@ -74,6 +89,7 @@ export function useTelescope() {
         if (msg.tracking_enabled    !== undefined) setTrackingEnabled(msg.tracking_enabled)
         if (msg.auto_capture_enabled !== undefined) setAutoCaptureEnabled(msg.auto_capture_enabled)
         if (msg.gps_source          !== undefined) setGpsSourceState(msg.gps_source)
+        if (msg.pointing_offset     !== undefined) setPointingOffsetState(msg.pointing_offset)
       }
     }
   }
@@ -116,13 +132,19 @@ export function useTelescope() {
     refreshCameraSettings: ()      => post('/api/telescope/camera/refresh_settings'),
     captureFrame:      (filename)   => post('/api/telescope/camera/capture', { filename }),
     setAutoCapture:    (enabled)   => post('/api/telescope/camera/auto_capture', { enabled }),
-    solveFrame:        (filename, signal) => post('/api/telescope/solve', { filename }, signal),
+    solveFrame:        (filename, signal, method) => post('/api/telescope/solve', { filename, ...(method ? { method } : {}) }, signal),
     applySolveCorrection: (raHours, decDeg) => post('/api/telescope/solve/apply',
                          { ra_hours: raHours, dec_deg: decDeg }),
     getCaptureDir:     ()          => apiFetch('/api/gallery/config').then(r => r.json()),
     setCaptureDir:     (dir)       => post('/api/gallery/config', { capture_dir: dir }),
     setGpsSource:      (source)    => post('/api/telescope/gps_source', { source }),
+    setDebugGps:       (lat, lon, alt) => post('/api/debug/set_gps', { lat, lon, alt }),
+    setPointingOffset: (azDeg, elDeg) => post('/api/telescope/offset',
+                         { azimuth_deg: azDeg, elevation_deg: elDeg }),
   }
 
-  return { wsReady, tracking, mountStatus, cameraStatus, trackingEnabled, autoCaptureEnabled, gpsSource, actions }
+  return {
+    wsReady, tracking, mountStatus, cameraStatus, trackingEnabled, autoCaptureEnabled,
+    gpsSource, pointingOffset, actions,
+  }
 }

@@ -2403,14 +2403,20 @@ async def post_telescope_solve(body: dict):
     commands the mount itself.
 
     Body: {"filename": "<name in the capture dir>"} — defaults to the most
-    recent capture if omitted.
+    recent capture if omitted. Optional {"method": "web" | "local"}
+    (default "web") picks the solver:
+      - "web": astrometry.net's hosted API (see backend/plate_solve.py) —
+        needs ASTROMETRY_API_KEY, can take tens of seconds to a few minutes
+        per solve due to the upload + queue.
+      - "local": the same astrometry.net solve-field engine running in a
+        local Docker container (backend/plate_solve.py's LocalSolver) —
+        needs Docker running and ASTROMETRY_INDEX_DIR set to a directory of
+        downloaded index files, but has no network round-trip once set up.
 
-    Solving happens against the astrometry.net web API (see
-    backend/plate_solve.py) and can take tens of seconds to a few minutes,
-    so this is a deliberate, explicit action, not something to poll or
-    call automatically.
+    Either way this is a deliberate, explicit action, not something to poll
+    or call automatically.
     """
-    from backend.plate_solve import get_client, solve_one
+    from backend.plate_solve import get_client, solve_one, solve_one_local
     from backend.tracking import radec_to_azalt
 
     filename = body.get("filename")
@@ -2425,31 +2431,51 @@ async def post_telescope_solve(body: dict):
     if not target_path.exists():
         return {"ok": False, "error": f"Capture not found: {target_path.name}"}
 
-    ast = get_client()
-    if ast is None:
-        return {
-            "ok": False,
-            "error": "ASTROMETRY_API_KEY is not set on the server. Get a free "
-                     "key at https://nova.astrometry.net/api_help and set it "
-                     "as an environment variable, then restart the backend.",
-        }
-
+    method = body.get("method", "web")
+    timeout = int(body.get("timeout", 300))
     loop = asyncio.get_event_loop()
-    try:
-        result = await loop.run_in_executor(
-            None, solve_one, ast, target_path, int(body.get("timeout", 300))
-        )
-    except Exception as e:
-        return {"ok": False, "error": f"Solve failed: {e}"}
+
+    if method == "local":
+        try:
+            result = await loop.run_in_executor(None, solve_one_local, target_path, timeout)
+        except Exception as e:
+            return {"ok": False, "error": f"Local solve failed: {e}"}
+    elif method == "web":
+        ast = get_client()
+        if ast is None:
+            return {
+                "ok": False,
+                "error": "ASTROMETRY_API_KEY is not set on the server. Get a free "
+                         "key at https://nova.astrometry.net/api_help and set it "
+                         "as an environment variable, then restart the backend.",
+            }
+        try:
+            result = await loop.run_in_executor(None, solve_one, ast, target_path, timeout)
+        except Exception as e:
+            return {"ok": False, "error": f"Solve failed: {e}"}
+    else:
+        return {"ok": False, "error": f"Unknown method '{method}' -- expected 'web' or 'local'."}
 
     if not result.solved:
-        return {"ok": False, "error": result.message, "filename": target_path.name}
+        return {
+            "ok": False, "error": result.message, "filename": target_path.name,
+            "method": method, "elapsed_s": result.elapsed_s,
+        }
 
     response: dict = {
         "ok": True,
         "filename": target_path.name,
+        "method": method,
+        "elapsed_s": round(result.elapsed_s, 1) if result.elapsed_s is not None else None,
         "solved_ra_hours": result.solved_ra_h,
         "solved_dec_deg":  result.solved_dec_d,
+        # Pixel-space overlay data for the gallery viewer (Telescope tab) to
+        # draw the solved center + mount-reported position directly on the
+        # displayed image — see TelescopeView.jsx's plate-solve overlay.
+        "naxis1": result.naxis1,
+        "naxis2": result.naxis2,
+        "center_px": [result.center_px_x, result.center_px_y] if result.center_px_x is not None else None,
+        "mount_px":  [result.mount_px_x, result.mount_px_y] if result.mount_px_x is not None else None,
     }
 
     # Offset vs the mount's own reported pointing at capture time — this is
@@ -2508,13 +2534,14 @@ async def post_telescope_solve_apply(body: dict):
     Body: {"ra_hours": float, "dec_deg": float} — normally the
     solved_ra_hours/solved_dec_deg straight out of POST /api/telescope/solve.
     """
-    if mount_controller is None or not mount_controller.connected:
+    mc = mount_controller   # pin: see _goto_after_capture's docstring
+    if mc is None or not mc.connected:
         return {"ok": False, "error": "Mount is not connected."}
-    if mount_controller.mount_type != "am5":
+    if mc.mount_type != "am5":
         return {
             "ok": False,
             "error": f"Sync is only supported for the AM5/ASCOM mount type "
-                     f"in this backend (current: {mount_controller.mount_type}).",
+                     f"in this backend (current: {mc.mount_type}).",
         }
 
     try:
@@ -2523,14 +2550,17 @@ async def post_telescope_solve_apply(body: dict):
     except (KeyError, TypeError, ValueError):
         return {"ok": False, "error": "Body must include numeric ra_hours and dec_deg."}
 
-    try:
-        await mount_controller.sync(ra_hours, dec_deg)
-    except Exception as e:
-        return {"ok": False, "error": f"Sync failed: {e}"}
+    async with _mount_lock:
+        if not mc.connected:
+            return {"ok": False, "error": "Mount disconnected before sync could run."}
+        try:
+            await mc.sync(ra_hours, dec_deg)
+        except Exception as e:
+            return {"ok": False, "error": f"Sync failed: {e}"}
 
-    pos = await mount_controller.get_position()
-    await _broadcast_telescope({"type": "telescope_status", "mount": mount_controller.status_dict()})
-    return {"ok": True, "ra_hours": ra_hours, "dec_deg": dec_deg, "position": pos}
+        pos = await mc.get_position()
+        await _broadcast_telescope({"type": "telescope_status", "mount": mc.status_dict()})
+        return {"ok": True, "ra_hours": ra_hours, "dec_deg": dec_deg, "position": pos}
 
 
 @app.post("/api/telescope/camera/auto_capture")
@@ -2881,6 +2911,12 @@ _GALLERY_HTML = """<!DOCTYPE html>
   }
   #viewer { cursor: crosshair; }
   #crosshair-overlay { position: absolute; inset: 0; pointer-events: none; }
+  #solve-overlay { position: absolute; inset: 0; pointer-events: none; }
+  #solve-btn.busy { opacity: 0.6; cursor: default; }
+  #solve-status { font-size: 11px; line-height: 1.5; }
+  #solve-legend { display: flex; gap: 12px; margin-top: 6px; font-size: 10px; }
+  #solve-legend span { display: flex; align-items: center; gap: 4px; }
+  #solve-legend .swatch { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
 </style>
 </head>
 <body>
@@ -2893,6 +2929,9 @@ _GALLERY_HTML = """<!DOCTYPE html>
   <label style="color:var(--muted);font-size:11px">Dir:</label>
   <input type="text" id="dir-input" placeholder="captures/">
   <button onclick="setDir()">Set</button>
+  <label style="color:var(--muted);font-size:11px">Token:</label>
+  <input type="password" id="token-input" placeholder="operator token" style="width:120px" autocomplete="off">
+  <button onclick="setToken()">Unlock</button>
 </header>
 
 <div id="main">
@@ -2901,6 +2940,7 @@ _GALLERY_HTML = """<!DOCTYPE html>
     <div id="viewer">
       <div id="viewer-placeholder">Select an image from the list below.</div>
       <img id="viewer-img" src="" alt="" style="display:none">
+      <canvas id="solve-overlay"></canvas>
       <canvas id="crosshair-overlay"></canvas>
       <div id="viewer-caption" style="display:none">
         <span id="cap-name"></span>
@@ -2931,6 +2971,21 @@ _GALLERY_HTML = """<!DOCTYPE html>
     <div class="section" id="debug-section" style="font-size:10px; line-height:1.7; font-family:var(--font); background:#1a0f00; border-bottom:2px solid var(--warn, #ffaa00);">
       <div class="section-title" style="color:#ffaa00;">Debug (temporary \u2014 screenshot this box)</div>
       <div id="debug-readout" style="color:#ffcc66; white-space:pre-wrap;">hover to populate</div>
+    </div>
+    <div class="section">
+      <div class="section-title"><span>Plate Solve</span></div>
+      <div style="display:flex; gap:6px; align-items:center;">
+        <select id="solve-method" style="background:var(--bg); border:1px solid var(--border); border-radius:4px; color:var(--text); font-family:var(--font); font-size:11px; padding:3px 6px;">
+          <option value="web">astrometry.net (web)</option>
+          <option value="local">Local (Docker)</option>
+        </select>
+        <button id="solve-btn" onclick="runPlateSolve()">Solve</button>
+      </div>
+      <div id="solve-status" style="color:var(--muted); margin-top:6px;">Select an image first.</div>
+      <div id="solve-legend" style="display:none;">
+        <span><span class="swatch" style="background:var(--accent)"></span>actual center</span>
+        <span><span class="swatch" style="background:#ffd600"></span>mount belief</span>
+      </div>
     </div>
     <div class="section">
       <div class="section-title">
@@ -2976,6 +3031,34 @@ function escapeHtml(str) {
   }[c]))
 }
 
+// ── Operator token ──
+// Same sessionStorage key the React app's src/api.js uses, so a token
+// unlocked there is already present here (same browser) and vice versa.
+// Needed because backend/main.py's _require_admin_token middleware gates
+// every non-GET request (plate-solve, Set Directory) behind this token
+// whenever ALTAIR_ADMIN_TOKEN is configured.
+const TOKEN_KEY = 'altair_admin_token'
+
+function getAdminToken() {
+  return sessionStorage.getItem(TOKEN_KEY) || ''
+}
+
+function setToken() {
+  const val = document.getElementById('token-input').value.trim()
+  if (!val) return
+  sessionStorage.setItem(TOKEN_KEY, val)
+  document.getElementById('token-input').value = ''
+}
+
+// Drop-in fetch() replacement for mutating requests -- attaches the
+// operator token, if unlocked, as a Bearer header.
+function authFetch(path, options = {}) {
+  const token = getAdminToken()
+  const headers = { ...(options.headers || {}) }
+  if (token) headers.Authorization = 'Bearer ' + token
+  return fetch(path, { ...options, headers })
+}
+
 // \u2500\u2500 Pixel inspector state \u2500\u2500
 let rawPixels = null       // {width, height, channels, dtype, maxValue, data: TypedArray}
 let pixelsRequestId = 0
@@ -2984,6 +3067,14 @@ let pinnedPos = null       // {x, y} in native image pixel coords
 let lastHoverPos = null
 let rafPending = false
 let pendingEvt = null
+
+// \u2500\u2500 Plate-solve overlay state \u2500\u2500
+// Keyed by filename so switching images between already-solved captures
+// (via the list or Set Directory) restores the right overlay instead of
+// carrying over a stale one -- same correctness concern as the Telescope
+// tab's sidebar viewer.
+const solveResultsByFile = new Map()
+let solving = false
 
 const CHANNEL_META = {
   1: [{ label: 'Value', color: '#dddddd', cls: 'chan-mono' }],
@@ -3018,6 +3109,8 @@ function selectImage(img) {
     row.scrollIntoView({block: 'nearest'})
   }
   fetchRawPixels(img.filename)
+  renderSolveStatus()
+  drawSolveOverlay()
 }
 
 // ------------------------------------------------------------------
@@ -3188,6 +3281,162 @@ function drawCrosshairOverlay(x, y) {
   ctx.stroke()
 }
 
+// ------------------------------------------------------------------
+// Plate-solve overlay -- marks the true (solved) frame center and, if the
+// capture's header carried mount pointing, where the mount believed it was
+// aimed, connected by a line whose length is the pointing error. Mirrors
+// the Telescope tab's sidebar-viewer overlay (see TelescopeView.jsx) but
+// drawn as a canvas layer here since this whole page is vanilla JS.
+// ------------------------------------------------------------------
+
+async function runPlateSolve() {
+  if (!activeFile || solving) return
+  const method = document.getElementById('solve-method').value
+  const btn = document.getElementById('solve-btn')
+  solving = true
+  btn.classList.add('busy')
+  btn.textContent = 'Solving…'
+  document.getElementById('solve-status').textContent = 'Solving…'
+  document.getElementById('solve-status').style.color = 'var(--muted)'
+
+  try {
+    const res = await authFetch('/api/telescope/solve', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ filename: activeFile, method }),
+    })
+    const data = await res.json()
+    if (!res.ok) {
+      // Middleware auth failures (and other non-2xx errors) come back as
+      // {detail: "..."} (FastAPI's default shape), not {ok, error} —
+      // normalize both so renderSolveStatus always has a real message
+      // instead of "undefined".
+      solveResultsByFile.set(activeFile, { ok: false, error: data.detail || data.error || ('HTTP ' + res.status) })
+    } else {
+      solveResultsByFile.set(activeFile, data)
+    }
+  } catch (e) {
+    solveResultsByFile.set(activeFile, { ok: false, error: e.message || 'Solve failed' })
+  } finally {
+    solving = false
+    btn.classList.remove('busy')
+    btn.textContent = 'Solve'
+    renderSolveStatus()
+    drawSolveOverlay()
+  }
+}
+
+function renderSolveStatus() {
+  const el = document.getElementById('solve-status')
+  const legend = document.getElementById('solve-legend')
+  const result = activeFile ? solveResultsByFile.get(activeFile) : null
+
+  if (!activeFile) {
+    el.style.color = 'var(--muted)'
+    el.textContent = 'Select an image first.'
+    legend.style.display = 'none'
+    return
+  }
+  if (!result) {
+    el.style.color = 'var(--muted)'
+    el.textContent = 'Not solved yet.'
+    legend.style.display = 'none'
+    return
+  }
+  if (!result.ok) {
+    el.style.color = '#ff4444'
+    el.textContent = result.error + (result.elapsed_s != null ? ' (after ' + result.elapsed_s.toFixed(1) + 's)' : '')
+    legend.style.display = 'none'
+    return
+  }
+  el.style.color = 'var(--text)'
+  const parts = [
+    'Solved (' + result.method + (result.elapsed_s != null ? ', ' + result.elapsed_s.toFixed(1) + 's' : '') + '): ' +
+    'RA ' + result.solved_ra_hours.toFixed(4) + 'h, Dec ' + result.solved_dec_deg.toFixed(4) + '°',
+  ]
+  if (result.err_vs_mount_arcsec != null) {
+    parts.push('Error vs mount: ' + (result.err_vs_mount_arcsec / 60).toFixed(1) + '′')
+  }
+  el.innerHTML = parts.map(escapeHtml).join('<br>')
+  legend.style.display = result.center_px ? 'flex' : 'none'
+}
+
+function computeSolveDisplayBox(naxis1, naxis2) {
+  // Independent of rawPixels/computeDisplayBox() -- the solve result can be
+  // available before or after the raw-pixel fetch resolves, and describes
+  // the same displayed <img> either way, so this reads the display box
+  // straight from the DOM rather than depending on that other fetch.
+  const imgEl = document.getElementById('viewer-img')
+  const dispW = imgEl.clientWidth
+  const dispH = imgEl.clientHeight
+  return {
+    scaleX: dispW / naxis1,
+    scaleY: dispH / naxis2,
+    dispW, dispH,
+    viewerOffX: imgEl.offsetLeft,
+    viewerOffY: imgEl.offsetTop,
+  }
+}
+
+function drawSolveOverlay() {
+  const canvas = document.getElementById('solve-overlay')
+  const viewerEl = document.getElementById('viewer')
+  const cssW = viewerEl.clientWidth
+  const cssH = viewerEl.clientHeight
+  const dpr = window.devicePixelRatio || 1
+  const w = Math.max(1, Math.round(cssW * dpr))
+  const h = Math.max(1, Math.round(cssH * dpr))
+  if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h }
+  const ctx = canvas.getContext('2d')
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+  ctx.clearRect(0, 0, cssW, cssH)
+
+  const result = activeFile ? solveResultsByFile.get(activeFile) : null
+  if (!result || !result.ok || !result.center_px || !result.naxis1 || !result.naxis2) return
+
+  const box = computeSolveDisplayBox(result.naxis1, result.naxis2)
+  if (box.dispW === 0 || box.dispH === 0) return
+
+  const toScreen = ([px, py]) => [
+    box.viewerOffX + px * box.scaleX,
+    box.viewerOffY + py * box.scaleY,
+  ]
+  const [cx, cy] = toScreen(result.center_px)
+  const r = 14
+  const font = '11px ' + getComputedStyle(document.body).fontFamily
+
+  if (result.mount_px) {
+    const [mx, my] = toScreen(result.mount_px)
+    ctx.strokeStyle = '#ffd600'
+    ctx.setLineDash([6, 4])
+    ctx.lineWidth = 1
+    ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(mx, my); ctx.stroke()
+    ctx.setLineDash([])
+
+    ctx.lineWidth = 2
+    ctx.beginPath()
+    ctx.moveTo(mx - r, my - r); ctx.lineTo(mx + r, my + r)
+    ctx.moveTo(mx - r, my + r); ctx.lineTo(mx + r, my - r)
+    ctx.stroke()
+    ctx.fillStyle = '#ffd600'
+    ctx.font = font
+    ctx.fillText('mount belief', mx + r * 1.2, my - r * 0.3)
+  }
+
+  ctx.strokeStyle = '#00e5ff'
+  ctx.lineWidth = 2
+  ctx.beginPath()
+  ctx.moveTo(cx - r, cy); ctx.lineTo(cx + r, cy)
+  ctx.moveTo(cx, cy - r); ctx.lineTo(cx, cy + r)
+  ctx.stroke()
+  ctx.beginPath()
+  ctx.arc(cx, cy, r * 0.5, 0, Math.PI * 2)
+  ctx.stroke()
+  ctx.fillStyle = '#00e5ff'
+  ctx.font = font
+  ctx.fillText('actual center', cx + r * 1.2, cy - r * 0.3)
+}
+
 function pixelValuesAt(x, y) {
   const { data, width, channels } = rawPixels
   const idx = (y * width + x) * channels
@@ -3345,6 +3594,7 @@ const viewerImgEl = document.getElementById('viewer-img')
 // event lands *after* it becomes ready to naturally refresh the crosshair.
 // Re-render explicitly once the image is actually decoded and laid out.
 viewerImgEl.addEventListener('load', () => {
+  drawSolveOverlay()
   if (!rawPixels) return
   if (pinned && pinnedPos) {
     updateCrosshairAndProfiles(pinnedPos.x, pinnedPos.y)
@@ -3403,6 +3653,7 @@ let resizeTimer = null
 window.addEventListener('resize', () => {
   clearTimeout(resizeTimer)
   resizeTimer = setTimeout(() => {
+    drawSolveOverlay()
     if (!rawPixels) return
     if (pinned && pinnedPos) updateCrosshairAndProfiles(pinnedPos.x, pinnedPos.y)
     else drawCrosshairOverlay(null, null)
@@ -3464,6 +3715,11 @@ async function loadImages() {
       if (current) {
         const viewImg = document.getElementById('viewer-img')
         if (viewImg.src !== location.origin + current.full_url) {
+          // Same filename, new pixel content (overwritten capture) -- any
+          // cached solve now describes a different image, so drop it
+          // rather than show a mismatched overlay.
+          solveResultsByFile.delete(activeFile)
+          renderSolveStatus()
           viewImg.src = current.full_url
         }
       }
@@ -3491,7 +3747,7 @@ async function loadConfig() {
 async function setDir() {
   const val = document.getElementById('dir-input').value.trim()
   if (!val) return
-  const res = await fetch('/api/gallery/config', {
+  const res = await authFetch('/api/gallery/config', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({capture_dir: val})
@@ -3502,6 +3758,8 @@ async function setDir() {
     knownFiles.clear()
     activeFile = null
     loadImages()
+  } else {
+    alert(data.detail || data.error || 'Failed to set directory (HTTP ' + res.status + ')')
   }
 }
 

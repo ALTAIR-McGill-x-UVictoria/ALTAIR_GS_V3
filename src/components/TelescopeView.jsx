@@ -118,6 +118,7 @@ export default function TelescopeView() {
     trackingEnabled,
     autoCaptureEnabled,
     gpsSource,
+    pointingOffset,
     actions,
   } = useTelescope()
 
@@ -135,16 +136,30 @@ export default function TelescopeView() {
   const [manualEl,     setManualEl]    = useState('')
   const [manualRa,     setManualRa]    = useState('')
   const [manualDec,    setManualDec]   = useState('')
+  const [testOffsetN,  setTestOffsetN] = useState('500')
+  const [testOffsetE,  setTestOffsetE] = useState('0')
+  const [testOffsetAlt, setTestOffsetAlt] = useState('1000')
+  const [testLat,      setTestLat]     = useState('')
+  const [testLon,      setTestLon]     = useState('')
+  const [testAlt,      setTestAlt]     = useState('')
+  const [testGpsError, setTestGpsError] = useState(null)
+  const [testGpsLast,  setTestGpsLast]  = useState(null)
   const [capturePath,  setCapturePath] = useState('')
   const [lastCapture,  setLastCapture] = useState(null)
   const [busy,         setBusy]        = useState(false)
   const [solving,      setSolving]     = useState(false)
+  const [solveMethod,  setSolveMethod] = useState('web')
   const [solveResult,  setSolveResult] = useState(null)
   const [solveError,   setSolveError]  = useState(null)
   const [applyArmed,   setApplyArmed]  = useState(false)
   const [applying,     setApplying]    = useState(false)
   const [applyError,   setApplyError]  = useState(null)
   const [applyDone,    setApplyDone]   = useState(false)
+  const [offsetError,  setOffsetError] = useState(null)
+  const [offsetDone,   setOffsetDone]  = useState(false)
+  const [offsetAzInput, setOffsetAzInput] = useState('0')
+  const [offsetElInput, setOffsetElInput] = useState('0')
+  const [offsetBusy,    setOffsetBusy]    = useState(false)
   const solveAbortRef = useRef(null)
   const [images,       setImages]      = useState([])
   const [activeIndex,  setActiveIndex] = useState(0)
@@ -202,6 +217,38 @@ export default function TelescopeView() {
   useEffect(() => {
     refreshPorts()
   }, [refreshPorts])
+
+  // Keep the manual offset inputs showing what the backend actually has
+  // applied (e.g. after a plate-solve Apply Correction, or another client's
+  // edit) rather than stale local state — but only while the operator isn't
+  // actively mid-edit here, so a live update doesn't yank text out from
+  // under them while typing.
+  const offsetInputsFocused = useRef(false)
+  useEffect(() => {
+    if (offsetInputsFocused.current || !pointingOffset) return
+    setOffsetAzInput(String(pointingOffset.azimuth_deg ?? 0))
+    setOffsetElInput(String(pointingOffset.elevation_deg ?? 0))
+  }, [pointingOffset])
+
+  // Flat-earth offset -> lat/lon, good enough at the few-km ranges this
+  // panel is used for. Mirrors backend/emulator.py's _M_PER_DEG constants.
+  const M_PER_DEG_LAT = 111_000
+  const M_PER_DEG_LON = 80_000 // approx at ~45°N; fine for a pre-flight smoke test
+
+  function offsetToLatLon(offsetNm, offsetEm) {
+    const gsLat = tracking?.gs_lat ?? 45.5088
+    const gsLon = tracking?.gs_lon ?? -73.5542
+    return {
+      lat: gsLat + offsetNm / M_PER_DEG_LAT,
+      lon: gsLon + offsetEm / M_PER_DEG_LON,
+    }
+  }
+
+  async function sendTestGps(lat, lon, alt) {
+    setTestGpsError(null)
+    const res = await run(() => actions.setDebugGps(lat, lon, alt), setTestGpsError)
+    if (res?.ok) setTestGpsLast({ lat, lon, alt })
+  }
 
   const mountConnected  = mountStatus?.connected  ?? false
   const activeMountType = mountStatus?.mount_type ?? mountType
@@ -271,6 +318,9 @@ export default function TelescopeView() {
             {images.length} capture{images.length !== 1 ? 's' : ''}
           </span>
         </div>
+
+        <div style={styles.columnsRow}>
+        <div style={styles.column}>
 
         <Section title="Mount">
           <div style={styles.rowFlex}>
@@ -437,6 +487,154 @@ export default function TelescopeView() {
             <Row label="Telescope WS" value={wsReady ? 'connected' : 'disconnected'} />
           </div>
         </Section>
+
+        <Section title="Pointing Offset">
+          <div style={{ fontSize: 10, color: C.muted, marginBottom: 8 }}>
+            Manual Az/El correction added to every computed tracking target
+            (backend/tracking.py) — never touches the mount driver, so it
+            works the same for any mount type. Adjust by hand, or fill it
+            from a plate solve below. Resets to zero on backend restart.
+          </div>
+          <div style={styles.inputRow}>
+            <input style={{ ...styles.input, width: 90 }} value={offsetAzInput}
+              onFocus={() => { offsetInputsFocused.current = true }}
+              onBlur={()  => { offsetInputsFocused.current = false }}
+              onChange={e => setOffsetAzInput(e.target.value)} placeholder="Az offset °" />
+            <input style={{ ...styles.input, width: 90 }} value={offsetElInput}
+              onFocus={() => { offsetInputsFocused.current = true }}
+              onBlur={()  => { offsetInputsFocused.current = false }}
+              onChange={e => setOffsetElInput(e.target.value)} placeholder="El offset °" />
+            <button style={styles.btnGreen} disabled={offsetBusy}
+              onClick={async () => {
+                setOffsetBusy(true)
+                setOffsetError(null)
+                setOffsetDone(false)
+                try {
+                  const res = await actions.setPointingOffset(
+                    parseFloat(offsetAzInput) || 0, parseFloat(offsetElInput) || 0)
+                  if (res.ok) setOffsetDone(true)
+                  else setOffsetError(res.error || 'Failed to set offset')
+                } catch (e) {
+                  setOffsetError(e.message || 'Failed to set offset')
+                } finally {
+                  setOffsetBusy(false)
+                }
+              }}>
+              Apply
+            </button>
+            <button style={styles.btn} disabled={offsetBusy}
+              onClick={async () => {
+                setOffsetBusy(true)
+                setOffsetError(null)
+                try {
+                  await actions.setPointingOffset(0, 0)
+                  setOffsetAzInput('0')
+                  setOffsetElInput('0')
+                  setOffsetDone(false)
+                } catch (e) {
+                  setOffsetError(e.message || 'Failed to clear offset')
+                } finally {
+                  setOffsetBusy(false)
+                }
+              }}>
+              Clear
+            </button>
+          </div>
+          {pointingOffset && (pointingOffset.azimuth_deg || pointingOffset.elevation_deg) ? (
+            <div style={{ marginTop: 6, fontSize: 10, color: C.accent }}>
+              Active: Az {pointingOffset.azimuth_deg >= 0 ? '+' : ''}
+              {pointingOffset.azimuth_deg.toFixed(3)}°,
+              {' '}El {pointingOffset.elevation_deg >= 0 ? '+' : ''}
+              {pointingOffset.elevation_deg.toFixed(3)}°
+            </div>
+          ) : (
+            <div style={{ marginTop: 6, fontSize: 10, color: C.muted }}>No offset applied.</div>
+          )}
+          {offsetError && (
+            <div style={{ marginTop: 4, fontSize: 11, color: C.red }}>{offsetError}</div>
+          )}
+          {offsetDone && (
+            <div style={{ marginTop: 4, fontSize: 11, color: C.green }}>
+              Offset applied — future tracking corrected.
+            </div>
+          )}
+        </Section>
+
+        <Section title="Test Tracking (no payload GPS)">
+          <div style={{ fontSize: 10, color: C.muted, marginBottom: 8 }}>
+            Injects a fake payload GPS fix via /api/debug/set_gps so you can
+            confirm goto + Auto-Track work before launch, without waiting on
+            real telemetry. Connect the mount first.
+          </div>
+
+          <label style={{ ...styles.label, display: 'block', marginBottom: 4 }}>
+            Offset from ground station
+          </label>
+          <div style={styles.inputRow}>
+            <input style={{ ...styles.input, width: 70 }} value={testOffsetN}
+              onChange={e => setTestOffsetN(e.target.value)} placeholder="N (m)" />
+            <input style={{ ...styles.input, width: 70 }} value={testOffsetE}
+              onChange={e => setTestOffsetE(e.target.value)} placeholder="E (m)" />
+            <input style={{ ...styles.input, width: 70 }} value={testOffsetAlt}
+              onChange={e => setTestOffsetAlt(e.target.value)} placeholder="Alt (m MSL)" />
+          </div>
+          <div style={{ ...styles.inputRow, marginTop: 6 }}>
+            <button style={styles.btn} disabled={!mountConnected || busy}
+              onClick={() => {
+                const { lat, lon } = offsetToLatLon(
+                  parseFloat(testOffsetN) || 0,
+                  parseFloat(testOffsetE) || 0,
+                )
+                sendTestGps(lat, lon, parseFloat(testOffsetAlt) || 0)
+              }}>
+              Inject Fake Fix
+            </button>
+          </div>
+
+          <div style={{ marginTop: 10, paddingTop: 8, borderTop: `1px solid ${C.border}` }}>
+            <label style={{ ...styles.label, display: 'block', marginBottom: 4 }}>
+              Or raw lat / lon / alt
+            </label>
+            <div style={styles.inputRow}>
+              <input style={{ ...styles.input, width: 90 }} value={testLat}
+                onChange={e => setTestLat(e.target.value)} placeholder="Lat °" />
+              <input style={{ ...styles.input, width: 90 }} value={testLon}
+                onChange={e => setTestLon(e.target.value)} placeholder="Lon °" />
+              <input style={{ ...styles.input, width: 80 }} value={testAlt}
+                onChange={e => setTestAlt(e.target.value)} placeholder="Alt (m)" />
+            </div>
+            <div style={{ ...styles.inputRow, marginTop: 6 }}>
+              <button style={styles.btn} disabled={!mountConnected || busy || !testLat || !testLon}
+                onClick={() => sendTestGps(
+                  parseFloat(testLat) || 0,
+                  parseFloat(testLon) || 0,
+                  parseFloat(testAlt) || 0,
+                )}>
+                Inject Raw Fix
+              </button>
+            </div>
+          </div>
+
+          {testGpsError && (
+            <div style={{ marginTop: 6, fontSize: 11, color: C.red }}>{testGpsError}</div>
+          )}
+          {testGpsLast && (
+            <div style={{ marginTop: 6, fontSize: 10, color: C.muted }}>
+              Last injected: {testGpsLast.lat.toFixed(6)}, {testGpsLast.lon.toFixed(6)}, {testGpsLast.alt.toFixed(0)} m
+              — watch Tracking Geometry above and confirm the mount slews.
+              With Auto-Track on, injecting a new fix here should re-slew
+              within ~1 s without touching GoTo.
+            </div>
+          )}
+          {!mountConnected && (
+            <div style={{ marginTop: 6, fontSize: 10, color: C.yellow }}>
+              Connect the mount above to enable injection.
+            </div>
+          )}
+        </Section>
+
+        </div>
+        <div style={styles.column}>
 
         <Section title="Camera">
           <div style={styles.rowFlex}>
@@ -619,148 +817,6 @@ export default function TelescopeView() {
                 {isCanon && ' Canon captures also save the original CR2 RAW file alongside the FITS.'}
               </div>
 
-              <div style={{ marginTop: 12, paddingTop: 10, borderTop: `1px solid ${C.border}` }}>
-                <div style={{ ...styles.inputRow }}>
-                  <button style={styles.btn} disabled={solving || !activeImg}
-                    onClick={async () => {
-                      setSolving(true)
-                      setSolveError(null)
-                      setSolveResult(null)
-                      setApplyArmed(false)
-                      setApplyError(null)
-                      setApplyDone(false)
-                      const controller = new AbortController()
-                      solveAbortRef.current = controller
-                      try {
-                        const res = await actions.solveFrame(activeImg.filename, controller.signal)
-                        if (res.ok) setSolveResult(res)
-                        else setSolveError(res.error || 'Solve failed')
-                      } catch (e) {
-                        if (e.name === 'AbortError') {
-                          setSolveError('Cancelled — the solve may still finish on '
-                            + 'astrometry.net\'s servers, but this page stopped waiting for it.')
-                        } else {
-                          setSolveError(e.message || 'Solve failed')
-                        }
-                      } finally {
-                        solveAbortRef.current = null
-                        setSolving(false)
-                      }
-                    }}>
-                    {solving ? 'Solving…' : 'Plate-Solve Current Image'}
-                  </button>
-                  {solving && (
-                    <button style={styles.btnDanger}
-                      onClick={() => solveAbortRef.current?.abort()}>
-                      Cancel
-                    </button>
-                  )}
-                </div>
-                <div style={{ marginTop: 4, fontSize: 10, color: C.muted }}>
-                  {activeImg
-                    ? <>Solves "{activeImg.filename}" against astrometry.net (can take a
-                        minute or more) and reports how far off the mount actually is —
-                        read-only, nothing is sent to the mount.</>
-                    : 'Capture or select an image first.'}
-                </div>
-                {solving && (
-                  <div style={{ marginTop: 6, fontSize: 10, color: C.muted }}>
-                    Submitted to astrometry.net — this can take a while, other controls
-                    still work while you wait. Cancel stops this page from waiting on it;
-                    the solve may still complete on astrometry.net's end regardless.
-                  </div>
-                )}
-                {solveError && (
-                  <div style={{ marginTop: 6, fontSize: 11, color: C.red }}>{solveError}</div>
-                )}
-                {solveResult && (
-                  <div style={{
-                    marginTop: 6, padding: 8, borderRadius: 4,
-                    border: `1px solid ${C.border}`, background: '#0e2030',
-                    fontSize: 11, color: C.text, lineHeight: 1.6,
-                  }}>
-                    <div>Solved center: RA {solveResult.solved_ra_hours?.toFixed(4)}h,
-                      Dec {solveResult.solved_dec_deg?.toFixed(4)}°</div>
-                    {solveResult.offset_azimuth_deg !== undefined ? (
-                      <>
-                        <div style={{ marginTop: 4, color: C.accent, fontWeight: 600 }}>
-                          Add to mount: Az {solveResult.offset_azimuth_deg >= 0 ? '+' : ''}
-                          {solveResult.offset_azimuth_deg.toFixed(3)}°,
-                          {' '}El {solveResult.offset_elevation_deg >= 0 ? '+' : ''}
-                          {solveResult.offset_elevation_deg.toFixed(3)}°
-                        </div>
-                        <div style={{ marginTop: 2, fontSize: 10, color: C.muted }}>
-                          Mount reported Az {solveResult.mount_azimuth?.toFixed(3)}°,
-                          El {solveResult.mount_elevation?.toFixed(3)}° at capture time —
-                          total error {(solveResult.err_vs_mount_arcsec / 60).toFixed(1)}′
-                        </div>
-
-                        {activeMountType === 'am5' ? (
-                          <div style={{ marginTop: 8, paddingTop: 8, borderTop: `1px solid ${C.border}` }}>
-                            <button
-                              style={applyArmed ? styles.btnDanger : styles.btn}
-                              disabled={applying || !mountConnected}
-                              onClick={async () => {
-                                if (!applyArmed) { setApplyArmed(true); return }
-                                setApplying(true)
-                                setApplyError(null)
-                                try {
-                                  const res = await actions.applySolveCorrection(
-                                    solveResult.solved_ra_hours, solveResult.solved_dec_deg)
-                                  if (res.ok) setApplyDone(true)
-                                  else setApplyError(res.error || 'Apply failed')
-                                } catch (e) {
-                                  setApplyError(e.message || 'Apply failed')
-                                } finally {
-                                  setApplying(false)
-                                  setApplyArmed(false)
-                                }
-                              }}>
-                              {applying ? 'Syncing…'
-                                : applyArmed ? 'Confirm: sync mount to solved position'
-                                : 'Apply Correction'}
-                            </button>
-                            {applyArmed && !applying && (
-                              <button style={{ ...styles.btn, marginLeft: 6 }}
-                                onClick={() => setApplyArmed(false)}>
-                                Cancel
-                              </button>
-                            )}
-                            <div style={{ marginTop: 4, fontSize: 10, color: C.muted }}>
-                              {!mountConnected
-                                ? 'Mount not connected.'
-                                : applyArmed
-                                  ? 'This tells the mount\'s ASCOM driver it is actually at the '
-                                    + 'solved RA/Dec above (a sync — the mount does not physically '
-                                    + 'move). Click again to confirm, or Cancel.'
-                                  : 'Syncs the AM5\'s ASCOM alignment model to the solved position '
-                                    + 'above. No physical movement; corrects future gotos.'}
-                            </div>
-                            {applyError && (
-                              <div style={{ marginTop: 4, fontSize: 11, color: C.red }}>{applyError}</div>
-                            )}
-                            {applyDone && (
-                              <div style={{ marginTop: 4, fontSize: 11, color: C.green }}>
-                                Synced — mount alignment updated.
-                              </div>
-                            )}
-                          </div>
-                        ) : (
-                          <div style={{ marginTop: 6, fontSize: 10, color: C.muted }}>
-                            Apply Correction is only available for the AM5/ASCOM mount
-                            (current: {activeMountType || 'none connected'}).
-                          </div>
-                        )}
-                      </>
-                    ) : (
-                      <div style={{ marginTop: 4, fontSize: 10, color: C.muted }}>
-                        No mount pointing recorded in this capture's metadata to compare against.
-                      </div>
-                    )}
-                  </div>
-                )}
-              </div>
-
               <div style={{ ...styles.rowFlex, marginTop: 12, paddingTop: 10, borderTop: `1px solid ${C.border}` }}>
                 <StatusDot ok={autoCaptureEnabled} />
                 <span style={{ color: C.text, fontSize: 12 }}>
@@ -784,6 +840,210 @@ export default function TelescopeView() {
           )}
         </Section>
 
+        <Section title="Plate Solve">
+          <div style={{ marginBottom: 8, fontSize: 10, color: C.muted }}>
+            Works on any capture already on disk — the camera doesn't need to be
+            connected to solve a previously saved image.
+          </div>
+          <div style={{ ...styles.inputRow, marginBottom: 8 }}>
+            <label style={styles.label}>Solver</label>
+            <select
+              style={{ ...styles.input, flex: 0, minWidth: 160 }}
+              value={solveMethod}
+              onChange={e => setSolveMethod(e.target.value)}
+              disabled={solving}
+            >
+              <option value="web">astrometry.net (web API)</option>
+              <option value="local">Local (Docker solve-field)</option>
+            </select>
+          </div>
+          <div style={{ ...styles.inputRow }}>
+            <button style={styles.btn} disabled={solving || !activeImg}
+              onClick={async () => {
+                setSolving(true)
+                setSolveError(null)
+                setSolveResult(null)
+                setApplyArmed(false)
+                setApplyError(null)
+                setApplyDone(false)
+                const controller = new AbortController()
+                solveAbortRef.current = controller
+                try {
+                  const res = await actions.solveFrame(activeImg.filename, controller.signal, solveMethod)
+                  if (res.ok) setSolveResult(res)
+                  else setSolveError(
+                    (res.error || 'Solve failed')
+                    + (res.elapsed_s != null ? ` (after ${res.elapsed_s.toFixed(1)}s)` : ''))
+                } catch (e) {
+                  if (e.name === 'AbortError') {
+                    setSolveError('Cancelled — the solve may still finish server-side, '
+                      + 'but this page stopped waiting for it.')
+                  } else {
+                    setSolveError(e.message || 'Solve failed')
+                  }
+                } finally {
+                  solveAbortRef.current = null
+                  setSolving(false)
+                }
+              }}>
+              {solving ? 'Solving…' : 'Plate-Solve Current Image'}
+            </button>
+            {solving && (
+              <button style={styles.btnDanger}
+                onClick={() => solveAbortRef.current?.abort()}>
+                Cancel
+              </button>
+            )}
+          </div>
+          <div style={{ marginTop: 4, fontSize: 10, color: C.muted }}>
+            {activeImg
+              ? <>Solves "{activeImg.filename}" using {solveMethod === 'local'
+                  ? 'the local Docker solve-field engine (no network round-trip, '
+                    + 'needs Docker + index files set up on the server)'
+                  : 'astrometry.net\'s web API (can take a minute or more)'}
+                  {' '}and reports how far off the mount actually is —
+                  read-only, nothing is sent to the mount.</>
+              : 'Capture or select an image first.'}
+          </div>
+          {solving && (
+            <div style={{ marginTop: 6, fontSize: 10, color: C.muted }}>
+              {solveMethod === 'local'
+                ? 'Solving locally via Docker — other controls still work while you wait.'
+                : 'Submitted to astrometry.net — this can take a while, other controls '
+                  + 'still work while you wait. Cancel stops this page from waiting on it; '
+                  + 'the solve may still complete on astrometry.net\'s end regardless.'}
+            </div>
+          )}
+          {solveError && (
+            <div style={{ marginTop: 6, fontSize: 11, color: C.red }}>{solveError}</div>
+          )}
+          {solveResult && (
+            <div style={{
+              marginTop: 6, padding: 8, borderRadius: 4,
+              border: `1px solid ${C.border}`, background: '#0e2030',
+              fontSize: 11, color: C.text, lineHeight: 1.6,
+            }}>
+              <div>Solved center ({solveResult.method === 'local' ? 'local' : 'web'}
+                {solveResult.elapsed_s != null ? `, ${solveResult.elapsed_s.toFixed(1)}s` : ''}):
+                {' '}RA {solveResult.solved_ra_hours?.toFixed(4)}h,
+                Dec {solveResult.solved_dec_deg?.toFixed(4)}°</div>
+              {solveResult.offset_azimuth_deg !== undefined ? (
+                <>
+                  <div style={{ marginTop: 4, color: C.accent, fontWeight: 600 }}>
+                    Add to mount: Az {solveResult.offset_azimuth_deg >= 0 ? '+' : ''}
+                    {solveResult.offset_azimuth_deg.toFixed(3)}°,
+                    {' '}El {solveResult.offset_elevation_deg >= 0 ? '+' : ''}
+                    {solveResult.offset_elevation_deg.toFixed(3)}°
+                  </div>
+                  <div style={{ marginTop: 2, fontSize: 10, color: C.muted }}>
+                    Mount reported Az {solveResult.mount_azimuth?.toFixed(3)}°,
+                    El {solveResult.mount_elevation?.toFixed(3)}° at capture time —
+                    total error {(solveResult.err_vs_mount_arcsec / 60).toFixed(1)}′
+                  </div>
+
+                  <div style={{ marginTop: 8, paddingTop: 8, borderTop: `1px solid ${C.border}` }}>
+                    <button style={styles.btnGreen} disabled={applying}
+                      onClick={async () => {
+                        setApplying(true)
+                        setOffsetError(null)
+                        setOffsetDone(false)
+                        try {
+                          const res = await actions.setPointingOffset(
+                            solveResult.offset_azimuth_deg, solveResult.offset_elevation_deg)
+                          if (res.ok) {
+                            setOffsetAzInput(String(solveResult.offset_azimuth_deg))
+                            setOffsetElInput(String(solveResult.offset_elevation_deg))
+                            setOffsetDone(true)
+                          } else {
+                            setOffsetError(res.error || 'Failed to set offset')
+                          }
+                        } catch (e) {
+                          setOffsetError(e.message || 'Failed to set offset')
+                        } finally {
+                          setApplying(false)
+                        }
+                      }}>
+                      {applying ? 'Applying…' : 'Use This Offset'}
+                    </button>
+                    <div style={{ marginTop: 4, fontSize: 10, color: C.muted }}>
+                      Sets the Pointing Offset above to this Az/El delta — never
+                      touches the mount driver, works for any mount type. Fine-tune
+                      it manually in the Pointing Offset section once applied.
+                    </div>
+                    {offsetError && (
+                      <div style={{ marginTop: 4, fontSize: 11, color: C.red }}>{offsetError}</div>
+                    )}
+                    {offsetDone && (
+                      <div style={{ marginTop: 4, fontSize: 11, color: C.green }}>
+                        Offset applied — future tracking corrected.
+                      </div>
+                    )}
+
+                    {activeMountType === 'am5' && (
+                      <div style={{ marginTop: 10, paddingTop: 8, borderTop: `1px solid ${C.border}` }}>
+                        <button
+                          style={applyArmed ? styles.btnDanger : styles.btn}
+                          disabled={applying || !mountConnected}
+                          onClick={async () => {
+                            if (!applyArmed) { setApplyArmed(true); return }
+                            setApplying(true)
+                            setApplyError(null)
+                            try {
+                              const res = await actions.applySolveCorrection(
+                                solveResult.solved_ra_hours, solveResult.solved_dec_deg)
+                              if (res.ok) setApplyDone(true)
+                              else setApplyError(res.error || 'Apply failed')
+                            } catch (e) {
+                              setApplyError(e.message || 'Apply failed')
+                            } finally {
+                              setApplying(false)
+                              setApplyArmed(false)
+                            }
+                          }}>
+                          {applying ? 'Syncing…'
+                            : applyArmed ? 'Confirm: sync mount to solved position'
+                            : 'Apply via ASCOM Sync Instead'}
+                        </button>
+                        {applyArmed && !applying && (
+                          <button style={{ ...styles.btn, marginLeft: 6 }}
+                            onClick={() => setApplyArmed(false)}>
+                            Cancel
+                          </button>
+                        )}
+                        <div style={{ marginTop: 4, fontSize: 10, color: C.muted }}>
+                          {!mountConnected
+                            ? 'Mount not connected.'
+                            : applyArmed
+                              ? 'This tells the mount\'s ASCOM driver it is actually at the '
+                                + 'solved RA/Dec above (a sync — the mount does not physically '
+                                + 'move). Click again to confirm, or Cancel.'
+                              : 'Alternative to the offset above: syncs the AM5\'s ASCOM '
+                                + 'alignment model directly. No physical movement.'}
+                        </div>
+                        {applyError && (
+                          <div style={{ marginTop: 4, fontSize: 11, color: C.red }}>{applyError}</div>
+                        )}
+                        {applyDone && (
+                          <div style={{ marginTop: 4, fontSize: 11, color: C.green }}>
+                            Synced — mount alignment updated.
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                </>
+              ) : (
+                <div style={{ marginTop: 4, fontSize: 10, color: C.muted }}>
+                  No mount pointing recorded in this capture's metadata to compare against.
+                </div>
+              )}
+            </div>
+          )}
+        </Section>
+
+        </div>
+        </div>
+
       </div>
 
       {/* ============================================================
@@ -801,8 +1061,71 @@ export default function TelescopeView() {
         <div style={styles.imgViewer}>
           {!activeImg
             ? <div style={{ color: C.muted, fontSize: 11, margin: 'auto' }}>No captures yet.</div>
-            : <img src={activeImg.full_url} alt={activeImg.filename}
-                style={{ maxWidth: '100%', maxHeight: '100%', objectFit: 'contain', display: 'block' }} />
+            : (() => {
+                // Only overlay if the solve we have is for the image actually
+                // on screen — solveResult isn't cleared on nav/thumbnail
+                // clicks, so without this a stale solve would draw on the
+                // wrong frame.
+                const overlay = solveResult
+                  && solveResult.filename === activeImg.filename
+                  && solveResult.naxis1 && solveResult.naxis2
+                  ? solveResult : null
+                return (
+                  <div style={{
+                    position: 'relative', maxWidth: '100%', maxHeight: '100%',
+                    aspectRatio: overlay ? `${overlay.naxis1} / ${overlay.naxis2}` : undefined,
+                    display: 'flex',
+                  }}>
+                    <img src={activeImg.full_url} alt={activeImg.filename}
+                      style={{ maxWidth: '100%', maxHeight: '100%', width: overlay ? '100%' : undefined,
+                        height: overlay ? '100%' : undefined, objectFit: 'contain', display: 'block' }} />
+                    {overlay && (
+                      <svg
+                        viewBox={`0 0 ${overlay.naxis1} ${overlay.naxis2}`}
+                        style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', pointerEvents: 'none' }}
+                      >
+                        {(() => {
+                          const [cx, cy] = overlay.center_px
+                          const r = overlay.naxis1 * 0.02
+                          const fontSize = overlay.naxis1 * 0.018
+                          const mount = overlay.mount_px
+                          return (
+                            <>
+                              {mount && (
+                                <line x1={cx} y1={cy} x2={mount[0]} y2={mount[1]}
+                                  stroke={C.yellow} strokeWidth={overlay.naxis1 * 0.0015} strokeDasharray="6,4" />
+                              )}
+                              {/* Solved center — cyan crosshair */}
+                              <g stroke={C.accent} strokeWidth={overlay.naxis1 * 0.002}>
+                                <line x1={cx - r} y1={cy} x2={cx + r} y2={cy} />
+                                <line x1={cx} y1={cy - r} x2={cx} y2={cy + r} />
+                                <circle cx={cx} cy={cy} r={r * 0.5} fill="none" />
+                              </g>
+                              <text x={cx + r * 1.2} y={cy - r * 0.3} fill={C.accent}
+                                fontSize={fontSize} fontFamily="monospace">
+                                actual center
+                              </text>
+                              {mount && (
+                                <>
+                                  {/* Mount-reported position — yellow marker */}
+                                  <g stroke={C.yellow} strokeWidth={overlay.naxis1 * 0.002}>
+                                    <line x1={mount[0] - r} y1={mount[1] - r} x2={mount[0] + r} y2={mount[1] + r} />
+                                    <line x1={mount[0] - r} y1={mount[1] + r} x2={mount[0] + r} y2={mount[1] - r} />
+                                  </g>
+                                  <text x={mount[0] + r * 1.2} y={mount[1] - r * 0.3} fill={C.yellow}
+                                    fontSize={fontSize} fontFamily="monospace">
+                                    mount belief
+                                  </text>
+                                </>
+                              )}
+                            </>
+                          )
+                        })()}
+                      </svg>
+                    )}
+                  </div>
+                )
+              })()
           }
         </div>
 
@@ -888,6 +1211,21 @@ const styles = {
     display:    'flex',
     alignItems: 'center',
     gap:        10,
+  },
+  // Groups related sections side by side (Mount/Tracking vs Camera/Plate
+  // Solve) on wide viewports; stacks back to one column when narrow so it
+  // still works in the sidebar-open layout / smaller windows.
+  columnsRow: {
+    display:               'grid',
+    gridTemplateColumns:   'repeat(auto-fit, minmax(320px, 1fr))',
+    gap:                   12,
+    alignItems:            'start',
+  },
+  column: {
+    display:       'flex',
+    flexDirection: 'column',
+    gap:           12,
+    minWidth:      0,
   },
   // Right sidebar: fixed width, slides in/out
   sidebar: {

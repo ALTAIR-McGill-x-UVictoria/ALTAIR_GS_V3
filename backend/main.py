@@ -875,6 +875,12 @@ class TunnelReader:
     # most often an abrupt power cycle, which never sends a TCP FIN/RST and
     # would otherwise leave _read_loop blocked on read() indefinitely.
     _READ_SILENCE_TIMEOUT_S = 5.0
+    # open_connection() itself has no built-in timeout. Right after an FC
+    # reboot, ZeroTier may take a while to re-resolve the peer route, so a
+    # single connect attempt can otherwise stall far longer than the backoff
+    # schedule assumes — capping it here lets the loop retry promptly instead
+    # of blocking on one slow SYN.
+    _CONNECT_TIMEOUT_S = 3.0
 
     def __init__(self) -> None:
         self._host = ""
@@ -916,7 +922,10 @@ class TunnelReader:
         delay = 1.0
         while True:
             try:
-                reader, writer = await asyncio.open_connection(self._host, self._port)
+                reader, writer = await asyncio.wait_for(
+                    asyncio.open_connection(self._host, self._port),
+                    timeout=self._CONNECT_TIMEOUT_S,
+                )
                 sock = writer.get_extra_info("socket")
                 if sock is not None:
                     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)

@@ -23,6 +23,7 @@ import logging
 import math
 import os
 import secrets
+import socket
 import sys
 import time
 from contextlib import asynccontextmanager
@@ -855,6 +856,11 @@ class TunnelReader:
     """
 
     _MAX_PAYLOAD = 512
+    # FC mirrors an LR900P heartbeat over the tee every ~625ms even with no
+    # telemetry flowing, so real silence this long means the peer is gone —
+    # most often an abrupt power cycle, which never sends a TCP FIN/RST and
+    # would otherwise leave _read_loop blocked on read() indefinitely.
+    _READ_SILENCE_TIMEOUT_S = 5.0
 
     def __init__(self) -> None:
         self._host = ""
@@ -897,6 +903,20 @@ class TunnelReader:
         while True:
             try:
                 reader, writer = await asyncio.open_connection(self._host, self._port)
+                sock = writer.get_extra_info("socket")
+                if sock is not None:
+                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                    # Detect a peer that vanished without a FIN/RST (e.g. an FC
+                    # power cycle) in a few seconds instead of relying on OS
+                    # defaults (~2h). Linux/Windows-only knobs — best effort.
+                    for opt, val in (
+                        (getattr(socket, "TCP_KEEPIDLE", None), 3),
+                        (getattr(socket, "TCP_KEEPINTVL", None), 2),
+                        (getattr(socket, "TCP_KEEPCNT", None), 3),
+                    ):
+                        if opt is not None:
+                            sock.setsockopt(socket.IPPROTO_TCP, opt, val)
                 logger.info("Tunnel reader: connected to %s:%d", self._host, self._port)
                 await self._set_connected(True)
                 delay = 1.0
@@ -905,16 +925,16 @@ class TunnelReader:
                     await self._read_loop(reader)
                 finally:
                     writer.close()
-            except (OSError, ConnectionError) as e:
+            except (OSError, ConnectionError, asyncio.TimeoutError) as e:
                 logger.info("Tunnel reader: %s:%d unavailable (%s) — retrying in %.0fs",
                             self._host, self._port, e, delay)
             await self._set_connected(False)
             await asyncio.sleep(delay)
-            delay = min(delay * 2, 30.0)
+            delay = min(delay * 2, 5.0)
 
     async def _read_loop(self, reader: asyncio.StreamReader) -> None:
         while True:
-            chunk = await reader.read(4096)
+            chunk = await asyncio.wait_for(reader.read(4096), timeout=self._READ_SILENCE_TIMEOUT_S)
             if not chunk:
                 return   # peer closed the connection
             self._buf.extend(chunk)

@@ -5,11 +5,12 @@ import ConnectionBar from './components/ConnectionBar'
 import PacketPanel from './components/PacketPanel'
 import AlarmSidebar from './components/AlarmSidebar'
 import TelescopeView from './components/TelescopeView'
+import CalibrationView from './components/CalibrationView'
 import GraphsView from './components/GraphsView'
 import FlightView from './components/FlightView'
 import SettingsView from './components/SettingsView'
 
-const TABS = ['Flight', 'Telemetry', 'Graphs', 'Telescope', 'Settings']
+const TABS = ['Flight', 'Telemetry', 'Graphs', 'Telescope', 'Calibration', 'Settings']
 
 /**
  * Resolve the best available GPS packet, normalizing field names to the
@@ -178,6 +179,10 @@ export default function App() {
           <div style={{ display: activeTab === 'Telescope' ? 'contents' : 'none' }}>
             <TelescopeView />
           </div>
+
+          {activeTab === 'Calibration' && (
+            <CalibrationView packets={packets} />
+          )}
 
           {activeTab === 'Settings' && (
             <SettingsView packets={packets} lastAck={lastAck} overrideChecks={overrideChecks} onOverrideChange={setOverrideChecks} currentStage={currentStage} />

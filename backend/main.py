@@ -49,6 +49,7 @@ from backend.packets import _HEADER, _CRC
 from backend.tracking import calculate_tracking_params
 from backend.mount import BaseMountController, create_mount
 from backend.camera import CameraController, EmulatedCameraController, create_camera
+from backend.calibration import CalibrationRecorder, write_sidecar_text, write_sidecar_csv
 from backend.logging_manager import TelemetryLogger
 from backend.alarms import ALARM_RULES
 from backend.emulator import PacketEmulator
@@ -857,6 +858,7 @@ async def _ingest_telemetry(source: str, result: dict) -> None:
         # same telemetry when both links are up at once.
         return
 
+    calibration_recorder.ingest(result)
     await serial_reader._broadcast({"type": "packet", "telemetry_source": source, **result})
 
 
@@ -890,6 +892,15 @@ class TunnelReader:
         self._seq_prev: dict[int, int] = {}
         self.connected = False
         self.enabled = False
+        # Set for the lifetime of one connected session (see _connect_loop);
+        # None whenever not connected. Reused for outbound command frames —
+        # see send_command() — now that the radio link itself is
+        # RF-unidirectional and can no longer carry GS->FC bytes at all.
+        # The FC's TeeServer mirrors these bytes into the same buffer
+        # CommandReceiverTask already drains for serial commands (see
+        # Altairfc_V2/altairfc/telemetry/tee_server.py + transport.py's
+        # feed_command_bytes).
+        self._writer: asyncio.StreamWriter | None = None
 
     async def start(self, host: str, port: int) -> None:
         self._host = host
@@ -941,12 +952,14 @@ class TunnelReader:
                         if opt is not None:
                             sock.setsockopt(socket.IPPROTO_TCP, opt, val)
                 logger.info("Tunnel reader: connected to %s:%d", self._host, self._port)
+                self._writer = writer
                 await self._set_connected(True)
                 delay = 1.0
                 self._buf.clear()
                 try:
                     await self._read_loop(reader)
                 finally:
+                    self._writer = None
                     writer.close()
             except (OSError, ConnectionError, asyncio.TimeoutError) as e:
                 logger.info("Tunnel reader: %s:%d unavailable (%s) — retrying in %.0fs",
@@ -954,6 +967,23 @@ class TunnelReader:
             await self._set_connected(False)
             await asyncio.sleep(delay)
             delay = min(delay * 2, 5.0)
+
+    def send_command(self, frame: bytes) -> bool:
+        """
+        Write a GS->FC command frame straight to the tunnel socket. Best-effort,
+        non-blocking (StreamWriter.write() buffers internally; this doesn't
+        await drain()) — mirrors SerialReader.send_command()'s fire-and-forget
+        shape so both can be used interchangeably by the /api/fc/command/*
+        endpoints. Returns False without raising if not currently connected.
+        """
+        if self._writer is None:
+            return False
+        try:
+            self._writer.write(frame)
+            return True
+        except Exception as e:
+            logger.warning("Tunnel reader: send_command failed: %s", e)
+            return False
 
     async def _read_loop(self, reader: asyncio.StreamReader) -> None:
         while True:
@@ -1008,6 +1038,26 @@ class TunnelReader:
 
 serial_reader   = SerialReader()
 tunnel_reader   = TunnelReader()
+
+
+def _send_fc_command(frame: bytes) -> bool:
+    """
+    Send a GS->FC command frame over whichever transport can actually carry
+    it. The LR-900p radio link is now RF-unidirectional (FC->GS telemetry
+    only — see TunnelReader's module comment), so serial_reader.send_command()
+    can no longer reach the FC under any circumstance; the ZeroTier tunnel
+    (tunnel_reader, backed by the FC's TeeServer — see tee_server.py /
+    transport.py's feed_command_bytes) is the only surviving path. Falls
+    back to the serial write only if the tunnel isn't connected, in case a
+    future/test setup restores a bidirectional radio — but with a
+    unidirectional radio that fallback will itself just fail cleanly
+    (returns False), same as before this change.
+    """
+    if tunnel_reader.connected:
+        return tunnel_reader.send_command(frame)
+    return serial_reader.send_command(frame)
+
+
 telem_logger    = TelemetryLogger()
 metrics_exporter = TelemetryMetrics()
 remote_metrics = RemoteMetricsReporter()
@@ -1029,6 +1079,13 @@ _latest_events:  list[dict]      = []   # last 200 events
 mount_controller: BaseMountController | None = None
 # "zwo" (default, ASI585MC) or "canon" (Rebel T3i test — see backend/camera_canon.py).
 camera_controller = create_camera(os.getenv("ALTAIR_CAMERA_TYPE", "zwo"))
+
+# Buffers Lighting (sphere source) + PhotodiodeSignal (PDRO) samples across
+# one calibration exposure window — see backend/calibration.py and
+# post_calibration_capture below. Fed from every decoded packet via
+# _ingest_telemetry(), regardless of which tab is active, so it's always
+# ready the moment the Calibration tab starts an exposure.
+calibration_recorder = CalibrationRecorder()
 
 # Held for the full duration of every camera exposure (see post_camera_capture
 # / _do_auto_capture below). Any mount motion — the tracking loop's periodic
@@ -1406,7 +1463,13 @@ async def _tracking_poll_loop(interval_s: float = 1.0) -> None:
                         # got the lock.
                         if mc is not mount_controller or not mc.connected:
                             logger.debug("Tracking poll: mount changed while waiting for lock, skipping")
-                        elif mc.mount_type in ("am5", "indi"):
+                        elif mc.mount_type == "am5":
+                            # retarget() doesn't wait for slew completion, so this
+                            # cycle's _mount_lock hold is brief and the next 1s
+                            # tick isn't starved behind a multi-second physical
+                            # slew — see AM5Controller.retarget()'s docstring.
+                            await mc.retarget(ra_hours=params["ra_hours"], dec_deg=params["dec_deg"])
+                        elif mc.mount_type == "indi":
                             await mc.goto(ra_hours=params["ra_hours"], dec_deg=params["dec_deg"])
                         else:
                             await mc.goto(azimuth=params["azimuth"], elevation=params["elevation"])
@@ -1425,7 +1488,7 @@ async def _gs_gps_beacon_loop(interval_s: float = 5.0) -> None:
 
     while True:
         await asyncio.sleep(interval_s)
-        if serial_reader.port_name is None:
+        if serial_reader.port_name is None and not tunnel_reader.connected:
             continue
         try:
             pkt = GsGpsCommandPacket(
@@ -1434,7 +1497,7 @@ async def _gs_gps_beacon_loop(interval_s: float = 5.0) -> None:
                 alt=_tracking.GS_ALT,
             )
             frame = build_command_frame(pkt)
-            serial_reader.send_command(frame)
+            _send_fc_command(frame)
         except Exception as e:
             logger.warning("GS GPS beacon error: %s", e)
 
@@ -1740,8 +1803,8 @@ async def post_fc_arm():
     from backend.commands import build_command_frame
     from telemetry.commands.arm import ArmCommandPacket
     frame = build_command_frame(ArmCommandPacket(arm_state=1))
-    ok = serial_reader.send_command(frame)
-    return {"ok": ok, "error": None if ok else "Serial port not connected"}
+    ok = _send_fc_command(frame)
+    return {"ok": ok, "error": None if ok else "No command transport connected (tunnel or serial)"}
 
 
 @app.post("/api/fc/command/launch_ok")
@@ -1752,8 +1815,8 @@ async def post_fc_launch_ok():
     from backend.commands import build_command_frame
     from telemetry.commands.launch_ok import LaunchOkCommandPacket
     frame = build_command_frame(LaunchOkCommandPacket(confirm=1))
-    ok = serial_reader.send_command(frame)
-    return {"ok": ok, "error": None if ok else "Serial port not connected"}
+    ok = _send_fc_command(frame)
+    return {"ok": ok, "error": None if ok else "No command transport connected (tunnel or serial)"}
 
 
 @app.post("/api/fc/command/ping")
@@ -1764,8 +1827,8 @@ async def post_fc_ping():
     from backend.commands import build_command_frame
     from telemetry.commands.ping import PingCommandPacket
     frame = build_command_frame(PingCommandPacket(token=0))
-    ok = serial_reader.send_command(frame)
-    return {"ok": ok, "error": None if ok else "Serial port not connected"}
+    ok = _send_fc_command(frame)
+    return {"ok": ok, "error": None if ok else "No command transport connected (tunnel or serial)"}
 
 
 @app.post("/api/fc/command/update_setting")
@@ -1774,8 +1837,8 @@ async def post_fc_update_setting(body: dict):
         field_id = int(body["field_id"])
     except (KeyError, TypeError, ValueError):
         return {"ok": False, "error": "field_id must be an integer"}
-    if not (0 <= field_id <= 17):
-        return {"ok": False, "error": f"field_id {field_id} out of range [0, 17]"}
+    if not (0 <= field_id <= 18):
+        return {"ok": False, "error": f"field_id {field_id} out of range [0, 18]"}
     try:
         value = float(body["value"])
     except (KeyError, TypeError, ValueError):
@@ -1790,8 +1853,8 @@ async def post_fc_update_setting(body: dict):
     from backend.commands import build_command_frame
     from telemetry.commands.update_setting import UpdateSettingCommandPacket
     frame = build_command_frame(UpdateSettingCommandPacket(field_id=field_id, value=value))
-    ok = serial_reader.send_command(frame)
-    return {"ok": ok, "error": None if ok else "Serial port not connected"}
+    ok = _send_fc_command(frame)
+    return {"ok": ok, "error": None if ok else "No command transport connected (tunnel or serial)"}
 
 
 @app.get("/api/radio/config")
@@ -1818,10 +1881,24 @@ async def post_radio_config(body: dict):
 
     Body: { "data_rate": 0|1|2, "tx_power": 0|1|2, "channel": 0-63 }
 
-    Blocked when the FC is in ARM state or later (flight_stage >= 1).
-    The FC is commanded first; its ACK gates the GS modem switch so the
-    ACK itself is always transmitted on the old channel.
+    DISABLED: the LR-900p RF link is now unidirectional (FC->GS telemetry
+    only — see TunnelReader's module comment / _send_fc_command). There is
+    no GS->FC path left for the RF link's own channel/data-rate/tx-power to
+    matter to reconfigure from here, and even routed over the tunnel this
+    endpoint's ACK-gated GS modem switch can never complete: TunnelReader
+    explicitly discards command ACKs as "meaningless over a one-way tee"
+    (see its _process_buffer), so _fc_radio_ack_event would just wait out
+    its own timeout every time. Left in place (rather than deleted) in case
+    a future hardware change restores a bidirectional RF path.
     """
+    return {"ok": False, "error": (
+        "Radio reconfiguration is not supported — the RF link is "
+        "unidirectional (receive-only); there is no GS→FC path for this command."
+    )}
+
+
+async def _post_radio_config_disabled(body: dict):
+    """Original implementation, preserved for when RF becomes bidirectional again."""
     global _fc_radio_ack_event
 
     # Validate
@@ -1939,33 +2016,6 @@ async def get_debug_registry_fields():
 @app.get("/api/debug/emulate")
 async def get_debug_emulate():
     return {"emulating": _emulating}
-
-
-@app.post("/api/debug/set_gps")
-async def post_debug_set_gps(body: dict):
-    """
-    Manually inject a payload GPS fix for telescope tracking, bypassing the
-    serial link entirely — for testing the tracking/mount-goto pipeline
-    (e.g. after a launch abort with no live payload telemetry) without the
-    packet emulator. Writes to whichever source _gps_source currently
-    selects, so _tracking_poll_loop picks it up on its next 1s cycle exactly
-    like real telemetry.
-    Body: { "lat": float, "lon": float, "alt": float }
-    """
-    global _latest_gps_mavlink, _latest_gps_local
-    try:
-        lat = float(body["lat"])
-        lon = float(body["lon"])
-        alt = float(body["alt"])
-    except (KeyError, TypeError, ValueError):
-        return {"ok": False, "error": "Body must include numeric lat, lon, alt"}
-    fix = {"lat": lat, "lon": lon, "alt": alt}
-    if _gps_source == "mavlink":
-        _latest_gps_mavlink = fix
-    else:
-        _latest_gps_local = fix
-    logger.info("Debug: injected payload GPS (%s) lat=%.6f lon=%.6f alt=%.1f", _gps_source, lat, lon, alt)
-    return {"ok": True, "gps_source": _gps_source, "latest_gps": fix}
 
 
 # ---------------------------------------------------------------------------
@@ -2400,6 +2450,137 @@ async def post_camera_capture(body: dict):
         return {"ok": True, "path": saved}
     except Exception as e:
         return {"ok": False, "error": str(e)}
+
+
+# ---------------------------------------------------------------------------
+# Camera calibration (integrating sphere source)
+# ---------------------------------------------------------------------------
+# Sphere source is field_id 18 in UpdateSettingCommandPacket.SETTING_KEYS —
+# see Altairfc_V2/altairfc/telemetry/commands/update_setting.py. Reuses the
+# existing generic /api/fc/command/update_setting mechanism rather than a
+# dedicated command; the FC's LightingTask (tasks/lighting_task.py) polls
+# settings.sphere_target_current_a each tick and re-engages hold_current()
+# when it changes.
+_SPHERE_TARGET_CURRENT_FIELD_ID = 18
+_SPHERE_TARGET_CURRENT_MAX_A    = 2.0   # sanity ceiling; the FC's own driver
+                                         # (drivers/sphere_led.py MAX_SAFE_CODE)
+                                         # is the real hardware limit — this
+                                         # just rejects an obviously-wrong typo
+                                         # before it goes out over the radio.
+
+
+def _latest_lighting_fields() -> dict[str, Any]:
+    pkt = _latest_packets.get("Lighting")
+    if not pkt:
+        return {}
+    return {f["name"]: f["value"] for f in pkt.get("fields", [])}
+
+
+@app.get("/api/calibration/status")
+async def get_calibration_status():
+    """Live sphere source + camera + buffering state for the Calibration tab."""
+    return {
+        "sphere":     _latest_lighting_fields(),
+        "camera":     camera_controller.status_dict(),
+        "recording":  calibration_recorder.active,
+    }
+
+
+@app.post("/api/calibration/sphere/set_brightness")
+async def post_calibration_set_brightness(body: dict):
+    """
+    Command the FC to hold the sphere source at a new target drive current
+    (amps), via UpdateSettingCommandPacket field_id 18. See module comment
+    above — identical wire mechanism to /api/fc/command/update_setting,
+    exposed under /api/calibration for the tab's own naming.
+    """
+    try:
+        target_a = float(body["target_a"])
+    except (KeyError, TypeError, ValueError):
+        return {"ok": False, "error": "target_a must be a number"}
+    if not math.isfinite(target_a) or not (0.0 <= target_a <= _SPHERE_TARGET_CURRENT_MAX_A):
+        return {"ok": False, "error": f"target_a must be between 0 and {_SPHERE_TARGET_CURRENT_MAX_A} A"}
+
+    if _emulating:
+        await _emulated_ack(0xC3)
+        return {"ok": True, "emulated": True, "target_a": target_a}
+
+    from backend.commands import build_command_frame
+    from telemetry.commands.update_setting import UpdateSettingCommandPacket
+    frame = build_command_frame(UpdateSettingCommandPacket(
+        field_id=_SPHERE_TARGET_CURRENT_FIELD_ID, value=target_a,
+    ))
+    ok = _send_fc_command(frame)
+    return {"ok": ok, "error": None if ok else "No command transport connected (tunnel or serial)", "target_a": target_a}
+
+
+@app.post("/api/calibration/capture")
+async def post_calibration_capture(body: dict):
+    """
+    Take one calibration exposure: capture a FITS frame exactly like
+    /api/telescope/camera/capture, but additionally buffer every Lighting
+    (sphere DAC/current/temperature) and PhotodiodeSignal (PDRO) sample
+    received from margin_pre_s before the shutter opens through margin_post_s
+    after the (approximate) exposure completes, and write two sidecar files
+    next to the FITS output:
+      <name>.txt — human-readable system state (sphere setting, sensor
+                   controls, pointing/GPS — same values as the FITS header)
+      <name>.csv — every buffered Lighting + PhotodiodeSignal sample,
+                   time-ordered, correlated to this specific exposure
+
+    Body: { filename?: str, margin_pre_s?: float, margin_post_s?: float }
+
+    The window itself is not sized off the requested exposure time — it
+    simply starts margin_pre_s before camera_controller.capture() is called
+    and stops margin_post_s after that awaitable returns, so it always
+    brackets the real exposure (whatever the sensor actually took) plus
+    fixed margins, regardless of what exposure_ms was requested.
+    """
+    requested = body.get("filename") or f"calib_{int(time.time())}"
+    margin_pre_s  = float(body.get("margin_pre_s", 0.5))
+    margin_post_s = float(body.get("margin_post_s", 0.5))
+
+    _capture_dir.mkdir(parents=True, exist_ok=True)
+    output_path = _unique_capture_path(_normalize_capture_filename(requested))
+
+    try:
+        async with _capture_lock:
+            calibration_recorder.start_window(margin_pre_s=margin_pre_s)
+            capture_meta = await _build_capture_metadata()
+            saved = await camera_controller.capture(output_path, metadata=capture_meta)
+            window = await calibration_recorder.finish_window(margin_post_s=margin_post_s)
+    except Exception as e:
+        await calibration_recorder.finish_window(margin_post_s=0.0)
+        return {"ok": False, "error": str(e)}
+
+    saved_path = Path(saved)
+    txt_path = saved_path.with_suffix(".txt")
+    csv_path  = saved_path.with_suffix(".csv")
+    try:
+        write_sidecar_text(
+            txt_path,
+            capture_meta=capture_meta,
+            sensor=camera_controller.status_dict(),
+            sphere=_latest_lighting_fields(),
+            window=window,
+        )
+        write_sidecar_csv(csv_path, window=window)
+    except Exception as e:
+        logger.warning("Calibration capture: sidecar write failed: %s", e)
+        return {
+            "ok": True, "path": saved, "sidecar_error": str(e),
+            "lighting_samples": len(window.get("lighting_samples", [])),
+            "photodiode_samples": len(window.get("photodiode_samples", [])),
+        }
+
+    return {
+        "ok": True,
+        "path": saved,
+        "txt_path": str(txt_path),
+        "csv_path": str(csv_path),
+        "lighting_samples": len(window.get("lighting_samples", [])),
+        "photodiode_samples": len(window.get("photodiode_samples", [])),
+    }
 
 
 @app.post("/api/telescope/solve")

@@ -39,6 +39,12 @@ Emit rates
     Photodiode  5 Hz
     GPS         2 Hz
     (any future packet)  5 Hz  ← default
+
+PhotodiodeSignal (the UVIC PDRO batch, wire packet 0x0D) is NOT part of
+REGISTRY — packets.py decodes it specially from raw bytes rather than
+through the generic per-field struct path every other packet uses (see
+_decode_photodiode_batch), so it needs its own emit loop here rather than
+falling out of the REGISTRY-driven loop below. See _photodiode_signal_loop.
 """
 from __future__ import annotations
 
@@ -49,7 +55,7 @@ import random
 import time
 from typing import Any, Awaitable, Callable
 
-from backend.packets  import REGISTRY
+from backend.packets  import REGISTRY, PHOTODIODE_BATCH_PACKET_ID
 from backend.alarms   import ALARM_RULES
 import backend.tracking as _tracking
 
@@ -392,6 +398,70 @@ def _heartbeat_value(field_name: str, t: float) -> float | str:
 BroadcastFn = Callable[[dict[str, Any]], Awaitable[None]]
 
 
+# ---------------------------------------------------------------------------
+# PhotodiodeSignal (UVIC PDRO batch) synthesis
+# ---------------------------------------------------------------------------
+# Matches PhotodiodeBatchPacket's real defaults (see
+# Altairfc_V2/altairfc/telemetry/packets/photodiode_batch.py) so the emulated
+# batch looks like a real one to any consumer keyed off those constants.
+_PDRO_BATCH_HZ        = 2.0      # matches PhotodiodePacket.TX_RATE_HZ
+_PDRO_BATCH_SIZE      = 50       # PHOTODIODE_BATCH_SIZE
+_PDRO_SAMPLE_PERIOD_US = 10_000  # PHOTODIODE_SAMPLE_PERIOD_US (100 Hz)
+_PDRO_BASE_V          = 1.25     # gentle mid-range TIA output, volts
+_PDRO_AMPLITUDE_V     = 0.6
+_PDRO_SWEEP_PERIOD_S  = 20.0     # faster than the general 60s sweep — this
+                                 # tab wants to see the readout visibly moving
+
+
+def _photodiode_batch_packet(t: float, seq: int) -> dict:
+    """Synthesize one PhotodiodeSignal packet in exactly the shape
+    backend/packets.py:_decode_photodiode_batch produces, so the Calibration
+    tab (and anything else keyed off that shape) works identically against
+    the emulator and real telemetry."""
+    now_us = int(time.time() * 1_000_000)
+    samples = []
+    for i in range(_PDRO_BATCH_SIZE):
+        sample_t = t + i * (_PDRO_SAMPLE_PERIOD_US / 1_000_000.0)
+        sergeant_v = _PDRO_BASE_V + _PDRO_AMPLITUDE_V * math.sin(2 * math.pi * sample_t / _PDRO_SWEEP_PERIOD_S)
+        soldier_v  = _PDRO_BASE_V + _PDRO_AMPLITUDE_V * math.sin(2 * math.pi * sample_t / _PDRO_SWEEP_PERIOD_S + 0.3)
+        samples.append({
+            "sequence":           (seq * _PDRO_BATCH_SIZE + i) & 0xFFFFFFFF,
+            "timestamp":          round(sample_t, 6),
+            "time_unix_us":       now_us + i * _PDRO_SAMPLE_PERIOD_US,
+            "valid_flags":        0x03,   # both channels valid
+            "sergeant_code":      0,
+            "soldier_code":       0,
+            "sergeant_voltage_v": round(sergeant_v, 9),
+            "soldier_voltage_v":  round(soldier_v, 9),
+        })
+
+    latest = samples[-1]
+    return {
+        "type":                "packet",
+        "packet_id":           PHOTODIODE_BATCH_PACKET_ID,
+        "label":               "PhotodiodeSignal",
+        "seq":                 seq & 0xFF,
+        "timestamp":           latest["timestamp"],
+        "wall_ms":             round(time.time() * 1000),
+        "transmit_timestamp":  round(t, 4),
+        "target_hz":           2.0,
+        "sample_hz":           round(1_000_000.0 / _PDRO_SAMPLE_PERIOD_US, 3),
+        "sample_period_us":    _PDRO_SAMPLE_PERIOD_US,
+        "first_sample_seq":    samples[0]["sequence"],
+        "last_sample_seq":     latest["sequence"],
+        "samples":             samples,
+        "dropped":             0,
+        "fields": [
+            {"name": "sergeant_voltage_v", "label": "Sergeant low-gain TIA", "unit": "V",
+             "group": "Photodiode signal", "value": latest["sergeant_voltage_v"]},
+            {"name": "soldier_voltage_v", "label": "Soldier low-gain TIA", "unit": "V",
+             "group": "Photodiode signal", "value": latest["soldier_voltage_v"]},
+            {"name": "valid_flags", "label": "ADC validity flags", "unit": "",
+             "group": "Photodiode signal", "value": latest["valid_flags"]},
+        ],
+    }
+
+
 class PacketEmulator:
     """
     Asyncio-based packet emulator.
@@ -424,6 +494,11 @@ class PacketEmulator:
             )
             self._tasks.append(task)
 
+        # PhotodiodeSignal isn't in REGISTRY (see module docstring) — its own loop.
+        self._tasks.append(asyncio.create_task(
+            self._photodiode_signal_loop(), name="emulator_PhotodiodeSignal",
+        ))
+
     async def stop(self) -> None:
         self._running = False
         for t in self._tasks:
@@ -435,6 +510,16 @@ class PacketEmulator:
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
+
+    async def _photodiode_signal_loop(self) -> None:
+        seq = 0
+        interval_s = 1.0 / _PDRO_BATCH_HZ
+        logger.debug("Emulator loop started: PhotodiodeSignal @ %.2f Hz", _PDRO_BATCH_HZ)
+        while self._running:
+            t = time.monotonic() - self._start_t
+            await self._broadcast(_photodiode_batch_packet(t, seq))
+            seq += 1
+            await asyncio.sleep(interval_s)
 
     async def _emit_loop(self, pid: int, entry: dict, interval_s: float) -> None:
         seq = 0

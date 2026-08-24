@@ -136,14 +136,6 @@ export default function TelescopeView() {
   const [manualEl,     setManualEl]    = useState('')
   const [manualRa,     setManualRa]    = useState('')
   const [manualDec,    setManualDec]   = useState('')
-  const [testOffsetN,  setTestOffsetN] = useState('500')
-  const [testOffsetE,  setTestOffsetE] = useState('0')
-  const [testOffsetAlt, setTestOffsetAlt] = useState('1000')
-  const [testLat,      setTestLat]     = useState('')
-  const [testLon,      setTestLon]     = useState('')
-  const [testAlt,      setTestAlt]     = useState('')
-  const [testGpsError, setTestGpsError] = useState(null)
-  const [testGpsLast,  setTestGpsLast]  = useState(null)
   const [capturePath,  setCapturePath] = useState('')
   const [lastCapture,  setLastCapture] = useState(null)
   const [busy,         setBusy]        = useState(false)
@@ -229,26 +221,6 @@ export default function TelescopeView() {
     setOffsetAzInput(String(pointingOffset.azimuth_deg ?? 0))
     setOffsetElInput(String(pointingOffset.elevation_deg ?? 0))
   }, [pointingOffset])
-
-  // Flat-earth offset -> lat/lon, good enough at the few-km ranges this
-  // panel is used for. Mirrors backend/emulator.py's _M_PER_DEG constants.
-  const M_PER_DEG_LAT = 111_000
-  const M_PER_DEG_LON = 80_000 // approx at ~45°N; fine for a pre-flight smoke test
-
-  function offsetToLatLon(offsetNm, offsetEm) {
-    const gsLat = tracking?.gs_lat ?? 45.5088
-    const gsLon = tracking?.gs_lon ?? -73.5542
-    return {
-      lat: gsLat + offsetNm / M_PER_DEG_LAT,
-      lon: gsLon + offsetEm / M_PER_DEG_LON,
-    }
-  }
-
-  async function sendTestGps(lat, lon, alt) {
-    setTestGpsError(null)
-    const res = await run(() => actions.setDebugGps(lat, lon, alt), setTestGpsError)
-    if (res?.ok) setTestGpsLast({ lat, lon, alt })
-  }
 
   const mountConnected  = mountStatus?.connected  ?? false
   const activeMountType = mountStatus?.mount_type ?? mountType
@@ -556,79 +528,6 @@ export default function TelescopeView() {
           {offsetDone && (
             <div style={{ marginTop: 4, fontSize: 11, color: C.green }}>
               Offset applied — future tracking corrected.
-            </div>
-          )}
-        </Section>
-
-        <Section title="Test Tracking (no payload GPS)">
-          <div style={{ fontSize: 10, color: C.muted, marginBottom: 8 }}>
-            Injects a fake payload GPS fix via /api/debug/set_gps so you can
-            confirm goto + Auto-Track work before launch, without waiting on
-            real telemetry. Connect the mount first.
-          </div>
-
-          <label style={{ ...styles.label, display: 'block', marginBottom: 4 }}>
-            Offset from ground station
-          </label>
-          <div style={styles.inputRow}>
-            <input style={{ ...styles.input, width: 70 }} value={testOffsetN}
-              onChange={e => setTestOffsetN(e.target.value)} placeholder="N (m)" />
-            <input style={{ ...styles.input, width: 70 }} value={testOffsetE}
-              onChange={e => setTestOffsetE(e.target.value)} placeholder="E (m)" />
-            <input style={{ ...styles.input, width: 70 }} value={testOffsetAlt}
-              onChange={e => setTestOffsetAlt(e.target.value)} placeholder="Alt (m MSL)" />
-          </div>
-          <div style={{ ...styles.inputRow, marginTop: 6 }}>
-            <button style={styles.btn} disabled={!mountConnected || busy}
-              onClick={() => {
-                const { lat, lon } = offsetToLatLon(
-                  parseFloat(testOffsetN) || 0,
-                  parseFloat(testOffsetE) || 0,
-                )
-                sendTestGps(lat, lon, parseFloat(testOffsetAlt) || 0)
-              }}>
-              Inject Fake Fix
-            </button>
-          </div>
-
-          <div style={{ marginTop: 10, paddingTop: 8, borderTop: `1px solid ${C.border}` }}>
-            <label style={{ ...styles.label, display: 'block', marginBottom: 4 }}>
-              Or raw lat / lon / alt
-            </label>
-            <div style={styles.inputRow}>
-              <input style={{ ...styles.input, width: 90 }} value={testLat}
-                onChange={e => setTestLat(e.target.value)} placeholder="Lat °" />
-              <input style={{ ...styles.input, width: 90 }} value={testLon}
-                onChange={e => setTestLon(e.target.value)} placeholder="Lon °" />
-              <input style={{ ...styles.input, width: 80 }} value={testAlt}
-                onChange={e => setTestAlt(e.target.value)} placeholder="Alt (m)" />
-            </div>
-            <div style={{ ...styles.inputRow, marginTop: 6 }}>
-              <button style={styles.btn} disabled={!mountConnected || busy || !testLat || !testLon}
-                onClick={() => sendTestGps(
-                  parseFloat(testLat) || 0,
-                  parseFloat(testLon) || 0,
-                  parseFloat(testAlt) || 0,
-                )}>
-                Inject Raw Fix
-              </button>
-            </div>
-          </div>
-
-          {testGpsError && (
-            <div style={{ marginTop: 6, fontSize: 11, color: C.red }}>{testGpsError}</div>
-          )}
-          {testGpsLast && (
-            <div style={{ marginTop: 6, fontSize: 10, color: C.muted }}>
-              Last injected: {testGpsLast.lat.toFixed(6)}, {testGpsLast.lon.toFixed(6)}, {testGpsLast.alt.toFixed(0)} m
-              — watch Tracking Geometry above and confirm the mount slews.
-              With Auto-Track on, injecting a new fix here should re-slew
-              within ~1 s without touching GoTo.
-            </div>
-          )}
-          {!mountConnected && (
-            <div style={{ marginTop: 6, fontSize: 10, color: C.yellow }}>
-              Connect the mount above to enable injection.
             </div>
           )}
         </Section>

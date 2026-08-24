@@ -32,10 +32,6 @@ const WS_URL = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.ho
  *                       setGpsSource('mavlink'|'local') — pick which GPS
  *                       fix (Pixhawk-fused vs. onboard module) tracking
  *                       uses.
- *                       setDebugGps(lat, lon, alt) — inject a fake payload
- *                       GPS fix (bypasses serial telemetry) for exercising
- *                       the tracking/goto pipeline before a flight — see
- *                       backend main.py's /api/debug/set_gps.
  *                       setPointingOffset(azDeg, elDeg) — set the manual
  *                       Az/El correction applied in backend/tracking.py,
  *                       the artificial-offset alternative to
@@ -138,7 +134,6 @@ export function useTelescope() {
     getCaptureDir:     ()          => apiFetch('/api/gallery/config').then(r => r.json()),
     setCaptureDir:     (dir)       => post('/api/gallery/config', { capture_dir: dir }),
     setGpsSource:      (source)    => post('/api/telescope/gps_source', { source }),
-    setDebugGps:       (lat, lon, alt) => post('/api/debug/set_gps', { lat, lon, alt }),
     setPointingOffset: (azDeg, elDeg) => post('/api/telescope/offset',
                          { azimuth_deg: azDeg, elevation_deg: elDeg }),
   }

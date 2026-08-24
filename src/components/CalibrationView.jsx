@@ -77,8 +77,10 @@ function fieldValue(packet, name) {
  * actions — same camera_controller instance backend-side as the Telescope
  * tab, since ZWO/Canon hardware only has one physical camera attached at a
  * time. Capture itself goes through /api/calibration/capture instead of
- * /api/telescope/camera/capture so the backend also buffers and saves the
- * sphere/PDRO sidecar files — see backend/calibration.py.
+ * /api/telescope/camera/capture, which saves capture.fits/.txt/.csv together
+ * into a new calibration_logs/<UTC timestamp>_<label>/ subdirectory per
+ * capture rather than a single file in the gallery's capture dir — see
+ * backend/calibration.py.
  *
  * Props:
  *   packets — the same `packets` map App.jsx already threads to every tab
@@ -104,7 +106,7 @@ export default function CalibrationView({ packets }) {
   const [brightnessError, setBrightnessError] = useState(null)
   const [brightnessAck,  setBrightnessAck]  = useState(null)
 
-  const [capturePath,  setCapturePath]  = useState('')
+  const [captureLabel,  setCaptureLabel]  = useState('')
   const [marginPreS,   setMarginPreS]   = useState('0.5')
   const [marginPostS,  setMarginPostS]  = useState('0.5')
   const [capturing,    setCapturing]    = useState(false)
@@ -203,7 +205,7 @@ export default function CalibrationView({ packets }) {
     setCaptureError(null)
     try {
       const res = await actions.captureCalibration(
-        capturePath || undefined,
+        captureLabel || undefined,
         Number(marginPreS) || 0,
         Number(marginPostS) || 0,
       )
@@ -415,8 +417,8 @@ export default function CalibrationView({ packets }) {
               </div>
 
               <div style={styles.inputRow}>
-                <input style={styles.input} value={capturePath}
-                  onChange={e => setCapturePath(e.target.value)}
+                <input style={styles.input} value={captureLabel}
+                  onChange={e => setCaptureLabel(e.target.value)}
                   placeholder="label for the subdirectory (optional)" />
               </div>
               <div style={{ ...styles.inputRow, marginTop: 8 }}>

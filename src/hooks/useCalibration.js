@@ -26,8 +26,12 @@ export function useCalibration() {
   const actions = {
     getStatus:       ()        => apiFetch('/api/calibration/status').then(r => r.json()),
     setBrightness:   (targetA) => post('/api/calibration/sphere/set_brightness', { target_a: targetA }),
-    captureCalibration: (filename, marginPreS, marginPostS) => post('/api/calibration/capture', {
-      filename,
+    // label becomes the calibration_logs/<UTC timestamp>_<label>/ subdirectory
+    // name (sanitized) that backend/main.py's post_calibration_capture creates
+    // for capture.fits/.txt/.csv — sent as "filename" to match the request
+    // body field the endpoint actually reads.
+    captureCalibration: (label, marginPreS, marginPostS) => post('/api/calibration/capture', {
+      filename: label,
       ...(marginPreS  !== undefined ? { margin_pre_s:  marginPreS }  : {}),
       ...(marginPostS !== undefined ? { margin_post_s: marginPostS } : {}),
     }),

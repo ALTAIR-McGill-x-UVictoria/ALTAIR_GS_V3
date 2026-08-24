@@ -32,6 +32,10 @@ captures/**/*.jpeg
 captures/**/*.tiff
 captures/**/*.tif
 
+# Calibration tab output (test/session output, not source) — each capture's
+# own subdirectory under calibration_logs/, same reasoning as captures/ above.
+calibration_logs/**
+
 # Editor
 .vscode/
 .idea/

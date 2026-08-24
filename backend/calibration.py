@@ -12,6 +12,12 @@ within one specific exposure window alongside that exposure's FITS file, so
 a calibration data point is self-contained without cross-referencing the
 session-wide CSVs by timestamp after the fact.
 
+Each capture (see backend/main.py's post_calibration_capture) gets its own
+subdirectory under calibration_logs/, containing capture.fits, capture.txt,
+and capture.csv together — kept entirely separate from the gallery's
+_capture_dir, since a calibration data point is three files that belong
+together rather than one browsable image.
+
 Timestamping: every sample kept here is stamped with the GS wall-clock
 receive time (time.time(), UTC), the same clock backend/camera.py uses for
 FITS DATE-OBS/capture_utc. The PDRO's own per-sample time_unix_us (FC clock)
@@ -130,15 +136,24 @@ def _fmt(v: Any) -> str:
 
 
 def write_sidecar_text(path: Path, *, capture_meta: dict[str, Any], sensor: dict[str, Any],
-                        sphere: dict[str, Any], window: dict[str, Any]) -> None:
+                        sphere: dict[str, Any], window: dict[str, Any],
+                        request_info: dict[str, Any] | None = None) -> None:
     """
     Write a human-readable key=value text file alongside a calibration
-    capture, covering everything not already in the FITS header: full sphere
-    source state at capture time, exposure-window bounds, and sample counts.
-    Mirrors the KEY=VALUE convention backend/camera.py._build_description
-    uses for the FITS COMMENT block, so both are parseable the same way.
+    capture, covering everything not already in the FITS header: the
+    original capture request, full sphere source state at capture time,
+    exposure-window bounds, sample counts, every camera sensor control
+    readback, and pointing/GPS/mount. Mirrors the KEY=VALUE convention
+    backend/camera.py._build_description uses for the FITS COMMENT block,
+    so both are parseable the same way.
     """
     lines = ["ALTAIR V2 -- Camera Calibration Capture", ""]
+
+    if request_info:
+        lines.append("-- Capture request --")
+        for key, value in request_info.items():
+            lines.append(f"{key}={_fmt(value)}")
+        lines.append("")
 
     lines.append(f"CaptureUTC={capture_meta.get('capture_utc', time.time())}")
     lines.append(f"ExposureWindowStartUTC={window.get('start_t')}")

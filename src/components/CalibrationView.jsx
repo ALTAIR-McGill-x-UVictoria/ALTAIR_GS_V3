@@ -408,15 +408,16 @@ export default function CalibrationView({ packets }) {
               <div style={{ marginBottom: 8, fontSize: 10, color: C.muted }}>
                 Captures one FITS frame exactly like the Telescope tab, but also
                 buffers sphere (Lighting) and PDRO (PhotodiodeSignal) telemetry from
-                just before the shutter opens to just after it closes, then writes a
-                sidecar .txt (full system state) and .csv (every buffered sample)
-                alongside the FITS file.
+                just before the shutter opens to just after it closes. Every capture
+                gets its own new subdirectory under calibration_logs/ containing
+                capture.fits, capture.txt (full system state), and capture.csv
+                (every buffered sample) together.
               </div>
 
               <div style={styles.inputRow}>
                 <input style={styles.input} value={capturePath}
                   onChange={e => setCapturePath(e.target.value)}
-                  placeholder="filename (auto if blank, saved as .fits)" />
+                  placeholder="label for the subdirectory (optional)" />
               </div>
               <div style={{ ...styles.inputRow, marginTop: 8 }}>
                 <label style={styles.label}>Pre-margin (s)</label>
@@ -443,15 +444,16 @@ export default function CalibrationView({ packets }) {
               )}
               {lastCapture && !captureError && (
                 <div style={{ marginTop: 8, fontSize: 11, color: C.green }}>
-                  Saved: {lastCapture.path}
+                  Saved to: {lastCapture.dir}
                   <div style={{ color: C.muted, marginTop: 2 }}>
-                    + {lastCapture.txt_path?.split(/[\\/]/).pop()}, {lastCapture.csv_path?.split(/[\\/]/).pop()}
+                    capture.fits, capture.txt, capture.csv
                     {' — '}{lastCapture.lighting_samples} sphere samples, {lastCapture.photodiode_samples} PDRO samples
                   </div>
                 </div>
               )}
               <div style={{ marginTop: 8, fontSize: 10, color: C.muted }}>
-                Reusing a name never overwrites — a repeat gets _1, _2, ... appended.
+                Reusing a label never overwrites — a repeat gets _1, _2, ... appended
+                to the subdirectory name.
               </div>
             </Section>
           </div>

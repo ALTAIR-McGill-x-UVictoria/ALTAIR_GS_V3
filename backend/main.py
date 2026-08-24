@@ -1221,6 +1221,13 @@ gs_gps_reader = GsGpsReader(on_fix=_on_gs_fix, on_status=_on_gs_status)
 _REPO_ROOT    = Path(__file__).parent.parent
 _capture_dir  = _REPO_ROOT / "captures"   # default; overridable at runtime
 
+# Calibration captures are kept entirely separate from the gallery's
+# _capture_dir above — each capture gets its own subdirectory here (see
+# post_calibration_capture) rather than living flat alongside regular
+# telescope captures, since a calibration data point is three files (FITS +
+# .txt + .csv) that belong together, not a single browsable image.
+_CALIBRATION_LOG_DIR = _REPO_ROOT / "calibration_logs"
+
 # In-memory JPEG cache: filename -> (mtime, jpeg_thumb_bytes, jpeg_full_bytes)
 _jpeg_cache: dict[str, tuple[float, bytes, bytes]] = {}
 
@@ -2514,21 +2521,51 @@ async def post_calibration_set_brightness(body: dict):
     return {"ok": ok, "error": None if ok else "No command transport connected (tunnel or serial)", "target_a": target_a}
 
 
+def _unique_calibration_dir(label: str) -> Path:
+    """
+    Return a new, not-yet-existing subdirectory of _CALIBRATION_LOG_DIR for
+    one calibration capture, named <UTC timestamp>_<label> (label sanitized
+    to filesystem-safe characters). Appends _1, _2, ... on collision — two
+    captures within the same second with the same label — mirroring
+    _unique_capture_path's approach for the gallery.
+    """
+    safe_label = "".join(c if (c.isalnum() or c in "-_") else "_" for c in label).strip("_") or "calib"
+    stamp = time.strftime("%Y%m%d_%H%M%S", time.gmtime())
+    base = f"{stamp}_{safe_label}"
+    candidate = _CALIBRATION_LOG_DIR / base
+    n = 1
+    while candidate.exists():
+        candidate = _CALIBRATION_LOG_DIR / f"{base}_{n}"
+        n += 1
+    return candidate
+
+
 @app.post("/api/calibration/capture")
 async def post_calibration_capture(body: dict):
     """
-    Take one calibration exposure: capture a FITS frame exactly like
-    /api/telescope/camera/capture, but additionally buffer every Lighting
-    (sphere DAC/current/temperature) and PhotodiodeSignal (PDRO) sample
-    received from margin_pre_s before the shutter opens through margin_post_s
-    after the (approximate) exposure completes, and write two sidecar files
-    next to the FITS output:
-      <name>.txt — human-readable system state (sphere setting, sensor
-                   controls, pointing/GPS — same values as the FITS header)
-      <name>.csv — every buffered Lighting + PhotodiodeSignal sample,
-                   time-ordered, correlated to this specific exposure
+    Take one calibration exposure and save every produced file into its own
+    new subdirectory under calibration_logs/ (not the gallery's _capture_dir
+    — calibration output is kept entirely separate, since a data point here
+    is three files that belong together rather than a single browsable
+    image). Each subdirectory is named <UTC timestamp>_<label>/ and contains:
+
+      capture.fits — the exposure itself, with the same pointing/GPS/mount/
+                     sensor-control FITS header camera.py always writes
+      capture.txt  — human-readable system state: the capture request
+                     itself (label, margins), exposure window bounds and
+                     sample counts, full sphere source state (on/off, DAC
+                     code, drive current, temperature, beacon state), every
+                     camera sensor control readback (gain, exposure, etc. —
+                     whatever was actually in effect at capture time), and
+                     pointing/GPS/mount — see write_sidecar_text
+      capture.csv  — every Lighting + PhotodiodeSignal sample buffered from
+                     margin_pre_s before the shutter opened through
+                     margin_post_s after it closed, time-ordered — see
+                     write_sidecar_csv
 
     Body: { filename?: str, margin_pre_s?: float, margin_post_s?: float }
+    filename, if given, only supplies the subdirectory's label — it is
+    sanitized and does not need a file extension.
 
     The window itself is not sized off the requested exposure time — it
     simply starts margin_pre_s before camera_controller.capture() is called
@@ -2536,26 +2573,32 @@ async def post_calibration_capture(body: dict):
     brackets the real exposure (whatever the sensor actually took) plus
     fixed margins, regardless of what exposure_ms was requested.
     """
-    requested = body.get("filename") or f"calib_{int(time.time())}"
+    requested = body.get("filename") or "calib"
     margin_pre_s  = float(body.get("margin_pre_s", 0.5))
     margin_post_s = float(body.get("margin_post_s", 0.5))
 
-    _capture_dir.mkdir(parents=True, exist_ok=True)
-    output_path = _unique_capture_path(_normalize_capture_filename(requested))
+    _CALIBRATION_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    capture_dir = _unique_calibration_dir(requested)
+    capture_dir.mkdir(parents=True)
+    fits_path = capture_dir / "capture.fits"
+    txt_path  = capture_dir / "capture.txt"
+    csv_path  = capture_dir / "capture.csv"
 
     try:
         async with _capture_lock:
             calibration_recorder.start_window(margin_pre_s=margin_pre_s)
             capture_meta = await _build_capture_metadata()
-            saved = await camera_controller.capture(output_path, metadata=capture_meta)
+            saved = await camera_controller.capture(fits_path, metadata=capture_meta)
             window = await calibration_recorder.finish_window(margin_post_s=margin_post_s)
     except Exception as e:
         await calibration_recorder.finish_window(margin_post_s=0.0)
         return {"ok": False, "error": str(e)}
 
-    saved_path = Path(saved)
-    txt_path = saved_path.with_suffix(".txt")
-    csv_path  = saved_path.with_suffix(".csv")
+    request_info = {
+        "requested_label": requested,
+        "margin_pre_s":    margin_pre_s,
+        "margin_post_s":   margin_post_s,
+    }
     try:
         write_sidecar_text(
             txt_path,
@@ -2563,18 +2606,20 @@ async def post_calibration_capture(body: dict):
             sensor=camera_controller.status_dict(),
             sphere=_latest_lighting_fields(),
             window=window,
+            request_info=request_info,
         )
         write_sidecar_csv(csv_path, window=window)
     except Exception as e:
         logger.warning("Calibration capture: sidecar write failed: %s", e)
         return {
-            "ok": True, "path": saved, "sidecar_error": str(e),
+            "ok": True, "dir": str(capture_dir), "path": saved, "sidecar_error": str(e),
             "lighting_samples": len(window.get("lighting_samples", [])),
             "photodiode_samples": len(window.get("photodiode_samples", [])),
         }
 
     return {
         "ok": True,
+        "dir": str(capture_dir),
         "path": saved,
         "txt_path": str(txt_path),
         "csv_path": str(csv_path),

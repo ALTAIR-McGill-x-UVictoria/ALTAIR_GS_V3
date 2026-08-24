@@ -94,14 +94,23 @@ export default function ConnectionBar({ status, tunnelStatus = {}, wsReady, fres
     setUnlocked(false)
   }
 
+  // Serial and the tunnel are both valid live telemetry sources — the radio
+  // link being unidirectional (or simply not wired at all, e.g. a
+  // tunnel-only ground station) is a normal deployment, not a degraded one,
+  // so this dot must treat "no serial, tunnel connected" as fully healthy
+  // rather than falling through to the same amber "No serial link" state a
+  // genuinely dead link gets.
+  const tunnelLive = status.telemetry_source === 'tunnel' && tunnelStatus.connected
   const dotColor = status.emulating
     ? '#a78bfa'
-    : status.connected ? 'var(--ok)' : wsReady ? 'var(--warn)' : 'var(--error)'
+    : (status.connected || tunnelLive) ? 'var(--ok)' : wsReady ? 'var(--warn)' : 'var(--error)'
   const dotLabel = status.emulating
     ? 'Emulator active'
     : status.connected
       ? `Connected — ${status.port}`
-      : wsReady ? 'No serial link' : 'Backend offline'
+      : tunnelLive
+        ? `Connected — tunnel (${tunnelStatus.host}:${tunnelStatus.port})`
+        : wsReady ? 'No serial link' : 'Backend offline'
 
   return (
     <header style={styles.bar}>

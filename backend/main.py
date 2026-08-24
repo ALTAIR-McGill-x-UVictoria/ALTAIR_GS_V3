@@ -1495,7 +1495,11 @@ async def _gs_gps_beacon_loop(interval_s: float = 5.0) -> None:
 
     while True:
         await asyncio.sleep(interval_s)
-        if serial_reader.port_name is None and not tunnel_reader.connected:
+        # port_name is "" (never None) when no port is open — SerialReader
+        # never sets it to None — so this must check falsiness, not identity,
+        # or the guard silently never skips anything even with no radio and
+        # no tunnel connected.
+        if not serial_reader.port_name and not tunnel_reader.connected:
             continue
         try:
             pkt = GsGpsCommandPacket(

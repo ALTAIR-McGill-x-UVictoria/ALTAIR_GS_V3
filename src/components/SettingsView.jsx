@@ -305,7 +305,107 @@ function RadioConfigPanel({ lastAck, currentStage = -1 }) {
   )
 }
 
-export default function SettingsView({ packets, lastAck, overrideChecks = false, onOverrideChange, currentStage = -1 }) {
+// GS-to-GS relay over ZeroTier (backend/relay.py). A station without the
+// radio subscribes to the host GS's ZeroTier IP and mirrors its telemetry;
+// every station also lists the peers currently subscribed to it.
+function PeerRelayPanel({ peerStatus = {}, relayPeers = [] }) {
+  const [hostDraft, setHostDraft] = useState('')
+  const [stationId, setStationId] = useState('')
+  const [busy, setBusy]           = useState(false)
+  const [error, setError]         = useState('')
+
+  useEffect(() => {
+    fetch('/api/peer')
+      .then(r => r.json())
+      .then(d => {
+        setStationId(d.station_id ?? '')
+        if (d.host) setHostDraft(d.port && d.port !== 8000 ? `${d.host}:${d.port}` : d.host)
+      })
+      .catch(() => {})
+  }, [])
+
+  async function apply(enabled) {
+    setBusy(true)
+    setError('')
+    try {
+      const res = await apiFetch('/api/peer', {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ enabled, host: hostDraft.trim() }),
+      })
+      const data = await res.json()
+      if (!res.ok || !data.ok) setError(data.error ?? data.detail ?? `HTTP ${res.status}`)
+    } catch (e) {
+      setError(String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const remote = peerStatus.remote_status ?? {}
+  const dot = !peerStatus.enabled ? '#607080' : peerStatus.connected ? '#22c55e' : '#fbbf24'
+  const line = !peerStatus.enabled
+    ? 'Not subscribed — this station uses its own radio/tunnel only'
+    : peerStatus.connected
+      ? `Subscribed to ${peerStatus.remote_station || 'host'} @ ${peerStatus.host}:${peerStatus.port}` +
+        ` — host ${remote.emulating ? 'emulator' : remote.radio_connected ? `radio ${remote.port}` : 'radio NOT connected'}` +
+        (remote.telemetry_source ? `, source ${remote.telemetry_source}` : '')
+      : `Connecting to ${peerStatus.host}:${peerStatus.port}…${peerStatus.error ? ` (${peerStatus.error})` : ''}`
+
+  return (
+    <div style={SV.group}>
+      <div style={SV.groupTitle}>Peer Relay (ZeroTier)</div>
+
+      <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 8 }}>
+        <span style={{ width: 7, height: 7, borderRadius: '50%', flexShrink: 0, background: dot, display: 'inline-block' }} />
+        <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--muted)' }}>{line}</span>
+      </div>
+
+      <div style={{ display: 'flex', alignItems: 'flex-end', gap: 10, flexWrap: 'wrap' }}>
+        <div style={SV.radioField}>
+          <span style={SV.radioLabel}>Host GS ZeroTier IP[:port]</span>
+          <input
+            type="text"
+            placeholder="10.147.17.5"
+            value={hostDraft}
+            disabled={busy}
+            onChange={e => setHostDraft(e.target.value)}
+            onKeyDown={e => { if (e.key === 'Enter' && hostDraft.trim()) apply(true) }}
+            style={{ ...SV.input, width: 180 }}
+          />
+        </div>
+        <button
+          disabled={busy || !hostDraft.trim()}
+          onClick={() => apply(true)}
+          style={{ ...SV.sendBtn, ...(busy || !hostDraft.trim() ? SV.sendBtnDisabled : SV.sendBtnActive) }}
+        >
+          {peerStatus.enabled ? 'RECONNECT' : 'SUBSCRIBE'}
+        </button>
+        {peerStatus.enabled && (
+          <button
+            disabled={busy}
+            onClick={() => apply(false)}
+            style={{ ...SV.sendBtn, ...(busy ? SV.sendBtnDisabled : SV.sendBtnActive) }}
+          >
+            STOP
+          </button>
+        )}
+        {error && <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--error)' }}>{error}</span>}
+      </div>
+
+      <div style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--muted)', marginTop: 10, lineHeight: 1.6 }}>
+        This station{stationId ? ` (${stationId})` : ''} shares its telemetry at
+        {' '}<span style={{ color: 'var(--text)' }}>ws://&lt;this-zerotier-ip&gt;:8000/ws/relay</span>.
+        {' '}{relayPeers.length === 0
+          ? 'No peers subscribed.'
+          : `Streaming to ${relayPeers.length} peer${relayPeers.length > 1 ? 's' : ''}: ` +
+            relayPeers.map(p => `${p.station_id} (${p.addr.split(':')[0]})${p.dropped ? ` — ${p.dropped} dropped` : ''}`).join(', ')}
+      </div>
+    </div>
+  )
+}
+
+export default function SettingsView({ packets, lastAck, peerStatus, relayPeers, overrideChecks = false, onOverrideChange, currentStage = -1 }) {
   const [drafts, setDrafts] = useState({})
   const [touched, setTouched] = useState(new Set())
   const [pendingFieldId, setPendingFieldId] = useState(null)
@@ -414,6 +514,7 @@ export default function SettingsView({ packets, lastAck, overrideChecks = false,
       )}
 
       <div style={SV.scrollArea}>
+        <PeerRelayPanel peerStatus={peerStatus} relayPeers={relayPeers} />
         <RadioConfigPanel lastAck={lastAck} currentStage={currentStage} />
 
         {groups.map(group => (

@@ -78,7 +78,7 @@ function resolveGpsHistory(history, packets) {
 }
 
 export default function App() {
-  const { status, tunnelStatus, packets, history, freshness, wsReady, alarms, alarmRules, events, stageNames, lastAck, gsGps, gsGpsStatus } = useTelemetry()
+  const { status, tunnelStatus, peerStatus, relayPeers, packets, history, freshness, wsReady, alarms, alarmRules, events, stageNames, lastAck, gsGps, gsGpsStatus } = useTelemetry()
   const { tracking, mountStatus, cameraStatus } = useTelescope()
   const [activeTab, setActiveTab] = useState('Flight')
   const [dismissed, setDismissed] = useState(new Set())
@@ -108,6 +108,8 @@ export default function App() {
       <ConnectionBar
         status={status}
         tunnelStatus={tunnelStatus}
+        peerStatus={peerStatus}
+        relayPeers={relayPeers}
         wsReady={wsReady}
         freshness={freshness}
         gsGps={gsGps}
@@ -185,7 +187,7 @@ export default function App() {
           )}
 
           {activeTab === 'Settings' && (
-            <SettingsView packets={packets} lastAck={lastAck} overrideChecks={overrideChecks} onOverrideChange={setOverrideChecks} currentStage={currentStage} />
+            <SettingsView packets={packets} lastAck={lastAck} peerStatus={peerStatus} relayPeers={relayPeers} overrideChecks={overrideChecks} onOverrideChange={setOverrideChecks} currentStage={currentStage} />
           )}
         </div>
 

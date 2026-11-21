@@ -45,7 +45,7 @@ const FRESHNESS_STYLE = {
   waiting: { color: 'var(--muted)', label: '○' },
 }
 
-export default function ConnectionBar({ status, tunnelStatus = {}, wsReady, freshness = {}, gsGps, gsGpsStatus, mountStatus, cameraStatus }) {
+export default function ConnectionBar({ status, tunnelStatus = {}, peerStatus = {}, relayPeers = [], wsReady, freshness = {}, gsGps, gsGpsStatus, mountStatus, cameraStatus }) {
   const { ports, loading, error, refreshPorts, connectPort, disconnectPort } = useSerial()
   const [selectedPort, setSelectedPort] = useState('')
   const [selectedBaud, setSelectedBaud] = useState(57600)
@@ -101,16 +101,20 @@ export default function ConnectionBar({ status, tunnelStatus = {}, wsReady, fres
   // rather than falling through to the same amber "No serial link" state a
   // genuinely dead link gets.
   const tunnelLive = status.telemetry_source === 'tunnel' && tunnelStatus.connected
+  // Same for a viewer GS mirroring another station over the ZeroTier relay.
+  const peerLive = status.telemetry_source === 'peer' && peerStatus.connected
   const dotColor = status.emulating
     ? '#a78bfa'
-    : (status.connected || tunnelLive) ? 'var(--ok)' : wsReady ? 'var(--warn)' : 'var(--error)'
+    : (status.connected || tunnelLive || peerLive) ? 'var(--ok)' : wsReady ? 'var(--warn)' : 'var(--error)'
   const dotLabel = status.emulating
     ? 'Emulator active'
     : status.connected
       ? `Connected — ${status.port}`
       : tunnelLive
         ? `Connected — tunnel (${tunnelStatus.host}:${tunnelStatus.port})`
-        : wsReady ? 'No serial link' : 'Backend offline'
+        : peerLive
+          ? `Connected — relay from ${peerStatus.remote_station || peerStatus.host}`
+          : wsReady ? 'No serial link' : 'Backend offline'
 
   return (
     <header style={styles.bar}>
@@ -125,6 +129,11 @@ export default function ConnectionBar({ status, tunnelStatus = {}, wsReady, fres
         {status.telemetry_source === 'tunnel' && (
           <span style={styles.tunnelBadge} title={`Radio quiet — live via tunnel${tunnelStatus.host ? ` (${tunnelStatus.host})` : ''}`}>
             TUNNEL ACTIVE
+          </span>
+        )}
+        {status.telemetry_source === 'peer' && (
+          <span style={styles.peerBadge} title={`No local radio — mirroring ${peerStatus.remote_station || 'host GS'} (${peerStatus.host}:${peerStatus.port}) over ZeroTier`}>
+            VIA {(peerStatus.remote_station || peerStatus.host || 'PEER').toUpperCase()}
           </span>
         )}
       </div>
@@ -241,6 +250,34 @@ export default function ConnectionBar({ status, tunnelStatus = {}, wsReady, fres
                 ? `Tunnel — connected to ${tunnelStatus.host}:${tunnelStatus.port}`
                 : `Tunnel — configured (${tunnelStatus.host}:${tunnelStatus.port}), not currently connected`
             }
+          />
+        )}
+
+        {/* Relay: our subscription to another GS's telemetry over ZeroTier.
+            Only shown when enabled (Settings tab or ALTAIR_PEER_HOST). */}
+        {peerStatus.enabled && (
+          <HwIndicator
+            label="Relay"
+            state={
+              !peerStatus.connected ? 'partial' :
+              status.telemetry_source === 'peer' ? 'receiving' : 'connected'
+            }
+            detail={
+              peerStatus.connected
+                ? `Relay — subscribed to ${peerStatus.remote_station || 'host GS'} at ${peerStatus.host}:${peerStatus.port}` +
+                  (peerStatus.remote_status?.radio_connected === false && !peerStatus.remote_status?.emulating
+                    ? ' (host radio not connected)' : '')
+                : `Relay — trying ${peerStatus.host}:${peerStatus.port}${peerStatus.error ? ` (${peerStatus.error})` : ''}`
+            }
+          />
+        )}
+
+        {/* Sharing: other GSs currently subscribed to this station's relay */}
+        {relayPeers.length > 0 && (
+          <HwIndicator
+            label={`Sharing ×${relayPeers.length}`}
+            state="connected"
+            detail={`Streaming telemetry to: ${relayPeers.map(p => `${p.station_id} (${p.addr.split(':')[0]})`).join(', ')}`}
           />
         )}
 
@@ -410,6 +447,17 @@ const styles = {
     background:   '#4c1d95',
     color:        '#a78bfa',
     border:       '1px solid #7c3aed',
+    borderRadius: 3,
+    fontSize:     9,
+    fontWeight:   700,
+    padding:      '1px 6px',
+    letterSpacing: 1,
+    fontFamily:   'var(--font-mono)',
+  },
+  peerBadge: {
+    background:   '#1f2a1a',
+    color:        '#a3e635',
+    border:       '1px solid #65a30d',
     borderRadius: 3,
     fontSize:     9,
     fontWeight:   700,

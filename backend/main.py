@@ -58,6 +58,7 @@ from backend.gps_reader import GsGpsReader
 from backend.chrony_status import get_chrony_status
 from backend.metrics import PROMETHEUS_CONTENT_TYPE, TelemetryMetrics
 from backend.remote_metrics import RemoteMetricsReporter
+from backend.relay import RELAY_PROTOCOL, DEFAULT_RELAY_PORT, PeerReader, RelayHub, parse_host
 
 logger = logging.getLogger("gs.backend")
 logging.basicConfig(
@@ -799,6 +800,14 @@ class SerialReader:
                     except Exception:
                         pass
 
+        # Fan out to peer ground stations on the ZeroTier network. Packets
+        # that themselves arrived from a peer relay are not re-relayed, which
+        # rules out loops if two stations ever subscribe to each other.
+        if msg.get("type") == "packet" and msg.get("telemetry_source") != "peer":
+            relay_hub.publish(msg)
+        elif msg.get("type") == "status":
+            relay_hub.publish(_relay_status_msg())
+
         if not self._clients:
             return
         data = json.dumps(msg)
@@ -824,28 +833,30 @@ class SerialReader:
 # is invisible in practice.
 _TUNNEL_FAILOVER_TIMEOUT_S = 3.0
 
-_last_radio_packet_t: float  = 0.0
-_last_tunnel_packet_t: float = 0.0
-_active_telemetry_source: str = "radio"   # "radio" | "tunnel" — which source is currently live
+# Highest priority first: our own radio, then our own FC tunnel, then
+# packets relayed from another ground station over ZeroTier (see relay.py).
+_SOURCE_PRIORITY = ("radio", "tunnel", "peer")
+_last_packet_t: dict[str, float] = {s: 0.0 for s in _SOURCE_PRIORITY}
+_active_telemetry_source: str = "radio"   # one of _SOURCE_PRIORITY — which source is currently live
 
 
 async def _ingest_telemetry(source: str, result: dict) -> None:
     """
-    Arbitrates between the radio (SerialReader) and the tunnel (TunnelReader)
-    so only one source's packets are logged/broadcast at a time, even when
-    both are connected simultaneously. Radio is preferred; tunnel only takes
-    over once radio has gone quiet for _TUNNEL_FAILOVER_TIMEOUT_S, and hands
-    back automatically as soon as radio packets resume.
+    Arbitrates between the radio (SerialReader), the tunnel (TunnelReader)
+    and a peer-GS relay (PeerReader) so only one source's packets are
+    logged/broadcast at a time, even when several are connected at once.
+    The highest-priority source heard from within _TUNNEL_FAILOVER_TIMEOUT_S
+    wins; a lower one only takes over once everything above it has gone
+    quiet, and hands back automatically as soon as a better source resumes.
     """
-    global _last_radio_packet_t, _last_tunnel_packet_t, _active_telemetry_source
+    global _active_telemetry_source
     now = time.monotonic()
-    if source == "radio":
-        _last_radio_packet_t = now
-    else:
-        _last_tunnel_packet_t = now
+    _last_packet_t[source] = now
 
-    radio_fresh = (now - _last_radio_packet_t) < _TUNNEL_FAILOVER_TIMEOUT_S
-    desired_source = "radio" if radio_fresh else "tunnel"
+    desired_source = next(
+        s for s in _SOURCE_PRIORITY
+        if s == source or (now - _last_packet_t[s]) < _TUNNEL_FAILOVER_TIMEOUT_S
+    )
 
     if desired_source != _active_telemetry_source:
         _active_telemetry_source = desired_source
@@ -1063,6 +1074,62 @@ metrics_exporter = TelemetryMetrics()
 remote_metrics = RemoteMetricsReporter()
 _emulator: PacketEmulator | None = None
 _emulating = False
+
+
+# ---------------------------------------------------------------------------
+# GS-to-GS relay (see backend/relay.py)
+#
+# Every GS is always a potential *host*: any peer on the ZeroTier network can
+# subscribe to ws://<this-GS-zerotier-ip>:8000/ws/relay and receive the
+# packets this station decodes. A GS becomes a *peer* by pointing its
+# PeerReader at a host — via ALTAIR_PEER_HOST in .env or the Settings tab.
+# ---------------------------------------------------------------------------
+
+_STATION_ID = os.getenv("ALTAIR_STATION_ID", "").strip() or socket.gethostname()
+_PEER_CONFIG_FILE = Path(__file__).resolve().parents[1] / "peer_relay.json"
+
+
+def _relay_status_msg() -> dict:
+    return {
+        "type":             "relay_status",
+        "station_id":       _STATION_ID,
+        "radio_connected":  serial_reader.connected,
+        "port":             serial_reader.port_name,
+        "telemetry_source": _active_telemetry_source,
+        "emulating":        _emulating,
+    }
+
+
+async def _broadcast_relay_hub_status() -> None:
+    await serial_reader._broadcast({"type": "relay_hub_status", "peers": relay_hub.peers})
+
+
+async def _on_peer_packet(msg: dict) -> None:
+    pkt = {k: v for k, v in msg.items() if k not in ("type", "telemetry_source")}
+    # Keep the host's own source (radio/tunnel/emulator) for display/debugging.
+    pkt["upstream_source"] = msg.get("telemetry_source") or "emulator"
+    await _ingest_telemetry("peer", pkt)
+
+
+async def _on_peer_status(status: dict) -> None:
+    await serial_reader._broadcast(status)
+
+
+def _load_peer_config() -> dict:
+    """Saved Settings-tab choice wins over ALTAIR_PEER_HOST in .env."""
+    try:
+        cfg = json.loads(_PEER_CONFIG_FILE.read_text())
+        return {"enabled": bool(cfg.get("enabled")), "host": str(cfg.get("host", ""))}
+    except FileNotFoundError:
+        env_host = os.getenv("ALTAIR_PEER_HOST", "").strip()
+        return {"enabled": bool(env_host), "host": env_host}
+    except Exception:
+        logger.warning("Could not read %s — peer relay disabled", _PEER_CONFIG_FILE, exc_info=True)
+        return {"enabled": False, "host": ""}
+
+
+relay_hub   = RelayHub(on_change=_broadcast_relay_hub_status)
+peer_reader = PeerReader(on_packet=_on_peer_packet, on_status=_on_peer_status, station_id=_STATION_ID)
 
 # Previous values of Event packet fields — used to detect transitions
 _event_prev: dict[str, int] = {}
@@ -1601,6 +1668,14 @@ async def lifespan(app: FastAPI):
         tunnel_port = int(os.getenv("ALTAIR_TUNNEL_PORT", "5760"))
         await tunnel_reader.start(tunnel_host, tunnel_port)
 
+    # Optional subscription to another GS's relay over ZeroTier (relay.py).
+    peer_cfg = _load_peer_config()
+    if peer_cfg["enabled"] and peer_cfg["host"]:
+        try:
+            await peer_reader.start(*parse_host(peer_cfg["host"]))
+        except ValueError:
+            logger.warning("Invalid peer relay host %r — ignored", peer_cfg["host"])
+
     # Start GS GPS reader (non-blocking; logs a warning if dongle absent)
     await gs_gps_reader.start()
 
@@ -1639,6 +1714,7 @@ async def lifespan(app: FastAPI):
     if _emulator:
         await _emulator.stop()
     await tunnel_reader.stop()
+    await peer_reader.stop()
     await serial_reader.disconnect()
     if mount_controller is not None and mount_controller.connected:
         await mount_controller.disconnect()
@@ -2068,6 +2144,9 @@ async def websocket_endpoint(ws: WebSocket):
             "host": tunnel_reader._host,
             "port": tunnel_reader._port,
         }))
+    # Relay state: our subscription to a host GS, and peers subscribed to us
+    await ws.send_text(json.dumps(peer_reader.status_dict()))
+    await ws.send_text(json.dumps({"type": "relay_hub_status", "peers": relay_hub.peers}))
     # Send current GS GPS status so the badge is accurate on page load
     await ws.send_text(json.dumps({
         "type":      "gs_gps_status",
@@ -2091,6 +2170,51 @@ async def websocket_endpoint(ws: WebSocket):
     finally:
         serial_reader.remove_client(ws)
         logger.info("WebSocket client disconnected (%d remaining)", len(serial_reader._clients))
+
+
+# ---------------------------------------------------------------------------
+# GS-to-GS relay endpoints (see backend/relay.py)
+# ---------------------------------------------------------------------------
+
+@app.websocket("/ws/relay")
+async def relay_ws_endpoint(ws: WebSocket):
+    """Peer ground stations subscribe here to receive this station's telemetry."""
+    await relay_hub.serve(ws, initial=[
+        {"type": "relay_hello", "protocol": RELAY_PROTOCOL, "station_id": _STATION_ID},
+        _relay_status_msg(),
+    ])
+
+
+@app.get("/api/peer")
+def get_peer():
+    """Peer-relay state: our upstream subscription and our downstream peers."""
+    return {**peer_reader.status_dict(), "station_id": _STATION_ID, "peers": relay_hub.peers}
+
+
+@app.post("/api/peer")
+async def post_peer(body: dict):
+    """
+    Subscribe to (or stop subscribing to) another GS's relay.
+    Body: {"enabled": bool, "host": "10.x.x.x" | "10.x.x.x:8000"}.
+    The choice is saved so it survives a backend restart.
+    """
+    enabled = bool(body.get("enabled", False))
+    host_str = str(body.get("host", "")).strip()
+    if enabled:
+        try:
+            host, port = parse_host(host_str)
+        except ValueError:
+            return {"ok": False, "error": f"Invalid host {host_str!r}"}
+        if not host:
+            return {"ok": False, "error": "Host required"}
+        await peer_reader.start(host, port)
+    else:
+        await peer_reader.stop()
+    try:
+        _PEER_CONFIG_FILE.write_text(json.dumps({"enabled": enabled, "host": host_str}))
+    except OSError:
+        logger.warning("Could not save %s", _PEER_CONFIG_FILE, exc_info=True)
+    return {"ok": True, **peer_reader.status_dict()}
 
 
 # ---------------------------------------------------------------------------

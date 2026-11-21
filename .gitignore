@@ -40,3 +40,6 @@ calibration_logs/**
 .vscode/
 .idea/
 .claude/
+
+# Saved GS-to-GS relay subscription (Settings tab)
+peer_relay.json

@@ -15,8 +15,11 @@ const STALE_LOST_MS_MIN  = 5000
  * Central telemetry hook.
  *
  * Returns:
- *   status       — { connected: bool, port: string, telemetry_source: 'radio' | 'tunnel' }
+ *   status       — { connected: bool, port: string, telemetry_source: 'radio' | 'tunnel' | 'peer' }
  *   tunnelStatus — { enabled: bool, connected: bool, host: string, port: number }
+ *   peerStatus   — our subscription to another GS's relay:
+ *                  { enabled, connected, host, port, error, remote_station, remote_status }
+ *   relayPeers   — peer GSs currently subscribed to *our* relay: [{ station_id, addr, ... }]
  *   packets    — { [label]: { fields: [{name, label, unit, value}], seq, timestamp } }
  *   history    — { [label]: { [fieldName]: [{ t, v }, ...] } }
  *   freshness  — { [label]: 'ok' | 'stale' | 'lost' | 'waiting' }
@@ -29,6 +32,8 @@ export function useTelemetry() {
   const [wsReady,     setWsReady]     = useState(false)
   const [status,      setStatus]      = useState({ connected: false, port: '', telemetry_source: 'radio' })
   const [tunnelStatus, setTunnelStatus] = useState({ enabled: false, connected: false, host: '', port: 0 })
+  const [peerStatus,  setPeerStatus]  = useState({ enabled: false, connected: false, host: '', port: 0, error: '', remote_station: '', remote_status: {} })
+  const [relayPeers,  setRelayPeers]  = useState([])
   const [packets,     setPackets]     = useState({})
   const [history,     setHistory]     = useState({})
   const [alarms,      setAlarms]      = useState([])
@@ -114,6 +119,16 @@ export function useTelemetry() {
 
       if (msg.type === 'tunnel_status') {
         setTunnelStatus({ enabled: true, connected: msg.connected, host: msg.host, port: msg.port })
+        return
+      }
+
+      if (msg.type === 'peer_status') {
+        setPeerStatus(msg)
+        return
+      }
+
+      if (msg.type === 'relay_hub_status') {
+        setRelayPeers(msg.peers ?? [])
         return
       }
 
@@ -289,5 +304,5 @@ export function useTelemetry() {
     return () => clearInterval(id)
   }, [])
 
-  return { status, tunnelStatus, packets, history, freshness, wsReady, alarms, alarmRules, events, stageNames, lastAck, gsGps, gsGpsStatus }
+  return { status, tunnelStatus, peerStatus, relayPeers, packets, history, freshness, wsReady, alarms, alarmRules, events, stageNames, lastAck, gsGps, gsGpsStatus }
 }

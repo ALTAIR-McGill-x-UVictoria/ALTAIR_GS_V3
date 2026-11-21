@@ -76,6 +76,8 @@ Imports the flight computer's telemetry registry from `../Altairfc_V2/altairfc/t
 
 **[emulator.py](backend/emulator.py)** — Synthetic packet generator for development without hardware. Activated by `ALTAIR_DEBUG=1`. Generates sinusoidal signals, sweeps alarm thresholds, and traces a GPS circle around the GS position.
 
+**[relay.py](backend/relay.py)** — GS-to-GS telemetry relay over ZeroTier. Every GS serves its decoded packets at `/ws/relay` (`RelayHub`, one bounded queue per peer so slow links never stall radio I/O). A GS without the radio sets `ALTAIR_PEER_HOST` (or uses the Settings tab, saved to `peer_relay.json`) and `PeerReader` feeds the host's packets into the local pipeline as source `"peer"` — lowest priority after `radio` and `tunnel` in `_ingest_telemetry`. Peer-sourced packets are never re-relayed.
+
 **[commands.py](backend/commands.py)** — Builds binary command frames (same wire format as telemetry, using the FC command registry) for sending to the flight computer.
 
 ### Frontend (`src/`)
@@ -104,6 +106,8 @@ All messages from `/ws` are JSON with a `type` field:
 - `"event"` — Flight state transition with `field`, `old_val`, `new_val`, `message`, `stage`
 - `"tracking"` — Telescope pointing data with `azimuth`, `elevation`, `ra_hours`, `dec_deg`, `distance_m`
 - `"gs_gps"` — Ground station GPS fix with `lat`, `lon`, `alt`, `fix_quality`, `hdop`
+- `"peer_status"` — This GS's subscription to a host GS relay (`enabled`, `connected`, `host`, `remote_station`, `remote_status`)
+- `"relay_hub_status"` — Peer GSs currently subscribed to this station's relay (`peers[]`)
 
 ### External Dependency: Flight Computer Registry
 

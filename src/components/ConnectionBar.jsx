@@ -266,8 +266,14 @@ export default function ConnectionBar({ status, tunnelStatus = {}, peerStatus = 
               peerStatus.connected
                 ? `Relay — subscribed to ${peerStatus.remote_station || 'host GS'} at ${peerStatus.host}:${peerStatus.port}` +
                   (peerStatus.remote_status?.radio_connected === false && !peerStatus.remote_status?.emulating
-                    ? ' (host radio not connected)' : '')
-                : `Relay — trying ${peerStatus.host}:${peerStatus.port}${peerStatus.error ? ` (${peerStatus.error})` : ''}`
+                    ? ' (host radio not connected)' : '') +
+                  (peerStatus.images?.enabled
+                    ? ` · ${peerStatus.images.received} image(s) mirrored` +
+                      (peerStatus.images.pending ? `, ${peerStatus.images.pending} queued` : '')
+                    : '')
+                : peerStatus.auto && !peerStatus.host
+                  ? `Relay — auto: ${peerStatus.scanning ? 'scanning the ZeroTier network…' : (peerStatus.error || 'searching')}`
+                  : `Relay — trying ${peerStatus.host}:${peerStatus.port}${peerStatus.error ? ` (${peerStatus.error})` : ''}`
             }
           />
         )}

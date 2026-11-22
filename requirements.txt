@@ -2,6 +2,9 @@ fastapi>=0.111.0
 uvicorn[standard]>=0.30.0
 pyserial>=3.5
 websockets>=12.0
+# Finds this PC's ZeroTier subnet(s) so the peer relay can scan them for
+# other ground stations (backend/relay.py discover()).
+psutil>=5.9
 pynmea2>=1.19.0
 python-dotenv>=1.0.1
 opentelemetry-sdk>=1.27.0

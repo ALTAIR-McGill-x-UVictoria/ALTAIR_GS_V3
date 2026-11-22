@@ -38,7 +38,7 @@ import serial.tools.list_ports
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 
 # Load local configuration before metrics reporters are constructed below.
 # Values already supplied by the shell or service manager take precedence.
@@ -58,7 +58,8 @@ from backend.gps_reader import GsGpsReader
 from backend.chrony_status import get_chrony_status
 from backend.metrics import PROMETHEUS_CONTENT_TYPE, TelemetryMetrics
 from backend.remote_metrics import RemoteMetricsReporter
-from backend.relay import RELAY_PROTOCOL, DEFAULT_RELAY_PORT, PeerReader, RelayHub, parse_host
+from backend.relay import (RELAY_PROTOCOL, DEFAULT_RELAY_PORT, IMAGE_PATH, DISCOVERY_PATH, INSTANCE_ID,
+                           PeerReader, RelayHub, discover, parse_host)
 
 logger = logging.getLogger("gs.backend")
 logging.basicConfig(
@@ -1128,8 +1129,22 @@ def _load_peer_config() -> dict:
         return {"enabled": False, "host": ""}
 
 
+async def _start_peer(host_str: str) -> None:
+    """'auto' (scan the ZeroTier network) or 'ip[:port]'. Raises ValueError."""
+    if host_str.strip().lower() == "auto":
+        await peer_reader.start("", DEFAULT_RELAY_PORT, auto=True)
+        return
+    host, port = parse_host(host_str)
+    if not host:
+        raise ValueError("Host required")
+    await peer_reader.start(host, port)
+
+
 relay_hub   = RelayHub(on_change=_broadcast_relay_hub_status)
-peer_reader = PeerReader(on_packet=_on_peer_packet, on_status=_on_peer_status, station_id=_STATION_ID)
+# dest_dir is a lambda so captures follow a runtime change of _capture_dir
+# (POST /api/gallery/config) — it's defined further down in this module.
+peer_reader = PeerReader(on_packet=_on_peer_packet, on_status=_on_peer_status,
+                         station_id=_STATION_ID, dest_dir=lambda: _capture_dir)
 
 # Previous values of Event packet fields — used to detect transitions
 _event_prev: dict[str, int] = {}
@@ -1478,6 +1493,16 @@ def _unique_capture_path(filename: str) -> Path:
     return candidate
 
 
+def _relay_captured_image(saved) -> None:
+    """Hand a finished telescope capture to the GS-to-GS relay (relay.py)."""
+    if not saved:
+        return
+    try:
+        relay_hub.add_image(Path(saved))
+    except Exception:
+        logger.warning("Relay: could not announce capture %s", saved, exc_info=True)
+
+
 async def _broadcast_telescope(msg: dict) -> None:
     if not _telescope_clients:
         return
@@ -1672,7 +1697,7 @@ async def lifespan(app: FastAPI):
     peer_cfg = _load_peer_config()
     if peer_cfg["enabled"] and peer_cfg["host"]:
         try:
-            await peer_reader.start(*parse_host(peer_cfg["host"]))
+            await _start_peer(peer_cfg["host"])
         except ValueError:
             logger.warning("Invalid peer relay host %r — ignored", peer_cfg["host"])
 
@@ -2185,6 +2210,49 @@ async def relay_ws_endpoint(ws: WebSocket):
     ])
 
 
+@app.get(IMAGE_PATH + "/{name}")
+def get_relay_image(name: str):
+    """Raw capture file for a peer GS to mirror — only files the relay announced."""
+    path = relay_hub.image_path(name)
+    if path is None or not path.is_file():
+        return Response(status_code=404)
+    return FileResponse(path, media_type="application/octet-stream", filename=name)
+
+
+@app.get(DISCOVERY_PATH)
+def get_relay_info():
+    """Identifies this GS to peers scanning the ZeroTier network (relay.discover)."""
+    now = time.monotonic()
+    live = next((s for s in ("radio", "tunnel")
+                 if now - _last_packet_t[s] < _TUNNEL_FAILOVER_TIMEOUT_S), None)
+    if live is None and _emulating:
+        live = "emulator"
+    return {
+        "service":          "altair-gs",
+        "protocol":         RELAY_PROTOCOL,
+        "instance":         INSTANCE_ID,
+        "station_id":       _STATION_ID,
+        "live_source":      live,          # None → nothing worth relaying right now
+        "radio_connected":  serial_reader.connected,
+        "tunnel_connected": tunnel_reader.connected,
+        "emulating":        _emulating,
+        "telemetry_source": _active_telemetry_source,
+        "peers":            len(relay_hub.peers),
+    }
+
+
+_discover_lock = asyncio.Lock()
+
+
+@app.get("/api/peer/discover")
+async def get_peer_discover():
+    """Scan every address on this PC's ZeroTier subnet(s) for other ground stations."""
+    async with _discover_lock:
+        result = await discover()
+    peer_reader.last_scan = result
+    return result
+
+
 @app.get("/api/peer")
 def get_peer():
     """Peer-relay state: our upstream subscription and our downstream peers."""
@@ -2195,19 +2263,17 @@ def get_peer():
 async def post_peer(body: dict):
     """
     Subscribe to (or stop subscribing to) another GS's relay.
-    Body: {"enabled": bool, "host": "10.x.x.x" | "10.x.x.x:8000"}.
+    Body: {"enabled": bool, "host": "10.x.x.x" | "10.x.x.x:8000" | "auto"}.
+    "auto" scans the ZeroTier network and picks the best live station.
     The choice is saved so it survives a backend restart.
     """
     enabled = bool(body.get("enabled", False))
     host_str = str(body.get("host", "")).strip()
     if enabled:
         try:
-            host, port = parse_host(host_str)
-        except ValueError:
-            return {"ok": False, "error": f"Invalid host {host_str!r}"}
-        if not host:
-            return {"ok": False, "error": "Host required"}
-        await peer_reader.start(host, port)
+            await _start_peer(host_str)
+        except ValueError as e:
+            return {"ok": False, "error": f"Invalid host {host_str!r}: {e}"}
     else:
         await peer_reader.stop()
     try:
@@ -2582,6 +2648,7 @@ async def post_camera_capture(body: dict):
     try:
         async with _capture_lock:
             saved = await camera_controller.capture(output_path, metadata=await _build_capture_metadata())
+        _relay_captured_image(saved)
         return {"ok": True, "path": saved}
     except Exception as e:
         return {"ok": False, "error": str(e)}
@@ -2970,6 +3037,7 @@ async def _do_auto_capture() -> None:
     async with _capture_lock:
         saved = await camera_controller.capture(output_path, metadata=await _build_capture_metadata())
     logger.info("Auto-capture saved %s", saved)
+    _relay_captured_image(saved)
     await _broadcast_telescope({"type": "auto_capture", "path": saved})
 
 

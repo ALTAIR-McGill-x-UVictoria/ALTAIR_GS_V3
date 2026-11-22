@@ -308,30 +308,47 @@ function RadioConfigPanel({ lastAck, currentStage = -1 }) {
 // GS-to-GS relay over ZeroTier (backend/relay.py). A station without the
 // radio subscribes to the host GS's ZeroTier IP and mirrors its telemetry;
 // every station also lists the peers currently subscribed to it.
+function describeHost(h) {
+  if (h.live_source === 'radio')    return 'LIVE — radio'
+  if (h.live_source === 'tunnel')   return 'LIVE — FC tunnel'
+  if (h.live_source === 'emulator') return 'emulator'
+  if (h.radio_connected)            return 'radio connected, no data yet'
+  if (h.tunnel_connected)           return 'tunnel connected, no data yet'
+  return h.telemetry_source === 'peer' ? 'viewer (no radio)' : 'no radio'
+}
+
 function PeerRelayPanel({ peerStatus = {}, relayPeers = [] }) {
   const [hostDraft, setHostDraft] = useState('')
   const [stationId, setStationId] = useState('')
   const [busy, setBusy]           = useState(false)
   const [error, setError]         = useState('')
+  const [scan, setScan]           = useState(null)   // last /api/peer/discover result
+  const [scanning, setScanning]   = useState(false)
 
   useEffect(() => {
     fetch('/api/peer')
       .then(r => r.json())
       .then(d => {
         setStationId(d.station_id ?? '')
-        if (d.host) setHostDraft(d.port && d.port !== 8000 ? `${d.host}:${d.port}` : d.host)
+        if (d.last_scan) setScan(d.last_scan)
+        if (d.host && !d.auto) setHostDraft(d.port && d.port !== 8000 ? `${d.host}:${d.port}` : d.host)
       })
       .catch(() => {})
   }, [])
 
-  async function apply(enabled) {
+  // Auto mode scans by itself — show its latest results too.
+  useEffect(() => {
+    if (peerStatus.last_scan) setScan(peerStatus.last_scan)
+  }, [peerStatus.last_scan?.time])
+
+  async function apply(enabled, host = hostDraft.trim()) {
     setBusy(true)
     setError('')
     try {
       const res = await apiFetch('/api/peer', {
         method:  'POST',
         headers: { 'Content-Type': 'application/json' },
-        body:    JSON.stringify({ enabled, host: hostDraft.trim() }),
+        body:    JSON.stringify({ enabled, host }),
       })
       const data = await res.json()
       if (!res.ok || !data.ok) setError(data.error ?? data.detail ?? `HTTP ${res.status}`)
@@ -342,15 +359,36 @@ function PeerRelayPanel({ peerStatus = {}, relayPeers = [] }) {
     }
   }
 
+  async function runScan() {
+    setScanning(true)
+    setError('')
+    try {
+      const res = await fetch('/api/peer/discover')
+      setScan(await res.json())
+    } catch (e) {
+      setError(String(e))
+    } finally {
+      setScanning(false)
+    }
+  }
+
   const remote = peerStatus.remote_status ?? {}
+  const auto = peerStatus.enabled && peerStatus.auto
   const dot = !peerStatus.enabled ? '#607080' : peerStatus.connected ? '#22c55e' : '#fbbf24'
   const line = !peerStatus.enabled
     ? 'Not subscribed — this station uses its own radio/tunnel only'
     : peerStatus.connected
-      ? `Subscribed to ${peerStatus.remote_station || 'host'} @ ${peerStatus.host}:${peerStatus.port}` +
+      ? `${auto ? 'Auto: ' : ''}Subscribed to ${peerStatus.remote_station || 'host'} @ ${peerStatus.host}:${peerStatus.port}` +
         ` — host ${remote.emulating ? 'emulator' : remote.radio_connected ? `radio ${remote.port}` : 'radio NOT connected'}` +
         (remote.telemetry_source ? `, source ${remote.telemetry_source}` : '')
-      : `Connecting to ${peerStatus.host}:${peerStatus.port}…${peerStatus.error ? ` (${peerStatus.error})` : ''}`
+      : auto && peerStatus.scanning
+        ? 'Auto: scanning the ZeroTier network for a ground station…'
+        : auto && !peerStatus.host
+          ? `Auto: ${peerStatus.error || 'searching'} — rescanning every 15 s`
+          : `${auto ? 'Auto: ' : ''}Connecting to ${peerStatus.host}:${peerStatus.port}…${peerStatus.error ? ` (${peerStatus.error})` : ''}`
+
+  const isCurrent = h => peerStatus.enabled && peerStatus.host === h.ip && peerStatus.port === h.port
+  const mono = { fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--muted)' }
 
   return (
     <div style={SV.group}>
@@ -358,10 +396,39 @@ function PeerRelayPanel({ peerStatus = {}, relayPeers = [] }) {
 
       <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 8 }}>
         <span style={{ width: 7, height: 7, borderRadius: '50%', flexShrink: 0, background: dot, display: 'inline-block' }} />
-        <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--muted)' }}>{line}</span>
+        <span style={mono}>{line}</span>
       </div>
 
+      {peerStatus.enabled && peerStatus.images?.enabled && (
+        <div style={{ ...mono, margin: '-2px 0 8px 13px' }}>
+          Telescope images: {peerStatus.images.received} mirrored to gallery
+          {peerStatus.images.pending > 0 && `, ${peerStatus.images.pending} queued`}
+          {peerStatus.images.current && ` — downloading ${peerStatus.images.current}`}
+          {peerStatus.images.error && (
+            <span style={{ color: 'var(--warn)' }}> — last error: {peerStatus.images.error}</span>
+          )}
+        </div>
+      )}
+
+      {/* Find a host: automatic, scan-and-pick, or type an IP */}
       <div style={{ display: 'flex', alignItems: 'flex-end', gap: 10, flexWrap: 'wrap' }}>
+        <button
+          disabled={busy}
+          onClick={() => apply(true, 'auto')}
+          title="Scan the ZeroTier network and follow whichever ground station has live telemetry"
+          style={{ ...SV.sendBtn, ...(busy ? SV.sendBtnDisabled : SV.sendBtnActive),
+                   ...(auto ? { background: 'rgba(34,197,94,0.15)', borderColor: '#22c55e', color: '#22c55e' } : {}) }}
+        >
+          {auto ? 'AUTO ✓' : 'AUTO'}
+        </button>
+        <button
+          disabled={scanning || peerStatus.scanning}
+          onClick={runScan}
+          style={{ ...SV.sendBtn, ...(scanning || peerStatus.scanning ? SV.sendBtnDisabled : SV.sendBtnActive) }}
+        >
+          {scanning || peerStatus.scanning ? 'SCANNING…' : 'SCAN NETWORK'}
+        </button>
+        <span style={{ ...mono, alignSelf: 'center' }}>or</span>
         <div style={SV.radioField}>
           <span style={SV.radioLabel}>Host GS ZeroTier IP[:port]</span>
           <input
@@ -371,7 +438,7 @@ function PeerRelayPanel({ peerStatus = {}, relayPeers = [] }) {
             disabled={busy}
             onChange={e => setHostDraft(e.target.value)}
             onKeyDown={e => { if (e.key === 'Enter' && hostDraft.trim()) apply(true) }}
-            style={{ ...SV.input, width: 180 }}
+            style={{ ...SV.input, width: 150 }}
           />
         </div>
         <button
@@ -379,7 +446,7 @@ function PeerRelayPanel({ peerStatus = {}, relayPeers = [] }) {
           onClick={() => apply(true)}
           style={{ ...SV.sendBtn, ...(busy || !hostDraft.trim() ? SV.sendBtnDisabled : SV.sendBtnActive) }}
         >
-          {peerStatus.enabled ? 'RECONNECT' : 'SUBSCRIBE'}
+          SUBSCRIBE
         </button>
         {peerStatus.enabled && (
           <button
@@ -390,12 +457,50 @@ function PeerRelayPanel({ peerStatus = {}, relayPeers = [] }) {
             STOP
           </button>
         )}
-        {error && <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--error)' }}>{error}</span>}
+        {error && <span style={{ ...mono, color: 'var(--error)' }}>{error}</span>}
       </div>
 
-      <div style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--muted)', marginTop: 10, lineHeight: 1.6 }}>
-        This station{stationId ? ` (${stationId})` : ''} shares its telemetry at
-        {' '}<span style={{ color: 'var(--text)' }}>ws://&lt;this-zerotier-ip&gt;:8000/ws/relay</span>.
+      {scan && (
+        <div style={{ marginTop: 10 }}>
+          <div style={mono}>
+            Scanned {scan.scanned} address{scan.scanned === 1 ? '' : 'es'}
+            {scan.subnets?.length ? ` on ${scan.subnets.join(', ')}` : ''} in {scan.duration_s}s
+            {' — '}{scan.hosts.length} ground station{scan.hosts.length === 1 ? '' : 's'} found
+            {scan.error && <span style={{ color: 'var(--warn)' }}> — {scan.error}</span>}
+            {scan.note && <span style={{ color: 'var(--warn)' }}> — {scan.note}</span>}
+          </div>
+          {scan.hosts.map(h => (
+            <div key={`${h.ip}:${h.port}`} style={{ display: 'flex', alignItems: 'center', gap: 10, marginTop: 4 }}>
+              <span style={{ width: 7, height: 7, borderRadius: '50%', flexShrink: 0, display: 'inline-block',
+                             background: h.live_source && h.live_source !== 'emulator' ? '#22c55e'
+                                       : (h.radio_connected || h.tunnel_connected || h.live_source) ? '#fbbf24' : '#607080' }} />
+              <span style={{ ...mono, color: 'var(--text)', minWidth: 160 }}>{h.station_id}</span>
+              <span style={{ ...mono, minWidth: 110 }}>{h.ip}{h.port !== 8000 ? `:${h.port}` : ''}</span>
+              <span style={{ ...mono, minWidth: 190 }}>{describeHost(h)}</span>
+              {isCurrent(h)
+                ? <span style={{ ...mono, color: '#22c55e' }}>SUBSCRIBED</span>
+                : (
+                  <button
+                    disabled={busy}
+                    onClick={() => { const v = h.port !== 8000 ? `${h.ip}:${h.port}` : h.ip; setHostDraft(v); apply(true, v) }}
+                    style={{ ...SV.sendBtn, ...(busy ? SV.sendBtnDisabled : SV.sendBtnActive), padding: '1px 8px', fontSize: 9 }}
+                  >
+                    SUBSCRIBE
+                  </button>
+                )}
+            </div>
+          ))}
+          {scan.scanned > 0 && scan.hosts.length === 0 && (
+            <div style={{ ...mono, marginTop: 4 }}>
+              Nothing answered on port 8000. Check the host GS is running and its firewall allows inbound TCP 8000 on the ZeroTier adapter.
+            </div>
+          )}
+        </div>
+      )}
+
+      <div style={{ ...mono, marginTop: 10, lineHeight: 1.6 }}>
+        This station{stationId ? ` (${stationId})` : ''} shares its telemetry and telescope captures with
+        other ground stations on the ZeroTier network (port 8000).
         {' '}{relayPeers.length === 0
           ? 'No peers subscribed.'
           : `Streaming to ${relayPeers.length} peer${relayPeers.length > 1 ? 's' : ''}: ` +
